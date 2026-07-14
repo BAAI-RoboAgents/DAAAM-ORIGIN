@@ -64,6 +64,7 @@ class ImageSequenceDataset(BaseDataset):
 			
 		# Load file lists
 		self._load_file_lists()
+		self._load_timestamps()
 		
 		# Load camera info if available
 		self._load_camera_info()
@@ -112,6 +113,23 @@ class ImageSequenceDataset(BaseDataset):
 			])
 			if pose_files:
 				self.poses = self._load_individual_poses(pose_files)
+
+	def _load_timestamps(self):
+		"""Load real frame timestamps from tick_index.json when available."""
+		self.timestamps = None
+		tick_index_path = self.data_path / "tick_index.json"
+		if not tick_index_path.exists():
+			return
+		with open(tick_index_path, "r") as f:
+			tick_index = json.load(f)
+		frames = tick_index.get("frames", [])
+		if not frames or not all("timestamp" in frame for frame in frames):
+			return
+		if len(frames) != len(self.rgb_files):
+			raise ValueError(
+				f"Timestamp count mismatch: {len(frames)} != {len(self.rgb_files)}"
+			)
+		self.timestamps = [float(frame["timestamp"]) for frame in frames]
 				
 	def _load_poses_from_txt(self, file_path: Path) -> List[np.ndarray]:
 		"""Load poses from a single text file."""
@@ -223,8 +241,8 @@ class ImageSequenceDataset(BaseDataset):
 		if self.poses and idx < len(self.poses):
 			transform = self.poses[idx]
 			
-		# Compute timestamp (assume uniform spacing or use file modification time)
-		timestamp = idx / self.fps  # Simple uniform spacing
+		# Prefer capture timestamps so filtered datasets retain real temporal gaps.
+		timestamp = self.timestamps[idx] if self.timestamps else idx / self.fps
 		
 		# Compute velocities if requested
 		lin_vel, ang_vel = np.zeros(3), np.zeros(3)
