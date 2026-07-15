@@ -27,6 +27,7 @@ class Frame:
 
 	# updated data (filled by orchestrator during processing)
 	tracks: List[Track] = field(default_factory=list)  # List of Track objects
+	timestamp_ns: Optional[int] = None  # Original capture clock, if available
 
 
 @dataclass
@@ -68,4 +69,3 @@ class SemanticUpdate(BaseModel):
 	semantic_labels: Dict[int, str]  # semantic_id -> label
 	temporal_observations: Dict[int, TemporalObservation]  # semantic_id -> temporal data
 	features: Dict[int, SemanticFeatures]  # semantic_id -> features
-

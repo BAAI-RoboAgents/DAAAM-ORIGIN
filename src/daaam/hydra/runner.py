@@ -351,7 +351,8 @@ class HydraPipelineRunner:
 						rgb_image=frame.rgb_image,
 						depth_image=frame.depth_image,
 						semantic_labels=label_image,
-						transform=frame.transform
+						transform=frame.transform,
+						timestamp_ns=frame.timestamp_ns,
 					)
 					hydra_elapsed = time.time() - hydra_start
 					

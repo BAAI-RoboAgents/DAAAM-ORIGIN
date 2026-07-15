@@ -22,6 +22,7 @@ class DatasetFrame:
 	camera_info: Optional[Dict[str, Any]] = None  # intrinsics, distortion, etc.
 	lin_vel: Optional[np.ndarray] = None  # [vx, vy, vz] 
 	ang_vel: Optional[np.ndarray] = None  # [wx, wy, wz]
+	timestamp_ns: Optional[int] = None  # Original capture time when available
 	
 	def to_pipeline_frame(self):
 		"""Convert to pipeline Frame format."""
@@ -38,6 +39,7 @@ class DatasetFrame:
 			frame_id=self.frame_id,
 			timestamp=self.timestamp,
 			rgb_image=self.rgb_image,
+			timestamp_ns=self.timestamp_ns,
 			depth_image=self.depth_image,
 			transform=self.transform,
 			lin_vel=self.lin_vel if self.lin_vel is not None else np.zeros(3),

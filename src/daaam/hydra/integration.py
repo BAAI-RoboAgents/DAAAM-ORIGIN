@@ -188,7 +188,8 @@ class HydraIntegration:
 		rgb_image: np.ndarray,
 		depth_image: np.ndarray,
 		semantic_labels: np.ndarray,
-		transform: Optional[np.ndarray] = None
+		transform: Optional[np.ndarray] = None,
+		timestamp_ns: Optional[int] = None,
 	) -> bool:
 		"""Process a single frame through Hydra.
 		
@@ -198,6 +199,7 @@ class HydraIntegration:
 			depth_image: Depth image in meters (H, W) float32
 			semantic_labels: Semantic segmentation labels (H, W) int32
 			transform: Optional 7D pose [x, y, z, qx, qy, qz, qw]
+			timestamp_ns: Optional original capture timestamp in nanoseconds
 		
 		Returns:
 			True if frame processed successfully
@@ -209,8 +211,11 @@ class HydraIntegration:
 		try:
 			start_time = time.time()
 			
-			# Convert timestamp to nanoseconds
-			timestamp_ns = int(timestamp * 1e9)
+			# Preserve the capture clock when the dataset provides it. The float
+			# timestamp remains useful for local semantic history and readability.
+			step_timestamp_ns = (
+				int(timestamp_ns) if timestamp_ns is not None else int(round(timestamp * 1e9))
+			)
 			
 			# Parse transform
 			if transform is not None and len(transform) >= 7:
@@ -227,7 +232,7 @@ class HydraIntegration:
 			
 			# Process through Hydra
 			success = self.pipeline.step(
-				timestamp_ns,
+				step_timestamp_ns,
 				translation,
 				quaternion,
 				depth_mm,

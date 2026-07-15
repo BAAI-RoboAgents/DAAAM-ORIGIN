@@ -68,6 +68,108 @@ Key arguments:
 
 This writes depth maps to `CODa/3d_raw_estimated/` (or the configured output directory), which the dataloader picks up via `depth_source:=3d_raw_estimated` in the next step.
 
+## 1.6 Validated Stereo Mapping
+
+For prepared stereo sequences, DAAAM can remove only strict duplicate frames before
+depth inference. The selector keeps the original camera nanosecond timestamps and
+the exact pose row associated with every retained image. In particular, an image
+with new visible content is retained even when the robot pose is unchanged.
+
+FoundationStereo is an NVIDIA research/non-commercial dependency. Initialize its
+pinned submodule and create its separate environment before using the one-click
+workflow:
+
+```bash
+git submodule update --init --recursive
+bash scripts/setup_foundation_stereo_env.sh
+export FOUNDATION_STEREO_CHECKPOINT=/path/to/model_best_bp2.pth
+```
+
+Inspect the complete command graph without changing data:
+
+```bash
+python scripts/run_stereo_mapping.py \
+  --adapter prepared-stereo \
+  --src /path/to/prepared_stereo_dataset \
+  --run-dir output/my_stereo_run \
+  --checkpoint "$FOUNDATION_STEREO_CHECKPOINT" \
+  --floor-calibration-report /path/to/validated_floor_geometry_calibration.json \
+  --hydra-config-path /path/to/hydra_config.yaml \
+  --dry-run
+```
+
+The G1 rig needs a previously validated fixed floor/image-frame calibration.
+Generate that report once from a clean nominal-depth calibration dataset as described
+in `REPRODUCTION_G1_20260713_170500_FISHEYE_FIX.md`; do not estimate it independently
+for every capture.
+
+Source ROS and the DAAAM environment, then run through the direct RGB-D preview gate:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source .repro/ros2_ws/install/setup.bash
+source .repro/venv/bin/activate
+
+python scripts/run_stereo_mapping.py \
+  --adapter g1-fisheye \
+  --src /path/to/g1_capture \
+  --run-dir output/g1_map \
+  --checkpoint "$FOUNDATION_STEREO_CHECKPOINT" \
+  --floor-calibration-report /path/to/validated_floor_geometry_calibration.json \
+  --accept-foundation-stereo-noncommercial-license \
+  --hydra-config-path /path/to/hydra_config.yaml \
+  --pipeline-config config/pipeline_config.yaml \
+  --labelspace-path config/labels_pseudo.yaml \
+  --labelspace-colors config/labels_pseudo.csv \
+  --stop-after fuse \
+  --resume
+```
+
+Inspect `10_direct_rgbd_fusion/direct_rgbd_fusion_preview.png`. Only after the floor,
+walls, and repeated objects are coherent should Hydra be allowed to run:
+
+```bash
+python scripts/run_stereo_mapping.py \
+  --adapter g1-fisheye \
+  --src /path/to/g1_capture \
+  --run-dir output/g1_map \
+  --checkpoint "$FOUNDATION_STEREO_CHECKPOINT" \
+  --floor-calibration-report /path/to/validated_floor_geometry_calibration.json \
+  --accept-foundation-stereo-noncommercial-license \
+  --hydra-config-path /path/to/hydra_config.yaml \
+  --pipeline-config config/pipeline_config.yaml \
+  --labelspace-path config/labels_pseudo.yaml \
+  --labelspace-colors config/labels_pseudo.csv \
+  --accept-direct-fusion-preview \
+  --resume
+```
+
+The run directory contains eleven ordered stages from pinhole rectification through
+Hydra. Mapping is blocked when no geometrically verified loop exists, the final
+temporal depth gate fails, or the direct-fusion preview has not been acknowledged.
+`mapping_run.json` records the FoundationStereo commit and checkpoint, thresholds,
+stage reports, and time-contract checks.
+
+Every dataset stage retains `sensor_time_ns`, `pose_sensor_time_ns`, source indices,
+and `pose/pose_timestamps_ns.txt`. `keyframe_selection_report.json` explains every
+retained or rejected input frame; output filenames may be renumbered, but capture
+times and pose associations are never reconstructed from those filenames.
+
+Render an estimated metric depth PNG as a pseudo-color depth image:
+
+```bash
+python scripts/visualize_depth.py \
+  --dataset /path/to/prepared_stereo_dataset \
+  --frame 600 \
+  --min-depth-m 0.25 \
+  --max-depth-m 3.0
+```
+
+The default `turbo` color map uses the same fixed range for every frame; black
+pixels are invalid or outside the requested range. Add `--with-context` to
+include RGB, an RGB/depth overlay, and a color legend. FoundationStereo depth
+PNGs are read as millimeters and converted to meters automatically.
+
 ## 3. Creating ROS Bags
 
 The dataloader node reads raw CODa files and publishes them as ROS topics, optionally recording to a bag (preferred option):

@@ -14,6 +14,12 @@ def parse_args():
     parser.add_argument("--dataset", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--max-delta-ms", type=float, default=10.0)
+    parser.add_argument(
+        "--camera-quaternion-order",
+        choices=("xyzw", "wxyz"),
+        default="xyzw",
+        help="Storage order used by head_camera orientation values.",
+    )
     return parser.parse_args()
 
 
@@ -93,7 +99,9 @@ def interpolate_poses(timestamps, positions, quaternions, target_timestamps):
     return interpolated_positions, interpolated_rotations, int(np.sum(clipped != targets))
 
 
-def compose_global_camera_poses(raw_source: Path, target_timestamps):
+def compose_global_camera_poses(
+    raw_source: Path, target_timestamps, camera_quaternion_order="xyzw"
+):
     odom_records = load_jsonl(raw_source / "state/000000/odom.jsonl")
     odom_timestamps = [record["odom"]["timestamp_ns"] for record in odom_records]
     odom_positions = [record["odom"]["position"] for record in odom_records]
@@ -106,6 +114,15 @@ def compose_global_camera_poses(raw_source: Path, target_timestamps):
     camera_timestamps_ns = [sample["timestamp_ns"] for sample in camera_samples]
     camera_positions = [sample["position"] for sample in camera_samples]
     camera_quaternions = [sample["orientation_xyzw"] for sample in camera_samples]
+    if camera_quaternion_order == "wxyz":
+        camera_quaternions = [
+            [quaternion[1], quaternion[2], quaternion[3], quaternion[0]]
+            for quaternion in camera_quaternions
+        ]
+    elif camera_quaternion_order != "xyzw":
+        raise ValueError(
+            f"Unsupported camera quaternion order: {camera_quaternion_order}"
+        )
 
     world_t_base, world_r_base, odom_clamped = interpolate_poses(
         odom_timestamps, odom_positions, odom_quaternions, target_timestamps
@@ -161,7 +178,9 @@ def main():
     selected_left = [left for left, _, _ in matches]
     selected_timestamps = left_ts[selected_left]
     global_poses, odom_clamped, camera_clamped = compose_global_camera_poses(
-        raw_source, selected_timestamps
+        raw_source,
+        selected_timestamps,
+        camera_quaternion_order=args.camera_quaternion_order,
     )
     origin_ns = int(selected_timestamps[0])
     output_frames = []
@@ -181,11 +200,15 @@ def main():
                 "source_idx": left_idx,
                 "cam0_source_idx": left_idx,
                 "cam1_source_idx": right_idx,
+                "pose_row": output_idx,
                 "cam0": str(rgb_source.resolve()),
                 "cam1": str(Path(tick_index["frames"][right_idx]["cam1"]).resolve()),
                 "depth": str(depth_source.resolve()),
                 "timestamp": (int(left_ts[left_idx]) - origin_ns) / 1e9,
+                "cam0_sensor_time_ns": int(left_ts[left_idx]),
+                "cam1_sensor_time_ns": int(right_ts[right_idx]),
                 "sensor_time_ns": int(left_ts[left_idx]),
+                "pose_sensor_time_ns": int(left_ts[left_idx]),
                 "stereo_delta_ms": delta_ns / 1e6,
             }
         )
@@ -198,6 +221,18 @@ def main():
     if pose_path.exists() and pose_path.read_text() != pose_text:
         raise RuntimeError(f"Refusing to replace different pose file: {pose_path}")
     pose_path.write_text(pose_text)
+    pose_timestamp_path = output / "pose/pose_timestamps_ns.txt"
+    pose_timestamp_text = "".join(
+        f"{int(timestamp)}\n" for timestamp in selected_timestamps
+    )
+    if (
+        pose_timestamp_path.exists()
+        and pose_timestamp_path.read_text() != pose_timestamp_text
+    ):
+        raise RuntimeError(
+            f"Refusing to replace different pose timestamps: {pose_timestamp_path}"
+        )
+    pose_timestamp_path.write_text(pose_timestamp_text)
     ensure_symlink(output / "camera_info.json", dataset / "camera_info.json")
     if (dataset / "source_manifest.json").exists():
         ensure_symlink(
@@ -213,6 +248,17 @@ def main():
             "sync_threshold_ms": args.max_delta_ms,
             "pose_frame": "odom",
             "pose_composition": "odom_T_base_link @ base_link_T_head_camera",
+            "time_origin_ns": origin_ns,
+            "timebase": {
+                "clock": "sensor_time_ns",
+                "unit": "ns",
+                "timestamp_definition": "(sensor_time_ns - time_origin_ns) / 1e9",
+            },
+            "pose_time_alignment": {
+                "method": "interpolate_odom_and_head_camera_at_cam0_sensor_time_ns",
+                "pose_timestamp_file": "pose/pose_timestamps_ns.txt",
+                "pose_row_field": "pose_row",
+            },
             "frames": output_frames,
         }
     )

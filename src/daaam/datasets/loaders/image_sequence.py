@@ -96,6 +96,7 @@ class ImageSequenceDataset(BaseDataset):
 			
 		# Pose files (optional)
 		self.poses = None
+		self.pose_timestamps_ns = None
 		if self.pose_dir.exists():
 			self._load_poses()
 			
@@ -105,6 +106,7 @@ class ImageSequenceDataset(BaseDataset):
 		poses_file = self.pose_dir / "poses.txt"
 		if poses_file.exists():
 			self.poses = self._load_poses_from_txt(poses_file)
+			self._load_pose_timestamps()
 		else:
 			# Load individual pose files
 			pose_files = sorted([
@@ -113,22 +115,84 @@ class ImageSequenceDataset(BaseDataset):
 			])
 			if pose_files:
 				self.poses = self._load_individual_poses(pose_files)
+				self._load_pose_timestamps()
+
+	def _load_pose_timestamps(self):
+		"""Load the optional absolute timestamp corresponding to each pose row."""
+		self.pose_timestamps_ns = None
+		path = self.pose_dir / "pose_timestamps_ns.txt"
+		if not path.exists():
+			return
+		values = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+		try:
+			timestamps = [int(value) for value in values]
+		except ValueError as error:
+			raise ValueError(f"Invalid pose timestamp in {path}") from error
+		if self.poses is not None and len(timestamps) != len(self.poses):
+			raise ValueError(
+				f"Pose timestamp count mismatch: {len(timestamps)} != {len(self.poses)}"
+			)
+		if len(timestamps) > 1 and any(
+			second <= first for first, second in zip(timestamps, timestamps[1:])
+		):
+			raise ValueError(f"Pose timestamps must be strictly increasing: {path}")
+		self.pose_timestamps_ns = timestamps
 
 	def _load_timestamps(self):
 		"""Load real frame timestamps from tick_index.json when available."""
 		self.timestamps = None
+		self.timestamps_ns = None
+		self.time_origin_ns = None
 		tick_index_path = self.data_path / "tick_index.json"
 		if not tick_index_path.exists():
 			return
 		with open(tick_index_path, "r") as f:
 			tick_index = json.load(f)
 		frames = tick_index.get("frames", [])
-		if not frames or not all("timestamp" in frame for frame in frames):
+		if not frames:
+			return
+		has_absolute_time = all("sensor_time_ns" in frame for frame in frames)
+		if not has_absolute_time and not all("timestamp" in frame for frame in frames):
 			return
 		if len(frames) != len(self.rgb_files):
 			raise ValueError(
 				f"Timestamp count mismatch: {len(frames)} != {len(self.rgb_files)}"
 			)
+		if has_absolute_time:
+			try:
+				absolute_timestamps = [int(frame["sensor_time_ns"]) for frame in frames]
+				time_origin_ns = int(
+					tick_index.get("time_origin_ns", absolute_timestamps[0])
+				)
+			except (TypeError, ValueError) as error:
+				raise ValueError("Invalid sensor_time_ns metadata") from error
+			if len(absolute_timestamps) > 1 and any(
+				second <= first
+				for first, second in zip(absolute_timestamps, absolute_timestamps[1:])
+			):
+				raise ValueError("sensor_time_ns values must be strictly increasing")
+			self.timestamps_ns = absolute_timestamps
+			self.time_origin_ns = time_origin_ns
+			self.timestamps = [
+				(timestamp - time_origin_ns) / 1.0e9
+				for timestamp in absolute_timestamps
+			]
+			for index, frame in enumerate(frames):
+				if "timestamp" in frame and not np.isclose(
+					float(frame["timestamp"]), self.timestamps[index], atol=1.0e-6
+				):
+					raise ValueError(
+						f"Frame timestamp mismatch at {index}: absolute and relative clocks disagree"
+					)
+				if self.pose_timestamps_ns is not None and "pose_sensor_time_ns" in frame:
+					pose_row = int(frame.get("pose_row", index))
+					if pose_row < 0 or pose_row >= len(self.pose_timestamps_ns):
+						raise ValueError(f"Invalid pose_row at frame {index}: {pose_row}")
+					if int(frame["pose_sensor_time_ns"]) != self.pose_timestamps_ns[pose_row]:
+						raise ValueError(
+							f"Pose/image absolute time mismatch at frame {index}"
+						)
+			return
 		self.timestamps = [float(frame["timestamp"]) for frame in frames]
 				
 	def _load_poses_from_txt(self, file_path: Path) -> List[np.ndarray]:
@@ -253,6 +317,11 @@ class ImageSequenceDataset(BaseDataset):
 			frame_id=idx,
 			timestamp=timestamp,
 			rgb_image=rgb_image,
+			timestamp_ns=(
+				self.timestamps_ns[idx]
+				if self.timestamps_ns is not None
+				else None
+			),
 			depth_image=depth_image,
 			transform=transform,
 			camera_info=self.camera_info,
