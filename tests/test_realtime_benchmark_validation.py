@@ -173,6 +173,29 @@ def write_run(root: Path, rate_hz: float, *, dirty: bool = False) -> Path:
                 "tracking_calls": 20,
                 "prompts_submitted": 1,
                 "corrections_submitted": 1,
+                "cleanup_errors": [],
+                "grounding_workers": {
+                    "all_ready": True,
+                    "workers": [
+                        {
+                            "name": "GroundingWorker-0",
+                            "is_alive": False,
+                            "is_ready": True,
+                            "drained": True,
+                            "timed_out": False,
+                            "forced_termination": False,
+                            "exitcode": 0,
+                        }
+                    ],
+                    "shutdown": {
+                        "drain_requested": True,
+                        "drain_complete": True,
+                        "correction_tail_enqueued": True,
+                        "timed_out": False,
+                        "forced_termination": False,
+                        "error": None,
+                    },
+                },
                 "dsg": {
                     "graph_attached": True,
                     "commit_valid": True,
@@ -264,6 +287,23 @@ def test_1_hz_authority_matches_dsg_descriptions_to_map_memory(tmp_path):
         if item["code"] == "semantic.final_dsg_artifacts"
     )
     assert "MapMemory" in check["detail"]["error"]
+
+
+def test_1_hz_authority_requires_a_clean_dam_drain(tmp_path):
+    run = write_run(tmp_path / "forced-dam", 1.0)
+    report_path = run / "realtime_run_report.json"
+    report = json.loads(report_path.read_text())
+    health = report["semantic_stats"]["grounding_workers"]
+    health["shutdown"]["drain_complete"] = False
+    health["shutdown"]["forced_termination"] = True
+    health["workers"][0]["drained"] = False
+    health["workers"][0]["forced_termination"] = True
+    health["workers"][0]["exitcode"] = -15
+    report_path.write_text(json.dumps(report))
+
+    verdict = validate_realtime_run(run, expected_rate_hz=1.0)
+
+    assert "semantic.dam_drain_complete" in verdict["blocking_failures"]
 
 
 def test_development_overrides_never_create_single_run_authority(tmp_path):

@@ -489,6 +489,33 @@ def validate_realtime_run(
             dsg_commit_valid,
             dsg_commit_detail,
         )
+        grounding = semantic.get("grounding_workers") or {}
+        grounding_workers = grounding.get("workers") or []
+        shutdown = grounding.get("shutdown") or {}
+        check(
+            "semantic.dam_drain_complete",
+            bool(grounding.get("all_ready"))
+            and bool(grounding_workers)
+            and bool(shutdown.get("drain_requested"))
+            and bool(shutdown.get("drain_complete"))
+            and bool(shutdown.get("correction_tail_enqueued"))
+            and not bool(shutdown.get("timed_out"))
+            and not bool(shutdown.get("forced_termination"))
+            and not shutdown.get("error")
+            and all(
+                bool(worker.get("drained"))
+                and not bool(worker.get("is_alive"))
+                and worker.get("exitcode") == 0
+                and not bool(worker.get("timed_out"))
+                and not bool(worker.get("forced_termination"))
+                for worker in grounding_workers
+            )
+            and not semantic.get("cleanup_errors"),
+            {
+                "grounding_workers": grounding,
+                "semantic_cleanup_errors": semantic.get("cleanup_errors"),
+            },
+        )
         check(
             "semantic.resolved_models",
             bool(semantic_models.get("fastsam", {}).get("sha256"))
