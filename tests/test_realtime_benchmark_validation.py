@@ -30,7 +30,14 @@ def write_run(root: Path, rate_hz: float, *, dirty: bool = False) -> Path:
                     "scale": 0.15,
                     "precision": "fp16",
                     "checkpoint_sha256": "model-sha",
-                }
+                },
+                "semantic_frontend": {
+                    "fastsam": {"sha256": "fastsam-sha"},
+                    "botsort_reid": {"sha256": "reid-sha"},
+                    "dam": {"cached_revision": "dam-revision"},
+                    "semantic_labelspace": {"sha256": "labels-sha"},
+                    "labelspace_colors": {"sha256": "colors-sha"},
+                },
             },
         },
         "realtime_metrics.json": {

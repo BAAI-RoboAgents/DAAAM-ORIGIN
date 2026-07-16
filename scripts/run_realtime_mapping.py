@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 import json
 import math
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -19,6 +20,7 @@ from typing import Callable, Optional
 
 import cv2
 import numpy as np
+import yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -429,6 +431,85 @@ def load_precomputed_depth_provenance(dataset: Path) -> Optional[dict]:
             "failed": report.get("failed"),
         }
     return None
+
+
+def load_semantic_model_provenance(
+    config_path: Path,
+    *,
+    repository_root: Path = REPOSITORY_ROOT,
+) -> dict:
+    """Resolve semantic model artifacts without initializing CUDA runtimes."""
+
+    try:
+        config = yaml.safe_load(config_path.read_text()) or {}
+    except yaml.YAMLError as error:
+        raise ValueError(f"Invalid semantic pipeline config: {config_path}") from error
+    if not isinstance(config, dict):
+        raise ValueError("Semantic pipeline config must contain a mapping")
+
+    def model_artifact(value: Optional[str], *, checkpoint_relative: bool) -> dict:
+        if not value:
+            return {"configured": value, "path": None, "sha256": None}
+        configured = Path(value)
+        if configured.is_absolute():
+            path = configured
+        elif checkpoint_relative and configured.parts[:1] != ("checkpoints",):
+            path = repository_root / "checkpoints" / configured
+        else:
+            path = repository_root / configured
+        path = path.resolve()
+        return {
+            "configured": value,
+            "path": str(path),
+            "sha256": sha256_file(path) if path.is_file() else None,
+        }
+
+    segmentation = config.get("segmentation", {})
+    tracking = config.get("tracking", {})
+    workers = config.get("workers", {})
+    dam_config = workers.get("dam_grounding_config", {})
+    dam_model = dam_config.get("dam_model_path")
+    cache_root = Path(
+        os.environ.get(
+            "HF_HUB_CACHE",
+            Path.home() / ".cache" / "huggingface" / "hub",
+        )
+    )
+    dam_revision_path = (
+        cache_root
+        / f"models--{str(dam_model).replace('/', '--')}"
+        / "refs"
+        / "main"
+        if dam_model
+        else None
+    )
+    dam_revision = (
+        dam_revision_path.read_text().strip()
+        if dam_revision_path is not None and dam_revision_path.is_file()
+        else None
+    )
+    semantic_labelspace = model_artifact(
+        config.get("semantic_config_path"), checkpoint_relative=False
+    )
+    labelspace_colors = model_artifact(
+        config.get("labelspace_colors_path"), checkpoint_relative=False
+    )
+    return {
+        "pipeline_config": str(config_path.resolve()),
+        "pipeline_config_sha256": sha256_file(config_path),
+        "fastsam": model_artifact(
+            segmentation.get("model_name"), checkpoint_relative=True
+        ),
+        "botsort_reid": model_artifact(
+            tracking.get("reid_weights"), checkpoint_relative=True
+        ),
+        "dam": {
+            "model_id": dam_model,
+            "cached_revision": dam_revision,
+        },
+        "semantic_labelspace": semantic_labelspace,
+        "labelspace_colors": labelspace_colors,
+    }
 
 
 class ReplayEngine:
@@ -1283,6 +1364,11 @@ def main() -> None:
         and precomputed_depth_provenance.get("confidence_mode")
         else args.depth_confidence_mode
     )
+    semantic_model_provenance = (
+        load_semantic_model_provenance(args.semantic_config)
+        if args.semantic_mode != "disabled"
+        else None
+    )
     foundation_stereo_python = None
     effective_depth_profile = None
     if args.depth_backend == "foundation-worker":
@@ -1472,6 +1558,7 @@ def main() -> None:
                 "torch_compile": args.depth_torch_compile,
                 "precomputed_provenance": precomputed_depth_provenance,
             },
+            "semantic_frontend": semantic_model_provenance,
         },
     )
     write_run_manifest(run_dir / "run_manifest.json", manifest)

@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 from run_realtime_mapping import (  # noqa: E402
     add_semantic_runtime_metrics,
     load_precomputed_depth_provenance,
+    load_semantic_model_provenance,
     resolve_environment_python,
     scheduled_confidence_mode,
 )
@@ -267,6 +268,39 @@ def test_semantic_model_latency_is_reported_under_real_stage_names():
         report["stages"]["tracking"]["latency"]["service_ms"]["p95"]
         == 20.0
     )
+
+
+def test_semantic_model_provenance_hashes_local_artifacts(tmp_path):
+    repository = tmp_path / "repository"
+    (repository / "checkpoints" / "fastsam").mkdir(parents=True)
+    (repository / "checkpoints" / "reid").mkdir()
+    (repository / "config").mkdir()
+    (repository / "checkpoints" / "fastsam" / "model.engine").write_bytes(b"sam")
+    (repository / "checkpoints" / "reid" / "model.engine").write_bytes(b"reid")
+    (repository / "config" / "labels.yaml").write_text("labels: []")
+    (repository / "config" / "colors.csv").write_text("0,0,0")
+    config = repository / "pipeline.yaml"
+    config.write_text(
+        """
+segmentation:
+  model_name: fastsam/model.engine
+tracking:
+  reid_weights: checkpoints/reid/model.engine
+workers:
+  dam_grounding_config:
+    dam_model_path: nvidia/DAM-3B
+semantic_config_path: config/labels.yaml
+labelspace_colors_path: config/colors.csv
+""".strip()
+    )
+    provenance = load_semantic_model_provenance(
+        config,
+        repository_root=repository,
+    )
+    assert provenance["fastsam"]["sha256"]
+    assert provenance["botsort_reid"]["sha256"]
+    assert provenance["semantic_labelspace"]["sha256"]
+    assert provenance["labelspace_colors"]["sha256"]
 
 
 def test_periodic_left_right_validation_never_skips_left_depth_inference():

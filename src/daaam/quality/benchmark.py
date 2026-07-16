@@ -52,6 +52,7 @@ def validate_realtime_run(
     semantic = report.get("semantic_stats") or {}
     stages = metrics.get("stages", {})
     foundation = manifest.get("models", {}).get("foundation_stereo", {})
+    semantic_models = manifest.get("models", {}).get("semantic_frontend") or {}
 
     checks: list[dict[str, Any]] = []
 
@@ -148,6 +149,15 @@ def validate_realtime_run(
             and int(dsg.get("unmapped", 0)) == 0
             and not dsg.get("errors"),
             dsg,
+        )
+        check(
+            "semantic.resolved_models",
+            bool(semantic_models.get("fastsam", {}).get("sha256"))
+            and bool(semantic_models.get("botsort_reid", {}).get("sha256"))
+            and bool(semantic_models.get("dam", {}).get("cached_revision"))
+            and bool(semantic_models.get("semantic_labelspace", {}).get("sha256"))
+            and bool(semantic_models.get("labelspace_colors", {}).get("sha256")),
+            semantic_models,
         )
     check(
         "depth.resolved_profile",
