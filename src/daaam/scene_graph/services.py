@@ -12,7 +12,14 @@ import time
 from tqdm import tqdm
 import numpy as np
 
-from spark_dsg import DynamicSceneGraph, DsgLayers, NodeSymbol, Labelspace, KhronosObjectAttributes
+from spark_dsg import (
+	BoundingBoxType,
+	DsgLayers,
+	DynamicSceneGraph,
+	KhronosObjectAttributes,
+	Labelspace,
+	NodeSymbol,
+)
 from daaam.utils.logging import PipelineLogger, get_default_logger
 from daaam.utils.scene_graph_utils import *
 from daaam.utils.vision import (
@@ -202,6 +209,155 @@ class SceneGraphService:
 			else:
 				self.logger.debug(f"Added correction for semantic_id {correction.semantic_id} to corrections dict")
 
+	def ensure_object_node(
+		self,
+		*,
+		semantic_id: int,
+		entity_id: str,
+		position_m: Any,
+		dimensions_m: Any,
+		sensor_time_ns: int,
+	) -> bool:
+		"""Ensure a correction-addressable object exists using MapMemory geometry.
+
+		Hydra can legitimately finish a short run without promoting any object
+		voxels. In that case the semantic sidecar still has mask/depth-derived,
+		world-frame geometry in MapMemory. Materializing that audited entity makes
+		the correction visible in the final DSG instead of acknowledging a no-op.
+		"""
+		if not self.scene_graph_is_set:
+			return False
+		position = dimensions = None
+		if position_m is not None and dimensions_m is not None:
+			try:
+				position = np.asarray(position_m, dtype=np.float64)
+				dimensions = np.asarray(dimensions_m, dtype=np.float64)
+			except (TypeError, ValueError):
+				position = dimensions = None
+		geometry_is_valid = bool(
+			position is not None
+			and dimensions is not None
+			and position.shape == (3,)
+			and dimensions.shape == (3,)
+			and np.all(np.isfinite(position))
+			and np.all(np.isfinite(dimensions))
+			and np.all(dimensions > 0.0)
+		)
+
+		with self.scene_graph_lock:
+			object_layer = self.scene_graph.get_layer(DsgLayers.OBJECTS)
+
+			def attach_to_nearest_place(node: Any) -> bool:
+				if node.has_parent():
+					metadata = dict(node.attributes.metadata.get() or {})
+					metadata.setdefault("parent_binding", "existing_parent")
+					node.attributes.metadata.set(metadata)
+					return True
+				places = list(self.scene_graph.get_layer(DsgLayers.PLACES).nodes)
+				if not places:
+					metadata = dict(node.attributes.metadata.get() or {})
+					metadata["parent_binding"] = "unavailable"
+					node.attributes.metadata.set(metadata)
+					return True
+				nearest_place = min(
+					places,
+					key=lambda place: float(
+						np.linalg.norm(
+							np.asarray(place.attributes.position)
+							- np.asarray(node.attributes.position)
+						)
+					),
+				)
+				inserted = bool(
+					self.scene_graph.insert_edge(
+						nearest_place.id,
+						node.id,
+						enforce_single_parent=True,
+					)
+				)
+				if inserted:
+					metadata = dict(node.attributes.metadata.get() or {})
+					metadata["parent_binding"] = "nearest_place"
+					node.attributes.metadata.set(metadata)
+				return inserted
+
+			matching_nodes = [
+				node
+				for node in object_layer.nodes
+				if int(node.attributes.semantic_label) == int(semantic_id)
+			]
+			bindings = {
+				str((node.attributes.metadata.get() or {}).get("entity_id", "")).strip()
+				for node in matching_nodes
+			}
+			bindings.discard("")
+			conflicts = bindings - {entity_id}
+			if conflicts:
+				raise ValueError(
+					f"semantic_id {semantic_id} is already bound to "
+					f"{sorted(conflicts)}"
+				)
+			if entity_id in bindings:
+				bound_node = next(
+					node
+					for node in matching_nodes
+					if str(
+						(node.attributes.metadata.get() or {}).get("entity_id", "")
+					).strip()
+					== entity_id
+				)
+				bound_node.attributes.is_active = True
+				return attach_to_nearest_place(bound_node)
+			if matching_nodes:
+				if not geometry_is_valid:
+					return False
+				node = min(
+					matching_nodes,
+					key=lambda candidate: float(
+						np.linalg.norm(
+							np.asarray(candidate.attributes.position) - position
+						)
+					),
+				)
+				metadata = dict(node.attributes.metadata.get() or {})
+				metadata["entity_id"] = entity_id
+				metadata["entity_binding_source"] = "semantic_id_map_memory"
+				metadata["first_observed_ns"] = int(sensor_time_ns)
+				metadata["last_observed_ns"] = int(sensor_time_ns)
+				node.attributes.metadata.set(metadata)
+				node.attributes.is_active = True
+				node.attributes.last_update_time_ns = int(sensor_time_ns)
+				return attach_to_nearest_place(node)
+
+			if not geometry_is_valid:
+				return False
+
+			node_index = int(semantic_id)
+			node_id = NodeSymbol("O", node_index)
+			while self.scene_graph.has_node(node_id):
+				node_index += 1
+				node_id = NodeSymbol("O", node_index)
+
+			attributes = KhronosObjectAttributes()
+			attributes.position = position
+			attributes.semantic_label = int(semantic_id)
+			attributes.is_active = True
+			attributes.last_update_time_ns = int(sensor_time_ns)
+			attributes.bounding_box.type = BoundingBoxType.AABB
+			attributes.bounding_box.world_P_center = position
+			attributes.bounding_box.dimensions = dimensions
+			attributes.metadata.set(
+				{
+					"entity_id": entity_id,
+					"geometry_source": "map_memory",
+					"first_observed_ns": int(sensor_time_ns),
+					"last_observed_ns": int(sensor_time_ns),
+				}
+			)
+			if not self.scene_graph.add_node(DsgLayers.OBJECTS, node_id, attributes):
+				return False
+			return attach_to_nearest_place(self.scene_graph.get_node(node_id))
+
 	def apply_corrections(self) -> None:
 		"""Apply pending corrections to the scene graph.
 
@@ -241,12 +397,17 @@ class SceneGraphService:
 					
 					# Check if we have a correction for this node's semantic_id
 					if semantic_id in corrections_copy:
-						matched_correction_ids.add(semantic_id)
 						correction = corrections_copy[semantic_id]
+						bound_entity = str(
+							(node.attributes.metadata.get() or {}).get("entity_id", "")
+						).strip()
+						if correction.entity_id and bound_entity != correction.entity_id:
+							continue
 						semantic_label = correction.semantic_label.lower()
 						embedding = correction.embedding
 
-						metadata_dict = {"description": semantic_label}
+						metadata_dict = dict(node.attributes.metadata.get() or {})
+						metadata_dict["description"] = semantic_label
 						
 						# Add temporal history if available
 						if hasattr(correction, 'frame_ids') and correction.frame_ids:
@@ -265,6 +426,9 @@ class SceneGraphService:
 							metadata_dict["selectframe_clip_feature"] = correction.selectframe_clip_feature
 						
 						node.attributes.metadata.set(metadata_dict)
+						stored_metadata = node.attributes.metadata.get() or {}
+						if stored_metadata.get("description") == semantic_label:
+							matched_correction_ids.add(semantic_id)
 						# node.attributes.semantic_feature = embedding
 						# self.logger.debug(
 						# 	f"Updated node {node.id.value} name to '{semantic_label}' for semantic_id {semantic_id}"

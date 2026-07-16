@@ -15,6 +15,7 @@ import queue
 import time
 
 from daaam.grounding.interfaces import GroundingWorkerInterface
+from daaam.grounding.control import GroundingDrainRequest
 from daaam.utils.embedding import CLIPHandler, SentenceEmbeddingHandler
 from daaam.utils.logging import PipelineLogger
 from daaam.utils.performance import performance_measure
@@ -435,7 +436,7 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 	
 	def _process_aggregated_batch(self) -> Optional[List[ObjectAnnotation]]:
 		"""Process one DAM batch only while holding the shared GPU lease."""
-		with self.gpu.lease():
+		with self.gpu.lease(self.stop_event):
 			return self._process_aggregated_batch_under_lease()
 
 	def _process_aggregated_batch_under_lease(self) -> Optional[List[ObjectAnnotation]]:
@@ -470,8 +471,9 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 				)
 
 				if not masks:
-					self.worker_logger.error(f"[Worker {self.worker_id}] No valid masks to process.")
-					return None
+					raise RuntimeError(
+						f"[Worker {self.worker_id}] No valid masks to process"
+					)
 
 				# Extract CLIP features if enabled
 				clip_features = {}
@@ -504,8 +506,9 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 					base_filenames.append(base_filename)
 			
 			if not image_mask_pairs:
-				self.worker_logger.error(f"[Worker {self.worker_id}] No valid image-mask pairs to process.")
-				return None
+				raise RuntimeError(
+					f"[Worker {self.worker_id}] No valid image-mask pairs to process"
+				)
 			
 			total_masks = sum(len(masks) for _, masks in image_mask_pairs)
 			self.worker_logger.info(
@@ -595,14 +598,15 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 						correction.embedding = embedding.tolist()
 				return corrections
 			else:
-				self.worker_logger.warning(f"[Worker {self.worker_id}] Received no valid corrections from DAM agent.")
-				return None
+				raise RuntimeError(
+					f"[Worker {self.worker_id}] DAM returned no valid corrections"
+				)
 			
 		except Exception as e:
 			self.worker_logger.error(f"[Worker {self.worker_id}] ERROR processing multi-image batch: {e}")
 
 			self.worker_logger.error(traceback.format_exc())
-			return None
+			raise
 		finally:
 			# clear batch after processing
 			self.aggregated_records = []
@@ -623,8 +627,38 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 		for correction in corrections:
 			self.output_queue.put(correction)
 
+	def _drain(self, request: GroundingDrainRequest) -> None:
+		"""Flush the final batch and acknowledge only after outputs are queued."""
+		try:
+			if self.aggregated_records and self.total_masks > 0:
+				self.worker_logger.info(
+					f"Draining final batch of {len(self.aggregated_records)} records "
+					f"with {self.total_masks} total masks"
+				)
+				self._emit_corrections(self._process_aggregated_batch())
+		except BaseException as error:
+			if self.ready_queue:
+				self.ready_queue.put(
+					{
+						"worker": self.worker_id,
+						"drain_token": request.token,
+						"drained": False,
+						"error": repr(error),
+					}
+				)
+			raise
+		if self.ready_queue:
+			self.ready_queue.put(
+				{
+					"worker": self.worker_id,
+					"drain_token": request.token,
+					"drained": True,
+					"error": None,
+				}
+			)
+
 	def run(self):
-		"""Flush underfilled batches by age and again during clean shutdown."""
+		"""Flush underfilled batches by age or an explicit FIFO drain request."""
 		if self.dam_agent is None:
 			self.worker_logger.error("DAM agent not initialized. Exiting worker.")
 			return
@@ -642,14 +676,10 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 						self.worker_logger.info("Flushing underfilled DAM batch by age")
 						self._emit_corrections(self._process_aggregated_batch())
 					continue
+				if isinstance(item, GroundingDrainRequest):
+					self._drain(item)
+					return
 				result = self.process_item(item)
 				self._emit_corrections(result)
 		except KeyboardInterrupt:
 			self.worker_logger.info("Received keyboard interrupt")
-		finally:
-			if self.aggregated_records and self.total_masks > 0:
-				self.worker_logger.info(
-					f"Processing final batch of {len(self.aggregated_records)} records "
-					f"with {self.total_masks} total masks"
-				)
-				self._emit_corrections(self._process_aggregated_batch())

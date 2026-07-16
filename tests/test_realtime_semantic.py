@@ -16,6 +16,10 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
+from daaam.grounding.control import (  # noqa: E402
+    GroundingCorrectionsDrained,
+    GroundingDrainRequest,
+)
 from daaam.grounding.models import ObjectAnnotation  # noqa: E402
 from daaam.grounding.workers.dam_grounding import (  # noqa: E402
     DAMGroundingWorkerMultiImage,
@@ -179,10 +183,16 @@ class FakeLifecycleGrounding:
         if self.start_error is not None:
             raise self.start_error
 
-    def stop(self):
+    def stop(self, *, timeout_s, drain):
+        del timeout_s, drain
         self.stop_calls += 1
         if self.stop_error is not None:
             raise self.stop_error
+        return {
+            "drain_requested": False,
+            "drain_complete": False,
+            "drain_token": None,
+        }
 
     def get_worker_health(self):
         return {
@@ -191,6 +201,29 @@ class FakeLifecycleGrounding:
             "workers": [],
             "ready_count": 0,
             "all_ready": False,
+        }
+
+
+class FakeFifoDrainingGrounding(FakeLifecycleGrounding):
+    def __init__(self):
+        super().__init__()
+        self.correction_queue = None
+
+    def start(self, _query_queue, correction_queue, *_args, **_kwargs):
+        self.start_calls += 1
+        self.correction_queue = correction_queue
+
+    def stop(self, *, timeout_s, drain):
+        del timeout_s
+        self.stop_calls += 1
+        token = "fake-grounding-drain"
+        if drain:
+            self.correction_queue.put("not-an-annotation")
+            self.correction_queue.put(GroundingCorrectionsDrained(token))
+        return {
+            "drain_requested": drain,
+            "drain_complete": drain,
+            "drain_token": token if drain else None,
         }
 
 
@@ -353,6 +386,40 @@ def test_semantic_start_rolls_back_after_correction_thread_start_failure(
     adapter.query_queue.join_thread()
     adapter.correction_queue.join_thread()
     memory.close()
+
+
+def test_semantic_stop_consumes_corrections_through_fifo_drain_marker(tmp_path):
+    memory = MapMemory(tmp_path / "memory.sqlite3")
+    memory.create_session("replay", ORIGIN_NS, canonical=True)
+    grounding = FakeFifoDrainingGrounding()
+    adapter = RealtimeSemanticAdapter(
+        pipeline_config(),
+        memory,
+        session_id="replay",
+        output_dir=tmp_path / "semantic",
+        config=RealtimeSemanticConfig(grounding_enabled=True),
+        segmentation_service=FakeSegmenter(),
+        tracking_service=FakeTracker(),
+        grounding_service=grounding,
+        dsg_sink=FakeDsgSink(),
+    )
+
+    try:
+        adapter.start()
+        stats = adapter.stop(timeout_s=2.0, drain=True)
+        assert grounding.stop_calls == 1
+        assert adapter._correction_drained.is_set()
+        assert adapter._correction_drain_token == "fake-grounding-drain"
+        assert stats["corrections_received"] == 1
+        assert stats["corrections_skipped"] == 1
+    finally:
+        if adapter._started:
+            adapter.stop(timeout_s=1.0, drain=False)
+        adapter.query_queue.close()
+        adapter.correction_queue.close()
+        adapter.query_queue.join_thread()
+        adapter.correction_queue.join_thread()
+        memory.close()
 
 
 def test_semantic_processor_start_failure_is_still_stopped(tmp_path):
@@ -584,7 +651,7 @@ class FakeSceneGraphService:
             self.applied_correction_ids.add(correction.semantic_id)
 
 
-def test_dsg_sink_has_separate_pending_and_applied_ack():
+def test_dsg_sink_does_not_count_live_only_ack_as_durable():
     service = FakeSceneGraphService()
     sink = HydraDsgSemanticSink(service)
     sink.register_entity("entity", 7)
@@ -601,8 +668,16 @@ def test_dsg_sink_has_separate_pending_and_applied_ack():
     assert sink.stats()["pending"] == 1
     service.scene_graph_is_set = True
     sink.register_entity("entity", 7)
-    assert sink.stats()["pending"] == 0
-    assert sink.stats()["applied"] == 1
+    assert sink.stats()["pending"] == 1
+    assert sink.stats()["applied"] == 0
+    assert sink.stats()["graph_attached"] is False
+
+
+def test_dsg_sink_rejects_semantic_id_shared_by_multiple_entities():
+    sink = HydraDsgSemanticSink(FakeSceneGraphService())
+    sink.register_entity("entity-one", 7)
+    with pytest.raises(ValueError, match="multiple stable entities"):
+        sink.register_entity("entity-two", 7)
 
 
 class FakeAgedDamWorker(DAMGroundingWorkerMultiImage):
@@ -660,3 +735,98 @@ def test_underfilled_dam_batch_flushes_by_age():
     thread.join(1.0)
     assert correction.semantic_label == "chair"
     assert not thread.is_alive()
+
+
+def test_underfilled_dam_batch_flushes_before_drain_ack():
+    incoming = queue.Queue()
+    outgoing = queue.Queue()
+    ready = queue.Queue()
+    stop = threading.Event()
+    worker = FakeAgedDamWorker(
+        incoming,
+        outgoing,
+        stop,
+        {
+            "multi_image_min_n_masks": 16,
+            "max_batch_age_s": 10.0,
+            "enable_selectframe_clip_features": False,
+        },
+        ready_queue=ready,
+    )
+    mask = np.ones((8, 8), dtype=bool)
+    track = Track.from_mask(1, mask, np.asarray([0, 0, 8, 8]))
+    incoming.put(
+        PromptRecord(
+            frame=np.zeros((8, 8, 3), dtype=np.uint8),
+            tracks=[track],
+            object_labels={1: 1},
+        )
+    )
+    incoming.put(GroundingDrainRequest("underfilled-drain"))
+
+    thread = threading.Thread(target=worker.run)
+    thread.start()
+    correction = outgoing.get(timeout=1.0)
+    ready_message = ready.get(timeout=1.0)
+    if ready_message.get("ready") is True:
+        ready_message = ready.get(timeout=1.0)
+    thread.join(1.0)
+
+    assert correction.semantic_label == "chair"
+    assert ready_message["drain_token"] == "underfilled-drain"
+    assert ready_message["drained"] is True
+    assert not thread.is_alive()
+    assert worker.aggregated_records == []
+
+
+class _FailingDamAgent:
+    def query_multi_image_multi_mask(self, **_kwargs):
+        raise RuntimeError("intentional final DAM inference failure")
+
+
+class _FailingFinalBatchDamWorker(DAMGroundingWorkerMultiImage):
+    def _initialize_models(self):
+        self.dam_agent = _FailingDamAgent()
+        self.compute_full_image_description = False
+        self.sentence_embedding_handler = None
+        self.clip_handler = None
+        self.save_grounding_images = False
+        self.output_dir = None
+        self.color_map = None
+
+
+def test_final_dam_batch_failure_cannot_acknowledge_drain():
+    incoming = queue.Queue()
+    outgoing = queue.Queue()
+    ready = queue.Queue()
+    worker = _FailingFinalBatchDamWorker(
+        incoming,
+        outgoing,
+        threading.Event(),
+        {
+            "multi_image_min_n_masks": 16,
+            "max_batch_age_s": 10.0,
+            "enable_selectframe_clip_features": False,
+        },
+        ready_queue=ready,
+    )
+    mask = np.ones((8, 8), dtype=bool)
+    track = Track.from_mask(1, mask, np.asarray([0, 0, 8, 8]))
+    worker.aggregated_records = [
+        PromptRecord(
+            frame=np.zeros((8, 8, 3), dtype=np.uint8),
+            tracks=[track],
+            object_labels={1: 1},
+        )
+    ]
+    worker.total_masks = 1
+
+    with pytest.raises(RuntimeError, match="intentional final DAM inference failure"):
+        worker._drain(GroundingDrainRequest("failed-drain"))
+
+    messages = [ready.get_nowait(), ready.get_nowait()]
+    drain_status = next(message for message in messages if "drained" in message)
+    assert drain_status["drain_token"] == "failed-drain"
+    assert drain_status["drained"] is False
+    assert "intentional final DAM inference failure" in drain_status["error"]
+    assert outgoing.empty()

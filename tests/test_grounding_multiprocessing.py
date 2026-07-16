@@ -8,13 +8,20 @@ from pathlib import Path
 import queue
 from types import SimpleNamespace
 import sys
+import threading
 import time
+
+import pytest
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
 from daaam.config import WorkerConfig  # noqa: E402
+from daaam.grounding.control import (  # noqa: E402
+    GroundingCorrectionsDrained,
+    GroundingDrainRequest,
+)
 from daaam.grounding.services import GroundingService  # noqa: E402
 
 
@@ -36,6 +43,143 @@ def _echo_grounding_worker(
     )
     outgoing.put(incoming.get(timeout=5.0))
     stop_event.wait(5.0)
+
+
+def _inflight_grounding_worker(
+    incoming,
+    outgoing,
+    _stop_event,
+    config,
+    ready_queue,
+) -> None:
+    """Hold one dequeued item in-flight until the test releases it."""
+
+    ready_queue.put(
+        {
+            "worker": mp.current_process().name,
+            "ready": True,
+            "error": None,
+        }
+    )
+    item = incoming.get(timeout=5.0)
+    config["in_flight"].set()
+    if not config["release"].wait(5.0):
+        raise RuntimeError("test did not release in-flight grounding item")
+    outgoing.put(("processed", item))
+    request = incoming.get(timeout=5.0)
+    if not isinstance(request, GroundingDrainRequest):
+        raise TypeError(f"unexpected grounding control message: {type(request)!r}")
+    ready_queue.put(
+        {
+            "worker": mp.current_process().name,
+            "drain_token": request.token,
+            "drained": True,
+            "error": None,
+        }
+    )
+
+
+def _fifo_drain_worker(
+    incoming,
+    outgoing,
+    stop_event,
+    _config,
+    ready_queue,
+) -> None:
+    ready_queue.put(
+        {
+            "worker": mp.current_process().name,
+            "ready": True,
+            "error": None,
+        }
+    )
+    while not stop_event.is_set():
+        item = incoming.get(timeout=5.0)
+        if isinstance(item, GroundingDrainRequest):
+            ready_queue.put(
+                {
+                    "worker": mp.current_process().name,
+                    "drain_token": item.token,
+                    "drained": True,
+                    "error": None,
+                }
+            )
+            return
+        outgoing.put(item)
+
+
+def _drain_crashing_worker(
+    incoming,
+    _outgoing,
+    _stop_event,
+    _config,
+    ready_queue,
+) -> None:
+    ready_queue.put(
+        {
+            "worker": mp.current_process().name,
+            "ready": True,
+            "error": None,
+        }
+    )
+    request = incoming.get(timeout=5.0)
+    if isinstance(request, GroundingDrainRequest):
+        raise RuntimeError("intentional drain crash")
+
+
+def _drain_without_ack_worker(
+    incoming,
+    _outgoing,
+    _stop_event,
+    config,
+    ready_queue,
+) -> None:
+    ready_queue.put(
+        {
+            "worker": mp.current_process().name,
+            "ready": True,
+            "error": None,
+        }
+    )
+    request = incoming.get(timeout=5.0)
+    if isinstance(request, GroundingDrainRequest):
+        config["sentinel_consumed"].set()
+    while True:
+        time.sleep(0.05)
+
+
+def _queue_blocking_worker(
+    _incoming,
+    _outgoing,
+    _stop_event,
+    _config,
+    ready_queue,
+) -> None:
+    ready_queue.put(
+        {
+            "worker": mp.current_process().name,
+            "ready": True,
+            "error": None,
+        }
+    )
+    while True:
+        time.sleep(0.05)
+
+
+def _close_queues(*queues) -> None:
+    for queued in queues:
+        queued.close()
+    for queued in queues:
+        queued.join_thread()
+
+
+def _wait_until_ready(service: GroundingService) -> None:
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if service.get_worker_health()["all_ready"]:
+            return
+        time.sleep(0.01)
+    raise AssertionError("grounding worker did not report ready")
 
 
 class _FakeEvent:
@@ -204,3 +348,187 @@ def test_stop_cleans_workers_even_if_running_flag_was_never_set():
     assert event.was_set
     assert worker.joined
     assert not service.workers
+
+
+def test_drain_waits_for_dequeued_inflight_work_and_publishes_fifo_tail(
+    monkeypatch,
+):
+    context = mp.get_context("spawn")
+    incoming = context.Queue(maxsize=1)
+    outgoing = context.Queue(maxsize=4)
+    in_flight = context.Event()
+    release = context.Event()
+    service = GroundingService(WorkerConfig(num_grounding_workers=1))
+    monkeypatch.setattr(
+        service,
+        "_get_grounding_worker_process",
+        lambda: _inflight_grounding_worker,
+    )
+    pipeline_config = SimpleNamespace(
+        get_worker_config=lambda _worker: {
+            "in_flight": in_flight,
+            "release": release,
+        }
+    )
+
+    try:
+        service.start(incoming, outgoing, pipeline_config)
+        incoming.put("dequeued-but-not-finished")
+        assert in_flight.wait(5.0)
+        timer = threading.Timer(0.2, release.set)
+        timer.start()
+        started = time.monotonic()
+        shutdown = service.stop(timeout_s=3.0, drain=True)
+        elapsed = time.monotonic() - started
+        timer.join()
+
+        assert elapsed >= 0.15
+        assert outgoing.get(timeout=1.0) == (
+            "processed",
+            "dequeued-but-not-finished",
+        )
+        tail = outgoing.get(timeout=1.0)
+        assert isinstance(tail, GroundingCorrectionsDrained)
+        assert tail.token == shutdown["drain_token"]
+        assert shutdown["drain_complete"] is True
+        assert shutdown["correction_tail_enqueued"] is True
+        health = service.get_worker_health()
+        assert health["shutdown"] == shutdown
+        assert health["workers"][0]["drained"] is True
+        assert health["workers"][0]["forced_termination"] is False
+    finally:
+        release.set()
+        if service.workers:
+            service.stop(timeout_s=1.0, drain=False)
+        _close_queues(incoming, outgoing)
+
+
+def test_drain_sends_one_fifo_request_to_each_worker(monkeypatch):
+    context = mp.get_context("spawn")
+    incoming = context.Queue(maxsize=8)
+    outgoing = context.Queue(maxsize=16)
+    service = GroundingService(WorkerConfig(num_grounding_workers=2))
+    monkeypatch.setattr(
+        service,
+        "_get_grounding_worker_process",
+        lambda: _fifo_drain_worker,
+    )
+    pipeline_config = SimpleNamespace(get_worker_config=lambda _worker: {})
+
+    try:
+        service.start(incoming, outgoing, pipeline_config)
+        _wait_until_ready(service)
+        for item in range(6):
+            incoming.put(item)
+        shutdown = service.stop(timeout_s=3.0, drain=True)
+        outputs = [outgoing.get(timeout=1.0) for _ in range(7)]
+
+        assert set(outputs[:-1]) == set(range(6))
+        assert isinstance(outputs[-1], GroundingCorrectionsDrained)
+        assert outputs[-1].token == shutdown["drain_token"]
+        health = service.get_worker_health()
+        assert len(health["workers"]) == 2
+        assert all(worker["drained"] for worker in health["workers"])
+        assert all(
+            worker["drain_request_enqueued"] for worker in health["workers"]
+        )
+    finally:
+        if service.workers:
+            service.stop(timeout_s=1.0, drain=False)
+        _close_queues(incoming, outgoing)
+
+
+def test_drain_reports_worker_crash_before_acknowledgement(monkeypatch):
+    context = mp.get_context("spawn")
+    incoming = context.Queue(maxsize=1)
+    outgoing = context.Queue(maxsize=2)
+    service = GroundingService(WorkerConfig(num_grounding_workers=1))
+    monkeypatch.setattr(
+        service,
+        "_get_grounding_worker_process",
+        lambda: _drain_crashing_worker,
+    )
+    pipeline_config = SimpleNamespace(get_worker_config=lambda _worker: {})
+
+    try:
+        service.start(incoming, outgoing, pipeline_config)
+        _wait_until_ready(service)
+        with pytest.raises(RuntimeError, match="exited with code"):
+            service.stop(timeout_s=2.0, drain=True)
+        health = service.get_worker_health()
+        assert health["shutdown"]["drain_complete"] is False
+        assert health["shutdown"]["timed_out"] is False
+        assert health["workers"][0]["exitcode"] not in (None, 0)
+    finally:
+        if service.workers:
+            service.stop(timeout_s=1.0, drain=False)
+        _close_queues(incoming, outgoing)
+
+
+def test_drain_timeout_forces_worker_that_consumes_sentinel_without_ack(
+    monkeypatch,
+):
+    context = mp.get_context("spawn")
+    incoming = context.Queue(maxsize=1)
+    outgoing = context.Queue(maxsize=2)
+    sentinel_consumed = context.Event()
+    service = GroundingService(WorkerConfig(num_grounding_workers=1))
+    monkeypatch.setattr(
+        service,
+        "_get_grounding_worker_process",
+        lambda: _drain_without_ack_worker,
+    )
+    pipeline_config = SimpleNamespace(
+        get_worker_config=lambda _worker: {
+            "sentinel_consumed": sentinel_consumed,
+        }
+    )
+
+    try:
+        service.start(incoming, outgoing, pipeline_config)
+        _wait_until_ready(service)
+        with pytest.raises(TimeoutError, match="drain acknowledgements"):
+            service.stop(timeout_s=0.5, drain=True)
+        assert sentinel_consumed.is_set()
+        health = service.get_worker_health()
+        assert health["shutdown"]["timed_out"] is True
+        assert health["shutdown"]["forced_termination"] is True
+        assert health["workers"][0]["timed_out"] is True
+        assert health["workers"][0]["forced_termination"] is True
+        assert health["workers"][0]["is_alive"] is False
+    finally:
+        if service.workers:
+            service.stop(timeout_s=1.0, drain=False)
+        _close_queues(incoming, outgoing)
+
+
+def test_full_prompt_queue_fails_drain_within_deadline_and_forces_worker(
+    monkeypatch,
+):
+    context = mp.get_context("spawn")
+    incoming = context.Queue(maxsize=1)
+    outgoing = context.Queue(maxsize=2)
+    service = GroundingService(WorkerConfig(num_grounding_workers=1))
+    monkeypatch.setattr(
+        service,
+        "_get_grounding_worker_process",
+        lambda: _queue_blocking_worker,
+    )
+    pipeline_config = SimpleNamespace(get_worker_config=lambda _worker: {})
+
+    try:
+        service.start(incoming, outgoing, pipeline_config)
+        _wait_until_ready(service)
+        incoming.put("occupies-the-only-slot")
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="prompt queue stayed full"):
+            service.stop(timeout_s=0.5, drain=True)
+        assert time.monotonic() - started < 1.0
+        health = service.get_worker_health()
+        assert health["shutdown"]["timed_out"] is True
+        assert health["shutdown"]["forced_termination"] is True
+        assert health["workers"][0]["drain_request_enqueued"] is False
+    finally:
+        if service.workers:
+            service.stop(timeout_s=1.0, drain=False)
+        _close_queues(incoming, outgoing)

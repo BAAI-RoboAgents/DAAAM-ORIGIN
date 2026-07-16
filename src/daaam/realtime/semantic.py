@@ -5,16 +5,19 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
+import json
 import multiprocessing as mp
 from pathlib import Path
 import queue
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Mapping, Optional
+import uuid
 
 import cv2
 import numpy as np
 
+from daaam.grounding.control import GroundingCorrectionsDrained
 from daaam.grounding.models import ObjectAnnotation
 from daaam.memory import (
     DeliveredSemanticCorrection,
@@ -76,13 +79,29 @@ class _TrackMaskState:
 class HydraDsgSemanticSink:
     """Apply versioned memory updates to a saved/live Hydra DSG with a second ACK."""
 
-    def __init__(self, scene_graph_service: Any) -> None:
+    def __init__(
+        self,
+        scene_graph_service: Any,
+        *,
+        entity_lookup: Optional[Callable[[str], Mapping[str, Any]]] = None,
+    ) -> None:
         self.service = scene_graph_service
+        self._entity_lookup = entity_lookup
         self._entity_to_semantic_id: dict[str, int] = {}
+        self._semantic_id_to_entity: dict[int, str] = {}
+        self._effective_label_by_entity: dict[str, str] = {}
         self._pending: dict[str, DeliveredSemanticCorrection] = {}
         self._applied: set[str] = set()
+        self._applied_entities: set[str] = set()
         self._errors: list[str] = []
         self._attached_path: Optional[Path] = None
+        self._attached_with_mesh_path: Optional[Path] = None
+        self._commit_manifest_path: Optional[Path] = None
+        self._commit_manifest_sha256: Optional[str] = None
+        self._verified_artifacts: list[str] = []
+        self._verified_entities = 0
+        self._verified_operations = 0
+        self._source_mesh_counts: Optional[tuple[int, int]] = None
         self._lock = threading.RLock()
 
     def register_entity(self, entity_id: str, semantic_id: int) -> None:
@@ -92,84 +111,568 @@ class HydraDsgSemanticSink:
             existing = self._entity_to_semantic_id.get(entity_id)
             if existing is not None and existing != semantic_id:
                 raise ValueError("stable entity was assigned multiple semantic IDs")
+            semantic_owner = self._semantic_id_to_entity.get(semantic_id)
+            if semantic_owner is not None and semantic_owner != entity_id:
+                raise ValueError("semantic ID was assigned to multiple stable entities")
             self._entity_to_semantic_id[entity_id] = semantic_id
-            self._drain_pending_locked()
+            self._semantic_id_to_entity[semantic_id] = entity_id
 
     def __call__(self, update: DeliveredSemanticCorrection) -> bool:
         with self._lock:
             self._pending[update.correction.operation_id] = update
-            self._drain_pending_locked()
+            self._effective_label_by_entity[update.correction.entity_id] = (
+                update.effective_label
+            )
         # MapMemory delivery acknowledges durable handoff to this independently
         # audited sink. The DSG ACK remains pending until a mapped node is updated.
         return True
 
-    def _apply_locked(self, update: DeliveredSemanticCorrection) -> bool:
-        semantic_id = self._entity_to_semantic_id.get(update.correction.entity_id)
-        if semantic_id is None or not bool(
-            getattr(self.service, "scene_graph_is_set", False)
+    def _entity_snapshot_locked(self, entity_id: str) -> Optional[Mapping[str, Any]]:
+        if self._entity_lookup is None:
+            return None
+        try:
+            return self._entity_lookup(entity_id)
+        except KeyError:
+            return None
+
+    def _effective_label_locked(self, entity_id: str) -> str:
+        snapshot = self._entity_snapshot_locked(entity_id)
+        if snapshot is not None:
+            canonical_name = str(snapshot.get("canonical_name") or "").strip()
+            if canonical_name:
+                return canonical_name
+        return self._effective_label_by_entity[entity_id]
+
+    @staticmethod
+    def _labelspace_has_update(
+        graph: Any,
+        semantic_id: int,
+        effective_label: str,
+        *labelspace_key: Any,
+    ) -> bool:
+        expected = " ".join(effective_label.split()).strip().casefold()
+        try:
+            labelspace = graph.get_labelspace(*labelspace_key)
+            stored = labelspace.labels_to_names[int(semantic_id)]
+        except (AttributeError, IndexError, KeyError, RuntimeError, TypeError):
+            return False
+        return " ".join(str(stored).split()).strip().casefold() == expected
+
+    @staticmethod
+    def _graph_has_update(
+        graph: Any,
+        semantic_id: int,
+        effective_label: str,
+        entity_id: str,
+    ) -> bool:
+        from spark_dsg import DsgLayers
+
+        expected = " ".join(effective_label.split()).strip().casefold()
+        try:
+            nodes = graph.get_layer(DsgLayers.OBJECTS).nodes
+            requires_parent = bool(
+                list(graph.get_layer(DsgLayers.PLACES).nodes)
+            )
+        except Exception:
+            return False
+        if not HydraDsgSemanticSink._labelspace_has_update(
+            graph,
+            semantic_id,
+            effective_label,
+            2,
+            0,
+        ):
+            return False
+        for node in nodes:
+            if int(node.attributes.semantic_label) != semantic_id:
+                continue
+            metadata = node.attributes.metadata.get() or {}
+            description = " ".join(str(metadata.get("description", "")).split())
+            stored_entity = str(metadata.get("entity_id", "")).strip()
+            if description.casefold() != expected:
+                continue
+            if stored_entity != entity_id:
+                continue
+            if requires_parent and not node.has_parent():
+                continue
+            return True
+        return False
+
+    def _artifact_targets_locked(self) -> list[tuple[Path, bool]]:
+        if self._attached_path is None:
+            return []
+        targets = [(self._attached_path, False)]
+        if self._attached_with_mesh_path is not None:
+            targets.append((self._attached_with_mesh_path, True))
+        return targets
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _object_signature(graph: Any) -> tuple[tuple[Any, ...], ...]:
+        from spark_dsg import DsgLayers
+
+        signature = []
+        for node in graph.get_layer(DsgLayers.OBJECTS).nodes:
+            metadata = node.attributes.metadata.get() or {}
+            signature.append(
+                (
+                    int(node.id.value),
+                    int(node.attributes.semantic_label),
+                    str(metadata.get("entity_id", "")),
+                    str(metadata.get("description", "")),
+                    bool(node.attributes.is_active),
+                    int(node.get_parent()) if node.has_parent() else None,
+                )
+            )
+        return tuple(sorted(signature))
+
+    @staticmethod
+    def _mesh_counts(graph: Any) -> Optional[tuple[int, int]]:
+        if not graph.has_mesh():
+            return None
+        return int(graph.mesh.num_vertices()), int(graph.mesh.num_faces())
+
+    def _commit_is_valid_locked(self) -> bool:
+        manifest_path = self._commit_manifest_path
+        if (
+            manifest_path is None
+            or self._commit_manifest_sha256 is None
+            or not manifest_path.is_file()
         ):
             return False
         try:
-            self.service.store_correction(
-                ObjectAnnotation(
-                    semantic_id=semantic_id,
-                    semantic_label=update.effective_label,
-                    confidence=min(1.0, update.correction.confidence),
-                    timestamp=update.correction.sensor_time_ns / 1.0e9,
-                    entity_id=update.correction.entity_id,
-                    request_id=update.correction.operation_id,
-                    sensor_time_ns=update.correction.sensor_time_ns,
-                    map_revision=update.correction.map_revision,
-                    source_model=update.correction.source,
-                )
-            )
-            with self.service.correction_lock:
-                return semantic_id in self.service.applied_correction_ids
-        except (
-            Exception
-        ) as error:  # pragma: no cover - real Spark failures are optional
-            self._errors.append(repr(error))
+            if self._file_sha256(manifest_path) != self._commit_manifest_sha256:
+                return False
+            manifest = json.loads(manifest_path.read_text())
+            if manifest.get("schema") != "daaam.semantic_dsg_commit.v1":
+                return False
+            records = manifest["artifacts"]
+            expected_names = {
+                target.name for target, _ in self._artifact_targets_locked()
+            }
+            if set(records) != expected_names:
+                return False
+            for name, record in records.items():
+                artifact = manifest_path.with_name(name)
+                if (
+                    not artifact.is_file()
+                    or self._file_sha256(artifact) != record["sha256"]
+                ):
+                    return False
+            return True
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
             return False
 
-    def _drain_pending_locked(self) -> None:
-        for operation_id, update in list(self._pending.items()):
-            if self._apply_locked(update):
-                self._applied.add(operation_id)
-                self._pending.pop(operation_id, None)
-
-    def attach_saved_graph(self, path: Path | str) -> dict[str, int]:
-        graph_path = Path(path).resolve()
-        if not graph_path.is_file():
-            raise FileNotFoundError(graph_path)
+    def _persist_and_reload_locked(
+        self,
+        expected_updates: tuple[tuple[str, int, str], ...] = (),
+        *,
+        verified_entity_ids: Optional[set[str]] = None,
+        verified_operation_count: Optional[int] = None,
+    ) -> tuple[Any, ...]:
+        if self._attached_path is None:
+            graph = getattr(self.service, "scene_graph", None)
+            return () if graph is None else (graph,)
         from spark_dsg import DynamicSceneGraph
 
-        graph = DynamicSceneGraph.load(str(graph_path))
+        token = uuid.uuid4().hex
+        temporary_paths: list[Path] = []
+        candidates: list[tuple[Path, Path, bool, Any, str]] = []
+        manifest_path = self._attached_path.with_name("semantic_dsg_commit.json")
+        self._commit_manifest_path = None
+        self._commit_manifest_sha256 = None
+        self._verified_artifacts = []
+        self._verified_entities = 0
+        self._verified_operations = 0
+        try:
+            if manifest_path.is_file():
+                stale_manifest = manifest_path.with_name(
+                    f".{manifest_path.stem}.stale.{token}{manifest_path.suffix}"
+                )
+                manifest_path.replace(stale_manifest)
+                temporary_paths.append(stale_manifest)
+
+            with self.service.scene_graph_lock:
+                for target, include_mesh in self._artifact_targets_locked():
+                    temporary = target.with_name(
+                        f".{target.stem}.semantic.{token}.tmp{target.suffix}"
+                    )
+                    temporary_paths.append(temporary)
+                    self.service.scene_graph.save(
+                        str(temporary),
+                        include_mesh=include_mesh,
+                    )
+                    candidate_graph = DynamicSceneGraph.load(str(temporary))
+                    candidates.append(
+                        (
+                            target,
+                            temporary,
+                            include_mesh,
+                            candidate_graph,
+                            self._file_sha256(temporary),
+                        )
+                    )
+
+            for target, _, include_mesh, graph, _ in candidates:
+                mesh_counts = self._mesh_counts(graph)
+                if not include_mesh and mesh_counts is not None:
+                    raise RuntimeError("mesh leaked into plain DSG artifact")
+                if (
+                    include_mesh
+                    and self._source_mesh_counts is not None
+                    and mesh_counts != self._source_mesh_counts
+                ):
+                    raise RuntimeError("semantic DSG candidate mesh counts changed")
+                for entity_id, semantic_id, effective_label in expected_updates:
+                    if not self._graph_has_update(
+                        graph,
+                        semantic_id,
+                        effective_label,
+                        entity_id,
+                    ):
+                        raise RuntimeError(
+                            "semantic DSG candidate failed node verification: "
+                            f"{entity_id}"
+                        )
+                    if (
+                        target == self._attached_with_mesh_path
+                        and not self._labelspace_has_update(
+                            graph,
+                            semantic_id,
+                            effective_label,
+                            "mesh",
+                        )
+                    ):
+                        raise RuntimeError(
+                            "semantic DSG mesh labelspace failed verification: "
+                            f"{entity_id}"
+                        )
+
+            signatures = {
+                self._object_signature(graph) for _, _, _, graph, _ in candidates
+            }
+            if len(signatures) != 1:
+                raise RuntimeError("semantic DSG candidate artifacts disagree")
+
+            for target, temporary, _, _, _ in candidates:
+                temporary.replace(target)
+
+            reloaded = tuple(
+                DynamicSceneGraph.load(str(target))
+                for target, _, _, _, _ in candidates
+            )
+            for (target, _, include_mesh, _, candidate_sha256), graph in zip(
+                candidates,
+                reloaded,
+                strict=True,
+            ):
+                if self._file_sha256(target) != candidate_sha256:
+                    raise RuntimeError("semantic DSG final artifact hash changed")
+                mesh_counts = self._mesh_counts(graph)
+                if not include_mesh and mesh_counts is not None:
+                    raise RuntimeError("mesh leaked into final plain DSG artifact")
+                if (
+                    include_mesh
+                    and self._source_mesh_counts is not None
+                    and mesh_counts != self._source_mesh_counts
+                ):
+                    raise RuntimeError("semantic DSG final mesh counts changed")
+                for entity_id, semantic_id, effective_label in expected_updates:
+                    if not self._graph_has_update(
+                        graph,
+                        semantic_id,
+                        effective_label,
+                        entity_id,
+                    ):
+                        raise RuntimeError(
+                            "semantic DSG final artifact failed node verification: "
+                            f"{entity_id}"
+                        )
+                    if (
+                        target == self._attached_with_mesh_path
+                        and not self._labelspace_has_update(
+                            graph,
+                            semantic_id,
+                            effective_label,
+                            "mesh",
+                        )
+                    ):
+                        raise RuntimeError(
+                            "semantic DSG final mesh labelspace failed verification: "
+                            f"{entity_id}"
+                        )
+
+            final_signatures = {self._object_signature(graph) for graph in reloaded}
+            if len(final_signatures) != 1:
+                raise RuntimeError("semantic DSG final artifacts disagree")
+
+            artifact_records = {}
+            for (target, include_mesh), graph in zip(
+                self._artifact_targets_locked(),
+                reloaded,
+                strict=True,
+            ):
+                mesh_counts = self._mesh_counts(graph)
+                artifact_records[target.name] = {
+                    "sha256": self._file_sha256(target),
+                    "requested_include_mesh": include_mesh,
+                    "has_mesh": mesh_counts is not None,
+                    "mesh_vertices": 0 if mesh_counts is None else mesh_counts[0],
+                    "mesh_faces": 0 if mesh_counts is None else mesh_counts[1],
+                    "object_count": len(self._object_signature(graph)),
+                }
+            bound_entities = {
+                record[2]
+                for record in next(iter(final_signatures))
+                if record[2] and record[3]
+            }
+            verified_entities = (
+                set(self._applied_entities)
+                if verified_entity_ids is None
+                else set(verified_entity_ids)
+            )
+            if not verified_entities.issubset(bound_entities):
+                raise RuntimeError("verified DSG entities are missing from artifacts")
+            operation_count = (
+                len(self._applied)
+                if verified_operation_count is None
+                else int(verified_operation_count)
+            )
+            manifest = {
+                "schema": "daaam.semantic_dsg_commit.v1",
+                "committed_ns": time.time_ns(),
+                "artifacts": artifact_records,
+                "object_count": len(next(iter(final_signatures))),
+                "verified_entity_count": len(verified_entities),
+                "verified_operation_count": operation_count,
+            }
+            manifest_temporary = manifest_path.with_name(
+                f".{manifest_path.stem}.{token}.tmp{manifest_path.suffix}"
+            )
+            temporary_paths.append(manifest_temporary)
+            manifest_temporary.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+            )
+            json.loads(manifest_temporary.read_text())
+            manifest_temporary.replace(manifest_path)
+            manifest_sha256 = self._file_sha256(manifest_path)
+
+            self._commit_manifest_path = manifest_path
+            self._commit_manifest_sha256 = manifest_sha256
+            self._verified_artifacts = [
+                str(target) for target, _ in self._artifact_targets_locked()
+            ]
+            self._verified_entities = len(verified_entities)
+            self._verified_operations = operation_count
+            return reloaded
+        finally:
+            for temporary in temporary_paths:
+                temporary.unlink(missing_ok=True)
+
+    def _drain_pending_locked(self) -> None:
+        if (
+            not self._pending
+            or self._attached_path is None
+            or not bool(
+                getattr(self.service, "scene_graph_is_set", False)
+            )
+        ):
+            return
+
+        # Deliver state, not stale intermediate events: every operation for one
+        # entity converges to MapMemory's current effective label.
+        updates_by_entity: dict[str, list[tuple[str, DeliveredSemanticCorrection]]] = {}
+        for operation_id, update in self._pending.items():
+            updates_by_entity.setdefault(update.correction.entity_id, []).append(
+                (operation_id, update)
+            )
+
+        staged: list[tuple[str, int, str, list[str]]] = []
+        try:
+            for entity_id, entity_updates in updates_by_entity.items():
+                semantic_id = self._entity_to_semantic_id.get(entity_id)
+                if semantic_id is None:
+                    continue
+                operation_ids = [operation_id for operation_id, _ in entity_updates]
+                representative = entity_updates[-1][1]
+                effective_label = self._effective_label_locked(entity_id)
+                correction = ObjectAnnotation(
+                    semantic_id=semantic_id,
+                    semantic_label=effective_label,
+                    confidence=min(1.0, representative.correction.confidence),
+                    timestamp=representative.correction.sensor_time_ns / 1.0e9,
+                    entity_id=entity_id,
+                    request_id=representative.correction.operation_id,
+                    sensor_time_ns=representative.correction.sensor_time_ns,
+                    map_revision=representative.correction.map_revision,
+                    source_model=representative.correction.source,
+                )
+                snapshot = self._entity_snapshot_locked(entity_id)
+                ensure_node = getattr(self.service, "ensure_object_node", None)
+                if snapshot is None or not callable(ensure_node):
+                    continue
+                try:
+                    ensured = bool(
+                        ensure_node(
+                            semantic_id=semantic_id,
+                            entity_id=entity_id,
+                            position_m=snapshot.get("position_m"),
+                            dimensions_m=snapshot.get("dimensions_m"),
+                            sensor_time_ns=representative.correction.sensor_time_ns,
+                        )
+                    )
+                except (RuntimeError, ValueError) as error:
+                    rendered = repr(error)
+                    if not self._errors or self._errors[-1] != rendered:
+                        self._errors.append(rendered)
+                    continue
+                if not ensured:
+                    continue
+
+                add_correction = getattr(self.service, "add_correction", None)
+                if callable(add_correction):
+                    add_correction(correction)
+                else:
+                    self.service.store_correction(correction)
+                staged.append(
+                    (entity_id, semantic_id, effective_label, operation_ids)
+                )
+
+            apply_corrections = getattr(self.service, "apply_corrections", None)
+            if callable(apply_corrections):
+                apply_corrections()
+
+            live_graph = self.service.scene_graph
+            verified_entries = tuple(
+                (entity_id, semantic_id, effective_label, operation_ids)
+                for entity_id, semantic_id, effective_label, operation_ids in staged
+                if live_graph is not None
+                and self._graph_has_update(
+                    live_graph,
+                    semantic_id,
+                    effective_label,
+                    entity_id,
+                )
+            )
+            expected_updates = tuple(entry[:3] for entry in verified_entries)
+            verified_operation_ids = {
+                operation_id
+                for _, _, _, operation_ids in verified_entries
+                for operation_id in operation_ids
+            }
+            verified_entity_ids = {
+                entity_id for entity_id, _, _, _ in verified_entries
+            }
+            verification_graphs = self._persist_and_reload_locked(
+                expected_updates,
+                verified_entity_ids=(
+                    self._applied_entities | verified_entity_ids
+                ),
+                verified_operation_count=len(
+                    self._applied | verified_operation_ids
+                ),
+            )
+            for entity_id, semantic_id, effective_label, operation_ids in staged:
+                if not verification_graphs or not all(
+                    self._graph_has_update(
+                        graph,
+                        semantic_id,
+                        effective_label,
+                        entity_id,
+                    )
+                    for graph in verification_graphs
+                ):
+                    continue
+                self._applied.update(operation_ids)
+                self._applied_entities.add(entity_id)
+                for operation_id in operation_ids:
+                    self._pending.pop(operation_id, None)
+        except Exception as error:  # pragma: no cover - depends on Spark I/O
+            rendered = repr(error)
+            if not self._errors or self._errors[-1] != rendered:
+                self._errors.append(rendered)
+
+    def attach_saved_graph(self, path: Path | str) -> dict[str, Any]:
+        requested_path = Path(path).resolve()
+        if not requested_path.is_file():
+            raise FileNotFoundError(requested_path)
+        from spark_dsg import DynamicSceneGraph
+
+        if requested_path.name == "dsg_with_mesh.json":
+            graph_path = requested_path.with_name("dsg.json")
+            with_mesh_path = requested_path
+        else:
+            graph_path = requested_path
+            with_mesh_path = requested_path.with_name("dsg_with_mesh.json")
+        source_path = with_mesh_path if with_mesh_path.is_file() else requested_path
+        graph = DynamicSceneGraph.load(str(source_path))
         with self._lock:
-            self.service.set_scene_graph(graph)
             self._attached_path = graph_path
+            self._attached_with_mesh_path = (
+                with_mesh_path if with_mesh_path.is_file() else None
+            )
+            self._source_mesh_counts = self._mesh_counts(graph)
+            self.service.set_scene_graph(graph)
+            had_pending = bool(self._pending)
             self._drain_pending_locked()
+            if not had_pending:
+                self._persist_and_reload_locked(
+                    verified_entity_ids=set(self._applied_entities),
+                    verified_operation_count=len(self._applied),
+                )
         return self.stats()
 
     def persist(self) -> None:
         with self._lock:
             if self._attached_path is None or not self.service.scene_graph_is_set:
                 return
-            with self.service.scene_graph_lock:
-                self.service.scene_graph.save(str(self._attached_path))
+            had_pending = bool(self._pending)
+            self._drain_pending_locked()
+            if not had_pending:
+                self._persist_and_reload_locked(
+                    verified_entity_ids=set(self._applied_entities),
+                    verified_operation_count=len(self._applied),
+                )
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
+            commit_valid = self._commit_is_valid_locked()
             unmapped = sum(
                 update.correction.entity_id not in self._entity_to_semantic_id
                 for update in self._pending.values()
             )
+            durable_applied = len(self._applied) if commit_valid else 0
+            durable_pending = len(self._pending) + (
+                0 if commit_valid else len(self._applied)
+            )
             return {
                 "mapped_entities": len(self._entity_to_semantic_id),
-                "applied": len(self._applied),
-                "pending": len(self._pending),
+                "applied": durable_applied,
+                "pending": durable_pending,
                 "unmapped": int(unmapped),
-                "graph_attached": bool(
-                    getattr(self.service, "scene_graph_is_set", False)
+                "graph_attached": commit_valid,
+                "commit_valid": commit_valid,
+                "commit_manifest_path": (
+                    None
+                    if self._commit_manifest_path is None
+                    else str(self._commit_manifest_path)
+                ),
+                "commit_manifest_sha256": self._commit_manifest_sha256,
+                "verified_artifacts": (
+                    list(self._verified_artifacts) if commit_valid else []
+                ),
+                "verified_entities": (
+                    self._verified_entities if commit_valid else 0
+                ),
+                "verified_operations": (
+                    self._verified_operations if commit_valid else 0
                 ),
                 "errors": list(self._errors),
             }
@@ -217,7 +720,10 @@ class RealtimeSemanticAdapter:
                 defer_dsg_processing=False,
                 enable_background_objects=False,
             )
-            dsg_sink = HydraDsgSemanticSink(scene_service)
+            dsg_sink = HydraDsgSemanticSink(
+                scene_service,
+                entity_lookup=memory.get_entity,
+            )
         self.segmentation_service = segmentation_service
         self.tracking_service = tracking_service
         self.grounding_service = grounding_service
@@ -236,6 +742,8 @@ class RealtimeSemanticAdapter:
         self.processor = VersionedCorrectionProcessor(memory, dsg_sink)
         self._correction_thread: Optional[threading.Thread] = None
         self._correction_stop = threading.Event()
+        self._correction_drained = threading.Event()
+        self._correction_drain_token: Optional[str] = None
         self._lock = threading.RLock()
         self._last_segmentation_time_ns: Optional[int] = None
         self._semantic_ids_by_track: dict[int, int] = {}
@@ -309,6 +817,8 @@ class RealtimeSemanticAdapter:
                     log_dir=str(self.output_dir / "logs"),
                 )
                 self._correction_stop.clear()
+                self._correction_drained.clear()
+                self._correction_drain_token = None
                 self._correction_thread = threading.Thread(
                     target=self._correction_loop,
                     daemon=True,
@@ -849,11 +1359,15 @@ class RealtimeSemanticAdapter:
             }
 
     def _correction_loop(self) -> None:
-        while not self._correction_stop.is_set() or not self.correction_queue.empty():
+        while not self._correction_stop.is_set():
             try:
                 annotation = self.correction_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
+            if isinstance(annotation, GroundingCorrectionsDrained):
+                self._correction_drain_token = annotation.token
+                self._correction_drained.set()
+                return
             self.process_annotation(annotation)
 
     def process_annotation(self, annotation: Any) -> None:
@@ -964,14 +1478,22 @@ class RealtimeSemanticAdapter:
         return values
 
     def stop(self, timeout_s: float = 30.0, *, drain: bool = True) -> dict[str, Any]:
+        if timeout_s <= 0.0:
+            raise ValueError("semantic stop timeout must be positive")
         deadline = time.monotonic() + timeout_s
         cleanup_errors: list[BaseException] = []
-        if drain and self._grounding_start_attempted:
-            while time.monotonic() < deadline - 5.0 and not self.query_queue.empty():
-                time.sleep(0.05)
+        grounding_shutdown: Optional[dict[str, Any]] = None
+        grounding_stop_succeeded = False
         if self._grounding_start_attempted and self.grounding_service is not None:
             try:
-                self.grounding_service.stop()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError("semantic drain budget expired before DAM stop")
+                grounding_shutdown = self.grounding_service.stop(
+                    timeout_s=remaining,
+                    drain=drain,
+                )
+                grounding_stop_succeeded = True
             except BaseException as error:
                 cleanup_errors.append(error)
             finally:
@@ -980,15 +1502,32 @@ class RealtimeSemanticAdapter:
         thread = self._correction_thread
         if self._correction_thread_start_attempted or thread is not None:
             try:
-                if drain and thread is not None and thread.is_alive():
-                    while (
-                        time.monotonic() < deadline - 2.0
-                        and not self.correction_queue.empty()
-                    ):
-                        time.sleep(0.05)
+                if drain and grounding_stop_succeeded:
+                    drain_token = (
+                        grounding_shutdown.get("drain_token")
+                        if isinstance(grounding_shutdown, dict)
+                        else None
+                    )
+                    if not drain_token:
+                        raise RuntimeError(
+                            "grounding service returned no correction drain token"
+                        )
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0 or not self._correction_drained.wait(remaining):
+                        raise TimeoutError(
+                            "DAM correction consumer did not observe drain completion"
+                        )
+                    if self._correction_drain_token != drain_token:
+                        raise RuntimeError(
+                            "DAM correction drain token did not match grounding workers"
+                        )
+            except BaseException as error:
+                cleanup_errors.append(error)
+            finally:
                 self._correction_stop.set()
+            try:
                 if thread is not None and thread.is_alive():
-                    thread.join(max(0.1, deadline - time.monotonic()))
+                    thread.join(max(0.0, deadline - time.monotonic()))
                     if thread.is_alive():
                         raise RuntimeError("DAM correction consumer did not stop")
             except BaseException as error:
