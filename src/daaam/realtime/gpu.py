@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import fcntl
 from pathlib import Path
+import threading
 import time
 from typing import Iterator, Optional, Protocol
 
@@ -15,6 +16,73 @@ class StopEvent(Protocol):
 
 class GpuLeaseCancelled(RuntimeError):
     """Raised when shutdown is requested while waiting for the shared GPU."""
+
+
+class GpuActivityHeartbeat:
+    """Refresh a coordinator activity marker until explicitly stopped."""
+
+    def __init__(
+        self,
+        coordinator: SharedGpuCoordinator,
+        *,
+        interval_s: float,
+    ) -> None:
+        if interval_s <= 0.0:
+            raise ValueError("GPU activity heartbeat interval must be positive")
+        self.coordinator = coordinator
+        self.interval_s = float(interval_s)
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._error: Optional[BaseException] = None
+        self._state_lock = threading.Lock()
+
+    @property
+    def is_running(self) -> bool:
+        with self._state_lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def _run(self) -> None:
+        try:
+            while not self._stop_event.wait(self.interval_s):
+                self.coordinator.touch_activity()
+        except BaseException as error:
+            with self._state_lock:
+                self._error = error
+            self._stop_event.set()
+
+    def start(self) -> GpuActivityHeartbeat:
+        with self._state_lock:
+            if self._thread is not None:
+                return self
+            self._stop_event.clear()
+            self._error = None
+            self.coordinator.touch_activity()
+            thread = threading.Thread(
+                target=self._run,
+                name="daaam-gpu-activity-heartbeat",
+                daemon=True,
+            )
+            self._thread = thread
+            thread.start()
+        return self
+
+    def stop(self, timeout_s: float = 1.0) -> None:
+        if timeout_s <= 0.0:
+            raise ValueError("GPU activity heartbeat timeout must be positive")
+        with self._state_lock:
+            thread = self._thread
+            self._stop_event.set()
+        if thread is None:
+            return
+        thread.join(timeout_s)
+        if thread.is_alive():
+            raise RuntimeError("GPU activity heartbeat did not stop")
+        with self._state_lock:
+            error = self._error
+            self._thread = None
+            self._error = None
+        if error is not None:
+            raise RuntimeError("GPU activity heartbeat failed") from error
 
 
 class SharedGpuCoordinator:
@@ -53,6 +121,13 @@ class SharedGpuCoordinator:
         if self.activity_path is None or not self.activity_path.exists():
             return None
         return max(0.0, time.time() - self.activity_path.stat().st_mtime)
+
+    def start_activity_heartbeat(
+        self,
+        *,
+        interval_s: float,
+    ) -> GpuActivityHeartbeat:
+        return GpuActivityHeartbeat(self, interval_s=interval_s).start()
 
     @staticmethod
     def _cancelled(stop_event: Optional[StopEvent]) -> bool:

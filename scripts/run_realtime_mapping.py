@@ -1272,6 +1272,7 @@ class RealtimeResourceState:
 
     scheduler: Optional[MultiRateScheduler] = None
     semantic_adapter: Optional[object] = None
+    gpu_activity_heartbeat: Optional[object] = None
     depth_worker: Optional[SubprocessDepthBackend] = None
     memory: Optional[MapMemory] = None
     static_map_backend: Optional[HydraStaticMapBackend] = None
@@ -1306,6 +1307,14 @@ def cleanup_realtime_resources(
         attempt(
             "semantic_adapter",
             lambda: semantic_adapter.stop(timeout_s=timeout_s, drain=False),
+        )
+
+    gpu_activity_heartbeat = resources.gpu_activity_heartbeat
+    resources.gpu_activity_heartbeat = None
+    if gpu_activity_heartbeat is not None:
+        attempt(
+            "gpu_activity_heartbeat",
+            lambda: gpu_activity_heartbeat.stop(timeout_s=timeout_s),
         )
 
     depth_worker = resources.depth_worker
@@ -1559,6 +1568,13 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         lock_path=gpu_lock_path,
         activity_path=gpu_activity_path,
     )
+    gpu_activity_heartbeat_interval_s = (
+        min(0.25, args.dam_minimum_gpu_idle_s / 3.0)
+        if args.semantic_mode == "dam"
+        and gpu_activity_path is not None
+        and args.dam_minimum_gpu_idle_s > 0.0
+        else None
+    )
 
     configuration = {
         "stop_after": args.stop_after,
@@ -1607,6 +1623,7 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
                 str(gpu_activity_path) if gpu_activity_path is not None else None
             ),
             "dam_minimum_idle_s": args.dam_minimum_gpu_idle_s,
+            "activity_heartbeat_interval_s": gpu_activity_heartbeat_interval_s,
         },
         "quality_config": str(args.quality_config.resolve()),
         "quality_config_sha256": sha256_file(args.quality_config),
@@ -1864,6 +1881,12 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             ),
         )
         resources.semantic_adapter = semantic_adapter
+        if gpu_activity_heartbeat_interval_s is not None:
+            resources.gpu_activity_heartbeat = (
+                gpu_coordinator.start_activity_heartbeat(
+                    interval_s=gpu_activity_heartbeat_interval_s,
+                )
+            )
         semantic_adapter.start()
         engine.semantic_label_provider = semantic_adapter.label_image_for
         semantic_startup_seconds = time.monotonic() - semantic_started
@@ -1967,6 +1990,9 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         timeout=max(5.0, args.drain_timeout_s), drain=not idle
     )
     resources.scheduler = None
+    if resources.gpu_activity_heartbeat is not None:
+        resources.gpu_activity_heartbeat.stop()
+        resources.gpu_activity_heartbeat = None
     if "global" in enabled_stages:
         engine.finalize_paths()
         engine.finalize_static_map()

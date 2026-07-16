@@ -45,6 +45,10 @@ def test_resource_cleanup_is_reverse_order_best_effort_and_idempotent():
         def close(self):
             calls.append(("depth_worker",))
 
+    class ActivityHeartbeat:
+        def stop(self, *, timeout_s):
+            calls.append(("gpu_activity_heartbeat", timeout_s))
+
     class Memory:
         def close(self):
             calls.append(("map_memory",))
@@ -57,6 +61,7 @@ def test_resource_cleanup_is_reverse_order_best_effort_and_idempotent():
     resources = RealtimeResourceState(
         scheduler=Scheduler(),
         semantic_adapter=SemanticAdapter(),
+        gpu_activity_heartbeat=ActivityHeartbeat(),
         depth_worker=DepthWorker(),
         memory=Memory(),
         static_map_backend=StaticMapBackend(),
@@ -67,6 +72,7 @@ def test_resource_cleanup_is_reverse_order_best_effort_and_idempotent():
     assert calls == [
         ("scheduler", 1.25, False),
         ("semantic_adapter", 1.25, False),
+        ("gpu_activity_heartbeat", 1.25),
         ("depth_worker",),
         ("map_memory",),
         ("static_map_backend", False),
@@ -308,6 +314,32 @@ def test_semantic_dry_run_records_independent_real_frontend_branch(tmp_path):
         "semantic_frontend",
         "frontend",
     ]
+
+
+def test_dam_dry_run_enables_replay_activity_heartbeat(tmp_path):
+    dataset = create_dataset(tmp_path)
+    hydra_config = tmp_path / "hydra.yaml"
+    hydra_config.write_text("frontend: {}\n")
+    run_dir = tmp_path / "dam-dry"
+    run_replay(
+        dataset,
+        run_dir,
+        "--dry-run",
+        "--semantic-mode",
+        "dam",
+        "--stop-after",
+        "global",
+        "--static-map-backend",
+        "hydra",
+        "--hydra-config-path",
+        str(hydra_config),
+    )
+
+    gpu_configuration = json.loads(
+        (run_dir / "run_manifest.json").read_text()
+    )["configuration"]["gpu_coordination"]
+    assert gpu_configuration["dam_minimum_idle_s"] == 1.0
+    assert gpu_configuration["activity_heartbeat_interval_s"] == 0.25
 
 
 def test_semantic_model_latency_is_reported_under_real_stage_names():
