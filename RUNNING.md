@@ -170,6 +170,137 @@ pixels are invalid or outside the requested range. Add `--with-context` to
 include RGB, an RGB/depth overlay, and a color legend. FoundationStereo depth
 PNGs are read as millimeters and converted to meters automatically.
 
+## 2. Realtime Dynamic Semantic Mapping
+
+The realtime replay path consumes the prepared pinhole dataset produced by the
+validated stereo workflow. It rejects incomplete time contracts before starting:
+every frame must have a positive, strictly increasing `sensor_time_ns`, and
+`cam0_sensor_time_ns`, `pose_sensor_time_ns`, and the corresponding line in
+`pose/pose_timestamps_ns.txt` must match exactly.
+
+Use the DAAAM environment for orchestration. FoundationStereo remains isolated in
+its own Conda environment and is launched as a restartable worker process:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source .repro/ros2_ws/install/setup.bash
+source .repro/venv/bin/activate
+
+python scripts/run_realtime_mapping.py \
+  --dataset /path/to/prepared-pinhole-dataset \
+  --run-dir output/realtime_dry_run \
+  --depth-backend foundation-worker \
+  --foundation-stereo-root third_party/FoundationStereo \
+  --checkpoint "$FOUNDATION_STEREO_CHECKPOINT" \
+  --static-map-backend hydra \
+  --hydra-config-path /path/to/clio_dataset_khronos.yaml \
+  --hydra-labelspace-path config/labels_pseudo.yaml \
+  --hydra-labelspace-colors config/labels_pseudo.csv \
+  --stop-after global \
+  --dry-run
+```
+
+The online profile defaults to 8 FoundationStereo iterations, 0.15 input scale,
+and FP16. Left depth is inferred for every selected frame; full left-right
+consistency is measured every three frames by default. The `refine` profile keeps
+full scale and 32 iterations for offline output.
+
+Run the bounded multi-rate pipeline at a maximum 5 Hz input rate:
+
+```bash
+python scripts/run_realtime_mapping.py \
+  --dataset /path/to/prepared-pinhole-dataset \
+  --run-dir output/realtime_map \
+  --overwrite \
+  --rate-hz 5 \
+  --queue-capacity 8 \
+  --depth-backend foundation-worker \
+  --foundation-stereo-root third_party/FoundationStereo \
+  --checkpoint "$FOUNDATION_STEREO_CHECKPOINT" \
+  --depth-profile online \
+  --depth-confidence-mode left-right \
+  --depth-lr-interval 3 \
+  --static-map-backend hydra \
+  --hydra-config-path /path/to/clio_dataset_khronos.yaml \
+  --hydra-labelspace-path config/labels_pseudo.yaml \
+  --hydra-labelspace-colors config/labels_pseudo.csv \
+  --stop-after global
+```
+
+`--rate-hz` is a maximum dispatch rate. Source intervals and every absolute frame
+timestamp remain unchanged. Use `--allow-source-bursts` only when sub-period bursts
+from the original capture must be replayed exactly. `--no-throttle` is intended for
+deterministic tests and offline stress runs.
+
+Resume an interrupted run without reprocessing its completed front-end prefix:
+
+```bash
+python scripts/run_realtime_mapping.py \
+  --dataset /path/to/prepared-pinhole-dataset \
+  --run-dir output/realtime_map \
+  --resume \
+  --depth-backend foundation-worker \
+  --foundation-stereo-root third_party/FoundationStereo \
+  --checkpoint "$FOUNDATION_STEREO_CHECKPOINT" \
+  --static-map-backend hydra \
+  --hydra-config-path /path/to/clio_dataset_khronos.yaml \
+  --hydra-labelspace-path config/labels_pseudo.yaml \
+  --hydra-labelspace-colors config/labels_pseudo.csv \
+  --stop-after global
+```
+
+Submaps, dynamic tracks, paths, semantic operations, and manual edits restore
+from their checkpoints. Hydra state is deterministically rebuilt from the committed
+`static_depth` prefix using original timestamps and poses, then only new suffix
+frames are fused. Resume fails immediately if a committed static-depth product is
+missing.
+
+Important run artifacts are:
+
+| Artifact | Purpose |
+|---|---|
+| `run_manifest.json` | Git/submodule/model/config hashes and validated time contract |
+| `realtime_checkpoint.json` | Completed frames, map revision, tracks, submaps, and paths |
+| `realtime_metrics.json` | Per-stage queue/service/end-to-end percentiles and drops |
+| `quality_context.json` | Measured depth, pose, dynamic, semantic, resource, and map metrics |
+| `quality_report.json` | Stable PASS/WARN/FAIL gate results and blocking codes |
+| `map_memory.sqlite3` | WAL-backed versioned entities, edits, sessions, and semantic ACKs |
+| `hydra_realtime/backend/mesh.ply` | Static-only Hydra mesh |
+
+Re-run quality and mesh checks independently:
+
+```bash
+python scripts/evaluate_mapping_quality.py \
+  --run-dir output/realtime_map \
+  --config config/realtime_quality_gates.yaml
+
+python scripts/analyze_mesh_quality.py \
+  output/realtime_map/hydra_realtime/backend/mesh.ply \
+  --output output/realtime_map/mesh_quality.json
+```
+
+The Mesh analyzer reports both raw PLY index connectivity and connectivity after
+welding duplicate block-boundary vertices at 0.1 mm. Quality gates use the welded
+geometry because Hydra can emit duplicate coordinates at voxel-block boundaries.
+
+Query or edit persistent map memory without starting the mapping pipeline:
+
+```bash
+python scripts/manage_map_memory.py \
+  --database output/realtime_map/map_memory.sqlite3 list
+
+python scripts/manage_map_memory.py \
+  --database output/realtime_map/map_memory.sqlite3 name ENTITY_ID "inspection desk" \
+  --alias "desk A"
+
+python scripts/manage_map_memory.py \
+  --database output/realtime_map/map_memory.sqlite3 stats
+```
+
+Canonical names are locked by default and survive restart, map revision updates,
+and later automatic semantic corrections. Deletion creates a tombstone; revision
+history remains queryable and can be rolled back explicitly.
+
 ## 3. Creating ROS Bags
 
 The dataloader node reads raw CODa files and publishes them as ROS topics, optionally recording to a bag (preferred option):

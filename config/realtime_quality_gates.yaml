@@ -1,0 +1,37 @@
+maximum_stereo_delta_ms: 10.0
+require_pinhole_projection: true
+minimum_depth_valid_ratio: 0.15
+minimum_depth_temporal_agreement: 0.70
+minimum_left_right_consistency: 0.60
+minimum_left_right_coverage: 0.25
+maximum_pose_translation_step_m: 0.50
+maximum_pose_rotation_step_deg: 20.0
+maximum_pose_position_std_m: 0.50
+maximum_dynamic_contamination_rate: 0.01
+maximum_dynamic_unknown_ratio: 0.60
+minimum_largest_mesh_component_ratio: 0.10
+maximum_mesh_components: 1000
+maximum_semantic_pending_ratio: 0.10
+stage_p95_limits_ms:
+  pose: 30.0
+  tracking: 50.0
+  segmentation: 250.0
+  depth: 250.0
+  fusion: 250.0
+  dynamic: 100.0
+  semantic: 5000.0
+  global: 250.0
+stage_queue_p95_limits_ms:
+  pose: 30.0
+  tracking: 50.0
+  segmentation: 250.0
+  depth: 250.0
+  fusion: 250.0
+  dynamic: 100.0
+  semantic: 5000.0
+  global: 1000.0
+maximum_runtime_drop_ratio: 0.10
+maximum_depth_peak_cuda_memory_bytes: 20000000000
+maximum_depth_worker_rss_bytes: 16000000000
+maximum_depth_worker_restarts: 2
+maximum_runtime_errors: 0

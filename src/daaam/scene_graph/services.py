@@ -42,6 +42,9 @@ class SceneGraphService:
 
 		self.corrections: Dict[int, ObjectAnnotation] = {}
 		self.corrections_queue: List[ObjectAnnotation] = []  # Only for queued corrections before scene graph is set
+		self.pending_correction_ids: set[int] = set()
+		self.applied_correction_ids: set[int] = set()
+		self.correction_application_events = 0
 		self.correction_lock = threading.Lock()
 
 		# CRITICAL: Lock for thread-safe scene graph access
@@ -99,6 +102,7 @@ class SceneGraphService:
 			self.scene_graph = scene_graph
 			self.scene_graph_is_set = True
 		self.logger.info("Scene graph instance set")
+		self.apply_corrections()
 
 	def get_scene_graph(self) -> Optional[DynamicSceneGraph]:
 		"""Get the current scene graph instance."""
@@ -172,6 +176,10 @@ class SceneGraphService:
 		else:
 			# Process normal corrections
 			self.add_correction(correction)
+			# Grounding callbacks run on a dedicated correction thread. Applying here
+			# keeps semantic metadata live without blocking the geometry frontend.
+			if self.scene_graph_is_set and not self.defer_dsg_processing:
+				self.apply_corrections()
 
 			# re-promoting for unknown labels (e.g., out of depth range or failed grounding)
 			semantic_label = correction.semantic_label.lower()
@@ -185,6 +193,7 @@ class SceneGraphService:
 		with self.correction_lock:
 
 			self.corrections[correction.semantic_id] = correction
+			self.pending_correction_ids.add(correction.semantic_id)
 			
 			# queue for later application if scene graph is not set
 			if not self.scene_graph_is_set:
@@ -224,6 +233,7 @@ class SceneGraphService:
 				
 				# single pass through all object nodes
 				nodes_to_remove = []
+				matched_correction_ids = set()
 				object_layer = self.scene_graph.get_layer(DsgLayers.OBJECTS)
 				
 				for node in object_layer.nodes:
@@ -231,6 +241,7 @@ class SceneGraphService:
 					
 					# Check if we have a correction for this node's semantic_id
 					if semantic_id in corrections_copy:
+						matched_correction_ids.add(semantic_id)
 						correction = corrections_copy[semantic_id]
 						semantic_label = correction.semantic_label.lower()
 						embedding = correction.embedding
@@ -297,6 +308,10 @@ class SceneGraphService:
 					self.logger.debug(
 						f"Finished applying {n_changes} semantic corrections. Corrections dict size: {len(corrections_copy)}"
 					)
+				with self.correction_lock:
+					self.pending_correction_ids.difference_update(matched_correction_ids)
+					self.applied_correction_ids.update(matched_correction_ids)
+					self.correction_application_events += len(matched_correction_ids)
 
 			# Identify background objects after applying corrections
 			with performance_measure("Identifying background objects", self.logger.debug):
@@ -373,7 +388,9 @@ class SceneGraphService:
 		with self.correction_lock:
 			stats = {
 				"total_corrections": len(self.corrections),
-				"pending_corrections": len(self.corrections_queue),
+				"pending_corrections": len(self.pending_correction_ids),
+				"applied_corrections": len(self.applied_correction_ids),
+				"application_events": self.correction_application_events,
 				"scene_graph_set": self.scene_graph_is_set,
 				"async_enabled": self._enable_async,
 				"keyframe_annotations_count": len(self.keyframe_annotations),

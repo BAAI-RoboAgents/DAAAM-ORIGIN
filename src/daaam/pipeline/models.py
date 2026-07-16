@@ -1,11 +1,26 @@
 """Data models for the pipeline orchestrator."""
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
-from pydantic import BaseModel
+from typing import TYPE_CHECKING, List, Dict, Any, Optional
+
+try:
+	from pydantic import BaseModel
+except ImportError:
+	class BaseModel:
+		"""Deferred error for semantic models when pydantic is not installed."""
+
+		def __init__(self, *_args, **_kwargs):
+			raise RuntimeError(
+				"pydantic is required for semantic pipeline messages; "
+				"install project runtime dependencies"
+			)
+
 import numpy as np
 import time
 
-from daaam.tracking.models import Track
+if TYPE_CHECKING:
+	from daaam.tracking.models import Track
 
 @dataclass
 class Frame:

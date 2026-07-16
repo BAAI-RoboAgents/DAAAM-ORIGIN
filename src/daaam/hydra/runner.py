@@ -150,6 +150,7 @@ class HydraPipelineRunner:
 			config=self.config,
 			logger=self.logger
 		)
+		self._hydra_graph_attached = False
 		
 		# Statistics
 		self.stats = {
@@ -159,6 +160,8 @@ class HydraPipelineRunner:
 			"cv_processing_times": [],
 			"tracks_created": 0,
 			"corrections_applied": 0,
+			"corrections_received": 0,
+			"corrections_pending": 0,
 			"dsg_nodes": 0,
 			"dsg_edges": 0
 		}
@@ -423,10 +426,13 @@ class HydraPipelineRunner:
 			self.logger.info(f"Dual pipeline processing complete. Results saved to {self.output_dir}")
 			
 		finally:
-			# Stop the daaam pipeline
+			# Materialize Hydra's graph before draining late semantic corrections.
+			if self.hydra and not self._hydra_graph_attached:
+				self.hydra.save_results()
+				self._attach_saved_hydra_scene_graph()
 			self.orchestrator.stop()
-			
-			# Save and shutdown Hydra
+			self._process_corrections()
+			self._write_processing_stats()
 			if self.hydra:
 				self.hydra.shutdown()
 				
@@ -461,29 +467,19 @@ class HydraPipelineRunner:
 		self.logger.info("Shutdown complete")
 	
 	def _process_corrections(self) -> None:
-		"""Process corrections from daaam and apply to scene graph."""
-		if not hasattr(self.orchestrator, 'correction_queue'):
+		"""Synchronize correction stats; the orchestrator owns its worker queue."""
+		if not hasattr(self.orchestrator, 'scene_graph_service'):
 			return
-		
-		# Get any pending corrections
-		corrections_processed = 0
-		while True:
-			try:
-				correction = self.orchestrator.correction_queue.get_nowait()
-				
-				# Apply correction through scene graph service
-				if hasattr(self.orchestrator, 'scene_graph_service'):
-					self.orchestrator.scene_graph_service.store_correction(correction)
-					corrections_processed += 1
-					
-			except queue.Empty:
-				break
-			except Exception as e:
-				self.logger.debug(f"Error processing correction: {e}")
-		
-		if corrections_processed > 0:
-			self.stats["corrections_applied"] += corrections_processed
-			self.logger.debug(f"Applied {corrections_processed} corrections")
+		correction_stats = self.orchestrator.scene_graph_service.get_correction_stats()
+		self.stats["corrections_received"] = correction_stats.get(
+			"total_corrections", 0
+		)
+		self.stats["corrections_applied"] = correction_stats.get(
+			"applied_corrections", 0
+		)
+		self.stats["corrections_pending"] = correction_stats.get(
+			"pending_corrections", 0
+		)
 	
 	def _compute_final_stats(self) -> None:
 		"""Compute final processing statistics."""
@@ -521,11 +517,28 @@ class HydraPipelineRunner:
 		except Exception as e:
 			self.logger.warning(f"Failed to get health status: {e}")
 	
-	def _save_results(self) -> None:
-		"""Save processing results to output directory."""
+	def _attach_saved_hydra_scene_graph(self) -> bool:
+		"""Attach Hydra's saved DSG so semantic corrections receive real ACKs."""
+		dsg_path = self.hydra.output_dir / "backend" / "dsg.json"
+		if not dsg_path.is_file():
+			self.logger.warning(f"Hydra DSG is not available for correction: {dsg_path}")
+			return False
+		try:
+			from spark_dsg import DynamicSceneGraph
+
+			graph = DynamicSceneGraph.load(str(dsg_path))
+			self.orchestrator.scene_graph_service.set_scene_graph(graph)
+			self._hydra_graph_attached = True
+			self._process_corrections()
+			return True
+		except Exception as error:
+			self.logger.error(f"Failed to attach saved Hydra DSG: {error}")
+			return False
+
+	def _write_processing_stats(self) -> None:
+		"""Write the latest synchronized statistics."""
 		import json
-		
-		# Save statistics
+
 		stats_file = self.output_dir / "processing_stats.json"
 		with open(stats_file, 'w') as f:
 			# Convert numpy values for JSON serialization
@@ -545,12 +558,16 @@ class HydraPipelineRunner:
 			json.dump(stats_to_save, f, indent=2)
 		
 		self.logger.info(f"Saved processing statistics to {stats_file}")
+
+	def _save_results(self) -> None:
+		"""Save geometry first, apply semantics, then persist synchronized stats."""
+		if self.hydra:
+			self.hydra.save_results()
+			self._attach_saved_hydra_scene_graph()
+		self._process_corrections()
+		self._write_processing_stats()
 		
 		# Save configuration
 		config_file = self.output_dir / "cv_pipeline_config.yaml"
 		self.config.to_yaml(str(config_file))
 		self.logger.info(f"Saved daaam configuration to {config_file}")
-		
-		# Save Hydra results
-		if self.hydra:
-			self.hydra.save_results()

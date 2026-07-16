@@ -1,0 +1,310 @@
+"""End-to-end tests for dry-run, replay, fault injection, and resume."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+import cv2
+import numpy as np
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+RUNNER = REPOSITORY_ROOT / "scripts" / "run_realtime_mapping.py"
+ORIGIN_NS = 1_783_933_507_759_540_877
+sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
+
+from run_realtime_mapping import (  # noqa: E402
+    resolve_environment_python,
+    scheduled_confidence_mode,
+)
+
+
+def create_dataset(root: Path, frame_count: int = 4) -> Path:
+    dataset = root / "dataset"
+    for directory in (
+        "rgb",
+        "stereo_right",
+        "depth",
+        "depth_confidence",
+        "depth_consistency",
+        "pose",
+    ):
+        (dataset / directory).mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(11)
+    texture = rng.integers(0, 255, (48, 64, 3), dtype=np.uint8)
+    frames = []
+    poses = []
+    timestamps = []
+    offsets = [0, 100_000_000, 260_000_000, 480_000_000]
+    for index in range(frame_count):
+        timestamp = ORIGIN_NS + offsets[index]
+        timestamps.append(timestamp)
+        rgb_path = dataset / "rgb" / f"{index:08d}.png"
+        right_path = dataset / "stereo_right" / f"{index:08d}.png"
+        cv2.imwrite(str(rgb_path), texture)
+        cv2.imwrite(str(right_path), texture)
+        cv2.imwrite(
+            str(dataset / "depth" / f"{index:08d}.png"),
+            np.full((48, 64), 1500, dtype=np.uint16),
+        )
+        cv2.imwrite(
+            str(dataset / "depth_confidence" / f"{index:08d}.png"),
+            np.full((48, 64), 255, dtype=np.uint8),
+        )
+        cv2.imwrite(
+            str(dataset / "depth_consistency" / f"{index:08d}.png"),
+            np.full((48, 64), 255, dtype=np.uint8),
+        )
+        pose = np.eye(4)
+        pose[0, 3] = index * 0.01
+        poses.append(pose)
+        frames.append(
+            {
+                "idx": index,
+                "source_idx": index,
+                "pose_row": index,
+                "cam0": str(rgb_path),
+                "cam1": str(right_path),
+                "timestamp": offsets[index] / 1e9,
+                "sensor_time_ns": timestamp,
+                "cam0_sensor_time_ns": timestamp,
+                "cam1_sensor_time_ns": timestamp,
+                "pose_sensor_time_ns": timestamp,
+                "stereo_delta_ms": 0.0,
+                "selection_reason": "initial_frame" if index == 0 else "routine",
+            }
+        )
+    (dataset / "pose" / "poses.txt").write_text(
+        "".join(
+            " ".join(str(value) for value in pose.reshape(-1)) + "\n"
+            for pose in poses
+        )
+    )
+    (dataset / "pose" / "pose_timestamps_ns.txt").write_text(
+        "".join(f"{value}\n" for value in timestamps)
+    )
+    (dataset / "camera_info.json").write_text(
+        json.dumps(
+            {
+                "width": 64,
+                "height": 48,
+                "intrinsics": [
+                    [60.0, 0.0, 31.5],
+                    [0.0, 60.0, 23.5],
+                    [0.0, 0.0, 1.0],
+                ],
+            }
+        )
+    )
+    (dataset / "tick_index.json").write_text(
+        json.dumps(
+            {
+                "time_origin_ns": ORIGIN_NS,
+                "projection_model": "pinhole",
+                "fx": 60.0,
+                "fy": 60.0,
+                "cx": 31.5,
+                "cy": 23.5,
+                "baseline": 0.07,
+                "frames": frames,
+            }
+        )
+    )
+    return dataset
+
+
+def run_replay(dataset: Path, run_dir: Path, *extra, check=True):
+    return subprocess.run(
+        [
+            sys.executable,
+            str(RUNNER),
+            "--dataset",
+            str(dataset),
+            "--run-dir",
+            str(run_dir),
+            "--no-throttle",
+            "--stage-rate-multiplier",
+            "100",
+            "--quality-report-only",
+            *extra,
+        ],
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_dry_run_writes_manifest_and_absolute_time_plan(tmp_path):
+    dataset = create_dataset(tmp_path)
+    run_dir = tmp_path / "dry"
+    run_replay(dataset, run_dir, "--dry-run")
+    manifest = json.loads((run_dir / "run_manifest.json").read_text())
+    plan = json.loads((run_dir / "dry_run_plan.json").read_text())
+    assert manifest["time_contract"]["valid"]
+    assert manifest["dataset"]["tick_index_sha256"]
+    assert plan["frame_count"] == 4
+    assert plan["stages"] == ["pose", "depth", "tracking", "fusion"]
+    assert not (run_dir / "realtime_checkpoint.json").exists()
+
+
+def test_foundation_dry_run_records_effective_profile_values(tmp_path):
+    dataset = create_dataset(tmp_path)
+    foundation_root = tmp_path / "FoundationStereo"
+    foundation_root.mkdir()
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"test checkpoint")
+    run_dir = tmp_path / "foundation-dry"
+    run_replay(
+        dataset,
+        run_dir,
+        "--dry-run",
+        "--depth-backend",
+        "foundation-worker",
+        "--foundation-stereo-python",
+        sys.executable,
+        "--foundation-stereo-root",
+        str(foundation_root),
+        "--checkpoint",
+        str(checkpoint),
+        "--depth-profile",
+        "online",
+    )
+    profile = json.loads((run_dir / "run_manifest.json").read_text())["models"][
+        "foundation_stereo"
+    ]
+    assert profile["profile"] == "online"
+    assert profile["valid_iters"] == 8
+    assert profile["scale"] == 0.15
+    assert profile["precision"] == "fp16"
+
+
+def test_periodic_left_right_validation_never_skips_left_depth_inference():
+    modes = [
+        scheduled_confidence_mode(
+            index,
+            configured_mode="left-right",
+            left_right_interval=3,
+        )
+        for index in range(7)
+    ]
+    assert modes == [
+        "left-right",
+        "validity",
+        "validity",
+        "left-right",
+        "validity",
+        "validity",
+        "left-right",
+    ]
+    assert all(mode in {"left-right", "validity"} for mode in modes)
+
+
+def test_explicit_depth_python_is_resolved_without_parent_virtualenv_leakage():
+    assert resolve_environment_python("unused", Path(sys.executable)) == Path(
+        sys.executable
+    ).resolve()
+
+
+def test_replay_completes_all_frames_and_writes_static_fusion_products(tmp_path):
+    dataset = create_dataset(tmp_path)
+    run_dir = tmp_path / "run"
+    run_replay(dataset, run_dir)
+    report = json.loads((run_dir / "realtime_run_report.json").read_text())
+    checkpoint = json.loads((run_dir / "realtime_checkpoint.json").read_text())
+    quality = json.loads((run_dir / "quality_report.json").read_text())
+    context = json.loads((run_dir / "quality_context.json").read_text())
+    assert report["frames_completed"] == 4
+    assert report["dropped_frames"] == {}
+    assert report["frames_by_stage"]["fusion"] == 4
+    assert checkpoint["completed_frame_indices"] == [0, 1, 2, 3]
+    assert len(list((run_dir / "static_depth").glob("*.png"))) == 4
+    assert quality["required_stages"] == ["time", "pose", "runtime", "depth", "dynamic"]
+    assert context["depth"]["left_right_coverage"] == 1.0
+
+
+def test_depth_metadata_distinguishes_verified_consistency_from_validity_fallback(
+    tmp_path,
+):
+    dataset = create_dataset(tmp_path)
+    metadata = json.loads((dataset / "tick_index.json").read_text())
+    metadata_dir = dataset / "depth_metadata"
+    metadata_dir.mkdir()
+    for frame in metadata["frames"]:
+        verified = frame["idx"] == 0
+        (metadata_dir / f"{frame['idx']:08d}.json").write_text(
+            json.dumps(
+                {
+                    "frame_idx": frame["idx"],
+                    "sensor_time_ns": frame["sensor_time_ns"],
+                    "confidence_mode": "left-right" if verified else "validity",
+                    "left_right_verified": verified,
+                    "left_right_consistency": 0.7 if verified else None,
+                }
+            )
+        )
+    run_dir = tmp_path / "depth-evidence"
+    run_replay(dataset, run_dir)
+    context = json.loads((run_dir / "quality_context.json").read_text())
+    assert context["depth"]["left_right_coverage"] == 0.25
+    assert context["depth"]["left_right_consistency"] == 0.7
+
+
+def test_resume_continues_from_checkpoint_without_reprocessing_prefix(tmp_path):
+    dataset = create_dataset(tmp_path)
+    run_dir = tmp_path / "resume"
+    run_replay(dataset, run_dir, "--max-frames", "2")
+    first = json.loads((run_dir / "realtime_run_report.json").read_text())
+    assert first["frames_completed"] == 2
+    run_replay(dataset, run_dir, "--resume")
+    resumed = json.loads((run_dir / "realtime_run_report.json").read_text())
+    assert resumed["frames_resumed_from"] == 2
+    assert resumed["frames_completed"] == 4
+    assert resumed["frames_by_stage"]["fusion"] == 2
+
+
+def test_global_path_history_survives_checkpoint_resume(tmp_path):
+    dataset = create_dataset(tmp_path)
+    run_dir = tmp_path / "global-resume"
+    run_replay(
+        dataset,
+        run_dir,
+        "--max-frames",
+        "2",
+        "--stop-after",
+        "global",
+    )
+    run_replay(dataset, run_dir, "--resume", "--stop-after", "global")
+    paths = json.loads((run_dir / "canonical_paths.json").read_text())
+    checkpoint = json.loads((run_dir / "realtime_checkpoint.json").read_text())
+    assert len(paths["paths"]) == 1
+    assert len(paths["paths"][0]["observations"]) == 2
+    assert checkpoint["paths"] == paths
+
+
+def test_stage_failure_is_observable_and_frame_is_not_silently_committed(tmp_path):
+    dataset = create_dataset(tmp_path)
+    run_dir = tmp_path / "fault"
+    run_replay(
+        dataset,
+        run_dir,
+        "--fault-stage",
+        "tracking",
+        "--fault-error-every",
+        "2",
+    )
+    report = json.loads((run_dir / "realtime_run_report.json").read_text())
+    metrics = json.loads((run_dir / "realtime_metrics.json").read_text())
+    quality = json.loads((run_dir / "quality_report.json").read_text())
+    runtime_gate = next(
+        result for result in quality["results"] if result["stage"] == "runtime"
+    )
+    assert report["status"] == "stage_error"
+    assert report["frames_completed"] == 2
+    assert set(report["dropped_frames"].values()) == {"pipeline_not_completed"}
+    assert metrics["stages"]["tracking"]["errors"] == 2
+    assert len(metrics["handler_errors"]) == 2
+    assert runtime_gate["code"] == "runtime.stage_error"
+    assert runtime_gate["blocks_pipeline"]

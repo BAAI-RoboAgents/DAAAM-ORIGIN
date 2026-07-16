@@ -100,6 +100,17 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("FOUNDATION_STEREO_CHECKPOINT"),
     )
     depth.add_argument("--valid-iters", type=int, default=32)
+    depth.add_argument(
+        "--depth-profile", choices=("online", "refine", "custom"), default="refine"
+    )
+    depth.add_argument("--depth-scale", type=float)
+    depth.add_argument("--depth-precision", choices=("fp32", "fp16", "bf16"))
+    depth.add_argument(
+        "--depth-confidence-mode",
+        choices=("left-right", "validity"),
+        default="left-right",
+    )
+    depth.add_argument("--depth-torch-compile", action="store_true")
     depth.add_argument("--max-depth-m", type=float)
     depth.add_argument("--swap-stereo", action="store_true")
     depth.add_argument(
@@ -315,7 +326,11 @@ def depth_manifest(report_path: Path) -> dict[str, Any]:
         for key in (
             "checkpoint",
             "foundation_stereo_root",
+            "profile",
             "valid_iters",
+            "scale",
+            "precision",
+            "confidence_mode",
             "max_depth_m",
             "swap_stereo",
         )
@@ -624,7 +639,17 @@ def main() -> None:
             str(checkpoint),
             "--valid-iters",
             str(args.valid_iters),
+            "--profile",
+            args.depth_profile,
+            "--confidence-mode",
+            args.depth_confidence_mode,
         ]
+        if args.depth_scale is not None:
+            command.extend(["--scale", str(args.depth_scale)])
+        if args.depth_precision is not None:
+            command.extend(["--precision", args.depth_precision])
+        if args.depth_torch_compile:
+            command.append("--torch-compile")
         if args.max_depth_m is not None:
             command.extend(["--max-depth-m", str(args.max_depth_m)])
         if args.swap_stereo:
