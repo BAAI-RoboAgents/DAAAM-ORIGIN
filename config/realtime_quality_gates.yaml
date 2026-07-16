@@ -22,7 +22,7 @@ stage_p95_limits_ms:
   depth: 250.0
   fusion: 250.0
   dynamic: 100.0
-  semantic: 5000.0
+  semantic_frontend: 5000.0
   global: 250.0
 stage_queue_p95_limits_ms:
   pose: 30.0
@@ -31,7 +31,7 @@ stage_queue_p95_limits_ms:
   depth: 250.0
   fusion: 250.0
   dynamic: 100.0
-  semantic: 5000.0
+  semantic_frontend: 5000.0
   global: 1000.0
 stage_end_to_end_p95_limits_ms:
   global: 1000.0

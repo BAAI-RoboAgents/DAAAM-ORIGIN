@@ -65,7 +65,7 @@ class QualityGateConfig:
             "depth": 250.0,
             "fusion": 250.0,
             "dynamic": 100.0,
-            "semantic": 5000.0,
+            "semantic_frontend": 5000.0,
             "global": 250.0,
         }
     )
@@ -77,7 +77,7 @@ class QualityGateConfig:
             "depth": 250.0,
             "fusion": 250.0,
             "dynamic": 100.0,
-            "semantic": 5000.0,
+            "semantic_frontend": 5000.0,
             "global": 1000.0,
         }
     )

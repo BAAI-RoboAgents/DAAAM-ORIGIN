@@ -108,6 +108,27 @@ def test_runtime_rejects_map_cycle_slower_than_1_hz_target():
     assert runtime["metrics"]["end_to_end_exceeded"]["global"]["limit_ms"] == 1000.0
 
 
+def test_runtime_gates_real_semantic_frontend_stage_name():
+    context = valid_context()
+    context["runtime"]["stages"]["semantic_frontend"] = {
+        "latency": {
+            "service_ms": {"p95": 5000.1},
+            "queue_wait_ms": {"p95": 10.0},
+        }
+    }
+
+    report = QualityGateRunner().evaluate(context)
+    runtime = next(
+        result for result in report["results"] if result["stage"] == "runtime"
+    )
+
+    assert runtime["code"] == "runtime.p95_exceeded"
+    assert runtime["metrics"]["service_exceeded"]["semantic_frontend"] == {
+        "p95_ms": 5000.1,
+        "limit_ms": 5000.0,
+    }
+
+
 def test_depth_gate_rejects_insufficient_left_right_validation_coverage():
     context = valid_context()
     context["depth"]["left_right_coverage"] = 0.2
