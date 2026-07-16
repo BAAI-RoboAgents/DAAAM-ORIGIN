@@ -29,6 +29,7 @@ class FakeHydraIntegration:
         self.frames = []
         self.saved = False
         self.closed = False
+        self.save_on_shutdown = None
 
     def initialize_camera(self, **camera):
         self.camera = camera
@@ -47,7 +48,8 @@ class FakeHydraIntegration:
     def get_stats(self):
         return {"frames_processed": len(self.frames)}
 
-    def shutdown(self):
+    def shutdown(self, *, save_results=True):
+        self.save_on_shutdown = save_results
         self.closed = True
 
 
@@ -115,6 +117,7 @@ def test_hydra_backend_receives_static_depth_and_original_absolute_time(tmp_path
     assert backend.stats()["frames_processed"] == 2
     backend.close()
     assert integration.closed
+    assert integration.save_on_shutdown is False
 
 
 def test_hydra_close_without_finalize_only_releases_pipeline(tmp_path):
@@ -132,6 +135,7 @@ def test_hydra_close_without_finalize_only_releases_pipeline(tmp_path):
 
     assert not integration.saved
     assert integration.closed
+    assert integration.save_on_shutdown is False
     assert not backend.stats()["finalized"]
 
 

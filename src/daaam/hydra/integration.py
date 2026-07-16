@@ -322,11 +322,12 @@ class HydraIntegration:
 			stats["total_processing_time"] = np.sum(stats["processing_times"])
 		return stats
 	
-	def shutdown(self) -> None:
-		"""Shutdown Hydra pipeline."""
+	def shutdown(self, *, save_results: bool = True) -> None:
+		"""Shutdown Hydra pipeline, optionally saving its current in-memory state."""
 		try:
 			if self.pipeline:
-				self.save_results()
+				if save_results:
+					self.save_results()
 				# Pipeline cleanup if needed
 				self.pipeline = None
 			self.logger.info("Hydra integration shutdown complete")

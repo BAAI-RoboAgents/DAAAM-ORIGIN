@@ -212,6 +212,9 @@ class HydraStaticMapBackend:
                 self.finalize()
         finally:
             try:
-                integration.shutdown()
+                # ``finalize`` above owns persistence. Saving implicitly during
+                # shutdown could overwrite semantic corrections applied to the
+                # finalized DSG after Hydra released its in-memory graph.
+                integration.shutdown(save_results=False)
             finally:
                 self._integration = None
