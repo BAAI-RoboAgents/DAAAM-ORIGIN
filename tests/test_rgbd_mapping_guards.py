@@ -188,6 +188,89 @@ class RgbdMappingGuardTests(unittest.TestCase):
             self.assertTrue(report["rgb_frames_preserved"])
             self.assertTrue(report["poses_preserved"])
 
+    def test_temporal_filter_preserves_verifiable_left_right_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset, timestamps = create_rgbd_dataset(root)
+            for directory in (
+                "depth_confidence",
+                "depth_consistency",
+                "depth_occlusion",
+                "depth_metadata",
+            ):
+                (dataset / directory).mkdir()
+            for index, timestamp in enumerate(timestamps):
+                cv2.imwrite(
+                    str(dataset / "depth_confidence" / f"{index:08d}.png"),
+                    np.full((24, 32), 220, dtype=np.uint8),
+                )
+                cv2.imwrite(
+                    str(dataset / "depth_consistency" / f"{index:08d}.png"),
+                    np.full((24, 32), 255, dtype=np.uint8),
+                )
+                cv2.imwrite(
+                    str(dataset / "depth_occlusion" / f"{index:08d}.png"),
+                    np.zeros((24, 32), dtype=np.uint8),
+                )
+                (dataset / "depth_metadata" / f"{index:08d}.json").write_text(
+                    json.dumps(
+                        {
+                            "frame_idx": index,
+                            "sensor_time_ns": timestamp,
+                            "confidence_mode": "left-right",
+                            "left_right_verified": True,
+                            "left_right_consistency": 1.0,
+                        }
+                    )
+                )
+
+            output = root / "filtered-with-evidence"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPOSITORY_ROOT
+                        / "scripts/filter_temporal_depth_consistency.py"
+                    ),
+                    "--dataset",
+                    str(dataset),
+                    "--output",
+                    str(output),
+                    "--neighbor-offsets",
+                    "1,2",
+                    "--filter-scale",
+                    "1",
+                    "--min-judged-neighbors",
+                    "1",
+                    "--min-support-ratio",
+                    "0.5",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            for directory in (
+                "depth_confidence",
+                "depth_consistency",
+                "depth_occlusion",
+                "depth_metadata",
+            ):
+                self.assertEqual(len(list((output / directory).iterdir())), 5)
+            metadata = json.loads(
+                (output / "depth_metadata" / "00000000.json").read_text()
+            )
+            self.assertTrue(metadata["left_right_verified"])
+            self.assertEqual(
+                metadata["temporal_filter"]["method"],
+                "multi_neighbor_reprojection_consistency",
+            )
+            self.assertEqual(len(metadata["temporal_filter"]["output_depth_sha256"]), 64)
+            report = json.loads(
+                (output / "temporal_depth_filter_report.json").read_text()
+            )
+            self.assertEqual(report["depth_evidence"]["coverage"], 1.0)
+
     def test_nonuniform_time_temporal_gate_uses_every_adjacent_pair(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

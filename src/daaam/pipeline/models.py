@@ -53,6 +53,10 @@ class PromptRecord:
 	object_labels: Dict[int, int]  # Mapping from track_id to semantic_id
 	frame_id: int = -1  # Frame identifier, default -1 if unknown
 	timestamp: float = 0.0  # Observation timestamp in seconds
+	sensor_time_ns: int = 0  # Absolute capture timestamp for versioned delivery
+	map_revision: int = 0
+	request_id: str = ""
+	entity_ids: Dict[int, str] = field(default_factory=dict)  # track_id -> entity_id
 
 
 class MinimalCorrection(BaseModel):

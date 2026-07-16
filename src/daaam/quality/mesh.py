@@ -51,14 +51,49 @@ def _component_counts(
     return list(counts.values()), len(used_vertices)
 
 
+def _polygon_area(vertices: np.ndarray, indices: list[int]) -> float:
+    """Return the area of a planar polygon using a triangle fan."""
+    anchor = vertices[indices[0]]
+    area = 0.0
+    for offset in range(1, len(indices) - 1):
+        first = vertices[indices[offset]] - anchor
+        second = vertices[indices[offset + 1]] - anchor
+        area += 0.5 * float(np.linalg.norm(np.cross(first, second)))
+    return area
+
+
+def _component_areas(
+    vertex_count: int,
+    topology_faces: list[list[int]],
+    source_vertices: np.ndarray,
+    source_faces: list[list[int]],
+) -> list[float]:
+    """Accumulate source-face area using welded topology connectivity."""
+    if len(topology_faces) != len(source_faces):
+        raise ValueError("topology and source face counts differ")
+    components = _DisjointSet(vertex_count)
+    for indices in topology_faces:
+        anchor = indices[0]
+        for index in indices[1:]:
+            components.union(anchor, index)
+    areas: dict[int, float] = {}
+    for topology, source in zip(topology_faces, source_faces):
+        root = components.find(topology[0])
+        areas[root] = areas.get(root, 0.0) + _polygon_area(source_vertices, source)
+    return list(areas.values())
+
+
 def analyze_ascii_ply_mesh(
     path: Path | str,
     *,
     weld_tolerance_m: float = 1.0e-4,
+    minimum_significant_component_area_m2: float = 5.0e-3,
 ) -> dict:
     mesh_path = Path(path)
     if weld_tolerance_m <= 0.0:
         raise ValueError("mesh weld tolerance must be positive")
+    if minimum_significant_component_area_m2 <= 0.0:
+        raise ValueError("minimum significant component area must be positive")
     if not mesh_path.is_file():
         raise FileNotFoundError(mesh_path)
     with mesh_path.open("r", encoding="ascii") as stream:
@@ -125,8 +160,22 @@ def analyze_ascii_ply_mesh(
         welded_vertex_count,
         welded_faces,
     )
+    welded_areas = _component_areas(
+        welded_vertex_count,
+        welded_faces,
+        vertices,
+        valid_faces,
+    )
     connected_components = len(welded_counts)
     largest = max(welded_counts, default=0)
+    total_area_m2 = float(sum(welded_areas))
+    largest_area_m2 = max(welded_areas, default=0.0)
+    significant_areas = [
+        area
+        for area in welded_areas
+        if area >= minimum_significant_component_area_m2
+    ]
+    tiny_area_m2 = total_area_m2 - float(sum(significant_areas))
     bounds = {
         "minimum_m": vertices.min(axis=0).tolist() if vertex_count else None,
         "maximum_m": vertices.max(axis=0).tolist() if vertex_count else None,
@@ -143,6 +192,18 @@ def analyze_ascii_ply_mesh(
         "connected_components": connected_components,
         "largest_component_vertices": largest,
         "largest_component_ratio": largest / max(1, welded_used_count),
+        "surface_area_m2": total_area_m2,
+        "largest_component_area_m2": largest_area_m2,
+        "largest_component_area_ratio": largest_area_m2
+        / max(total_area_m2, np.finfo(np.float64).eps),
+        "minimum_significant_component_area_m2": (
+            minimum_significant_component_area_m2
+        ),
+        "significant_connected_components": len(significant_areas),
+        "significant_component_area_m2": float(sum(significant_areas)),
+        "tiny_component_area_m2": tiny_area_m2,
+        "tiny_component_area_ratio": tiny_area_m2
+        / max(total_area_m2, np.finfo(np.float64).eps),
         "raw_vertices_used_by_faces": raw_used_count,
         "raw_isolated_vertices": vertex_count - raw_used_count,
         "raw_connected_components": len(raw_counts),

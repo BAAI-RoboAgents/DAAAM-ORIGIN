@@ -11,6 +11,8 @@ from daaam.tracking.models import Track
 from pathlib import Path
 import cv2
 import yaml
+import queue
+import time
 
 from daaam.grounding.interfaces import GroundingWorkerInterface
 from daaam.utils.embedding import CLIPHandler, SentenceEmbeddingHandler
@@ -45,6 +47,7 @@ class DAMGroundingWorkerBase(GroundingWorkerInterface):
 		except Exception as e:
 			self.worker_logger.error(f"[Worker {self.worker_id}] Failed to initialize DAM agent: {e}")
 			self.dam_agent = None
+			raise RuntimeError("DAM model initialization failed") from e
 		
 		# Initialize sentence embedding handler
 		sentence_embedding_model_name = self.config.get("sentence_embedding_model_name")
@@ -370,9 +373,19 @@ class DAMGroundingWorkerBase(GroundingWorkerInterface):
 class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 	"""DAM-specific grounding worker that aggregates multiple images/masks for batch processing."""
 	
-	def __init__(self, query_group_queue, correction_queue, stop_event, config, name=None):
-		super().__init__(query_group_queue, correction_queue, stop_event, config, name)
+	def __init__(self, query_group_queue, correction_queue, stop_event, config, ready_queue=None, name=None):
+		super().__init__(
+			query_group_queue,
+			correction_queue,
+			stop_event,
+			config,
+			ready_queue=ready_queue,
+			name=name,
+		)
 		self.multi_image_min_n_masks = config.get("multi_image_min_n_masks", None)
+		self.max_batch_age_s = float(config.get("max_batch_age_s", 1.0))
+		if self.max_batch_age_s <= 0.0:
+			raise ValueError("max_batch_age_s must be positive")
 		
 		if self.multi_image_min_n_masks is None:
 			self.worker_logger.error("multi_image_min_n_masks not set in config.")
@@ -380,6 +393,7 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 		
 		self.aggregated_records = []
 		self.total_masks = 0
+		self._batch_started_monotonic = None
 	
 	def process_prompt_record(self, prompt_record: PromptRecord) -> Optional[List[ObjectAnnotation]]:
 		"""Process prompt record - aggregate until we have enough masks."""
@@ -402,6 +416,8 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 			return None
 		
 		# add to aggregation
+		if not self.aggregated_records:
+			self._batch_started_monotonic = time.monotonic()
 		self.aggregated_records.append(prompt_record)
 		self.total_masks += len(valid_tracks)
 		
@@ -418,6 +434,11 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 		return None
 	
 	def _process_aggregated_batch(self) -> Optional[List[ObjectAnnotation]]:
+		"""Process one DAM batch only while holding the shared GPU lease."""
+		with self.gpu.lease():
+			return self._process_aggregated_batch_under_lease()
+
+	def _process_aggregated_batch_under_lease(self) -> Optional[List[ObjectAnnotation]]:
 		"""Process the aggregated batch of records."""
 		if not self.aggregated_records:
 			return None
@@ -433,6 +454,7 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 			all_semantic_ids_by_record = []
 			all_clip_features_by_record = []  # Store CLIP features for each record
 			all_timestamps_by_record = []  # Store timestamps for each record
+			all_context_by_record = []
 			base_filenames = []
 
 			for record in self.aggregated_records:
@@ -475,6 +497,7 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 					all_semantic_ids_by_record.append(semantic_ids)
 					all_clip_features_by_record.append(clip_features)
 					all_timestamps_by_record.append(record_timestamp)
+					all_context_by_record.append(record)
 
 					# Save grounding image if enabled
 					base_filename = self._save_grounding_image(prompt_frame, masks, semantic_ids, timestamp=record_timestamp)
@@ -513,6 +536,7 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 					semantic_ids = all_semantic_ids_by_record[img_idx]
 					clip_features = all_clip_features_by_record[img_idx] if img_idx < len(all_clip_features_by_record) else {}
 					record_timestamp = all_timestamps_by_record[img_idx] if img_idx < len(all_timestamps_by_record) else None
+					record_context = all_context_by_record[img_idx]
 
 					# Save annotations if enabled
 					if img_idx < len(base_filenames) and base_filenames[img_idx] and descriptions:
@@ -525,6 +549,26 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 					
 					# Attach CLIP features to corrections
 					for correction in record_corrections:
+						if hasattr(correction, 'semantic_id'):
+							track_id = next(
+								(
+									track_id
+									for track_id, semantic_id in record_context.object_labels.items()
+									if semantic_id == correction.semantic_id
+								),
+								None,
+							)
+							correction.entity_id = (
+								record_context.entity_ids.get(track_id)
+								if track_id is not None
+								else None
+							)
+							correction.request_id = record_context.request_id or None
+							correction.sensor_time_ns = record_context.sensor_time_ns or None
+							correction.map_revision = record_context.map_revision
+							correction.source_model = self.config.get(
+								"dam_model_path", "nvidia/DAM-3B"
+							)
 						if hasattr(correction, 'semantic_id') and correction.semantic_id in clip_features:
 							correction.selectframe_clip_feature = clip_features[correction.semantic_id]
 							self.worker_logger.debug(
@@ -563,31 +607,49 @@ class DAMGroundingWorkerMultiImage(DAMGroundingWorkerBase):
 			# clear batch after processing
 			self.aggregated_records = []
 			self.total_masks = 0
+			self._batch_started_monotonic = None
 			
 			# clear GPU cache after batch processing
 			if torch.cuda.is_available():
 				torch.cuda.empty_cache()
 				self.worker_logger.debug(f"[Worker {self.worker_id}] Cleared GPU cache after multi-image batch processing")
 	
+	def _emit_corrections(self, corrections) -> None:
+		if not corrections:
+			return
+		self.worker_logger.info(
+			f"[Worker {self.worker_id}] Putting {len(corrections)} corrections on output queue"
+		)
+		for correction in corrections:
+			self.output_queue.put(correction)
+
 	def run(self):
-		"""Override run to handle remaining records when stopping."""
+		"""Flush underfilled batches by age and again during clean shutdown."""
 		if self.dam_agent is None:
 			self.worker_logger.error("DAM agent not initialized. Exiting worker.")
 			return
-		
-		super().run()
-		
-		# remaining records before shutting down
-		if self.aggregated_records and self.total_masks > 0:
-			self.worker_logger.info(
-				f"Processing final batch of {len(self.aggregated_records)} records "
-				f"with {self.total_masks} total masks"
-			)
-			corrections = self._process_aggregated_batch()
-			if corrections:
-				# to out queue
-				self.worker_logger.info(f"[Worker {self.worker_id}] Putting {len(corrections)} corrections on output queue")
-				for correction in corrections:
-					self.output_queue.put(correction)
-			else:
-				self.worker_logger.warning(f"[Worker {self.worker_id}] No valid corrections to put on output queue.")
+		try:
+			while not self.stop_event.is_set():
+				try:
+					item = self.input_queue.get(timeout=self.timeout)
+				except queue.Empty:
+					if (
+						self.aggregated_records
+						and self._batch_started_monotonic is not None
+						and time.monotonic() - self._batch_started_monotonic
+						>= self.max_batch_age_s
+					):
+						self.worker_logger.info("Flushing underfilled DAM batch by age")
+						self._emit_corrections(self._process_aggregated_batch())
+					continue
+				result = self.process_item(item)
+				self._emit_corrections(result)
+		except KeyboardInterrupt:
+			self.worker_logger.info("Received keyboard interrupt")
+		finally:
+			if self.aggregated_records and self.total_masks > 0:
+				self.worker_logger.info(
+					f"Processing final batch of {len(self.aggregated_records)} records "
+					f"with {self.total_masks} total masks"
+				)
+				self._emit_corrections(self._process_aggregated_batch())

@@ -59,6 +59,10 @@ class DAMGroundingWorkerConfig:
 	dam_conv_mode: str = "v1"
 	dam_prompt_mode: str = "focal_prompt"
 	multi_image_min_n_masks: Optional[int] = None
+	max_batch_age_s: float = 1.0
+	gpu_lock_path: Optional[str] = None
+	gpu_activity_path: Optional[str] = None
+	gpu_minimum_idle_s: float = 1.0
 	sentence_embedding_model_name: Optional[str] = None
 	compute_full_image_description: bool = False
 	save_grounding_images: bool = False

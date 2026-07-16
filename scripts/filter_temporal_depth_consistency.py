@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import shutil
 from functools import lru_cache
@@ -19,6 +20,14 @@ import cv2
 import numpy as np
 
 from diagnose_temporal_depth_consistency import load_poses, load_time_contract
+
+
+DEPTH_EVIDENCE_DIRECTORIES = (
+    "depth_confidence",
+    "depth_consistency",
+    "depth_occlusion",
+    "depth_metadata",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,6 +82,9 @@ def prepare_output(source: Path, output: Path, overwrite: bool) -> None:
                 source_directory.resolve(), target_is_directory=True
             )
     (output / "depth").mkdir()
+    for directory in DEPTH_EVIDENCE_DIRECTORIES:
+        if (source / directory).is_dir():
+            (output / directory).mkdir()
     (output / "pose").mkdir()
     shutil.copy2(source / "pose" / "poses.txt", output / "pose" / "poses.txt")
     shutil.copy2(
@@ -84,6 +96,7 @@ def prepare_output(source: Path, output: Path, overwrite: bool) -> None:
         "source_manifest.json",
         "keyframe_selection_report.json",
         "floor_calibration_application.json",
+        "foundation_stereo_run.json",
         "foundation_stereo_nominal_run.json",
         "trajectory_refinement.json",
         "global_pose_graph_report.json",
@@ -91,6 +104,90 @@ def prepare_output(source: Path, output: Path, overwrite: bool) -> None:
         source_path = source / name
         if source_path.exists():
             (output / name).symlink_to(source_path.resolve())
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def propagate_depth_evidence(
+    source: Path,
+    output: Path,
+    *,
+    frame_index: int,
+    sensor_time_ns: int,
+    frame_name: str,
+    rejected_mask: np.ndarray,
+    output_depth_path: Path,
+    output_valid_ratio: float,
+    rejected_valid_ratio: float,
+) -> dict[str, object]:
+    """Copy verifiable stereo evidence while applying the temporal reject mask."""
+    propagated: list[str] = []
+    for directory in ("depth_confidence", "depth_consistency", "depth_occlusion"):
+        source_directory = source / directory
+        if not source_directory.is_dir():
+            continue
+        source_path = source_directory / frame_name
+        if not source_path.is_file():
+            raise FileNotFoundError(
+                f"Incomplete {directory} evidence for frame {frame_index}: {source_path}"
+            )
+        artifact = cv2.imread(str(source_path), cv2.IMREAD_UNCHANGED)
+        if artifact is None or artifact.shape[:2] != rejected_mask.shape:
+            raise ValueError(f"Invalid {directory} evidence: {source_path}")
+        artifact = artifact.copy()
+        if directory in {"depth_confidence", "depth_consistency"}:
+            artifact[rejected_mask] = 0
+        destination = output / directory / frame_name
+        if not cv2.imwrite(str(destination), artifact):
+            raise RuntimeError(f"Failed to write propagated evidence: {destination}")
+        propagated.append(directory)
+
+    metadata_directory = source / "depth_metadata"
+    left_right_verified = False
+    if metadata_directory.is_dir():
+        source_metadata_path = metadata_directory / f"{frame_index:08d}.json"
+        if not source_metadata_path.is_file():
+            raise FileNotFoundError(
+                f"Incomplete depth_metadata evidence for frame {frame_index}: "
+                f"{source_metadata_path}"
+            )
+        try:
+            metadata = json.loads(source_metadata_path.read_text())
+        except json.JSONDecodeError as error:
+            raise ValueError(f"Invalid depth metadata: {source_metadata_path}") from error
+        if int(metadata.get("sensor_time_ns", -1)) != sensor_time_ns:
+            raise ValueError(
+                f"Depth metadata timestamp mismatch for frame {frame_index}"
+            )
+        left_right_verified = bool(metadata.get("left_right_verified", False))
+        metadata.update(
+            {
+                "frame_idx": frame_index,
+                "sensor_time_ns": sensor_time_ns,
+                "valid_ratio": output_valid_ratio,
+                "temporal_filter": {
+                    "method": "multi_neighbor_reprojection_consistency",
+                    "rejected_valid_ratio": rejected_valid_ratio,
+                    "source_metadata_sha256": sha256_file(source_metadata_path),
+                    "output_depth_sha256": sha256_file(output_depth_path),
+                },
+            }
+        )
+        destination = output / "depth_metadata" / f"{frame_index:08d}.json"
+        temporary = destination.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n")
+        temporary.replace(destination)
+        propagated.append("depth_metadata")
+    return {
+        "propagated": propagated,
+        "left_right_verified": left_right_verified,
+    }
 
 
 def projection_support(
@@ -201,6 +298,8 @@ def main() -> None:
     rejected_ratios = []
     per_frame = []
     rejected_pixels = 0
+    propagated_evidence_directories: set[str] = set()
+    left_right_verified_frames = 0
     for index, depth_path in enumerate(depths):
         source_low = scaled_depth(index)
         judged_count = np.zeros(source_low.shape, dtype=np.uint8)
@@ -250,7 +349,8 @@ def main() -> None:
         reject_full &= valid_before
         filtered = depth_mm.copy()
         filtered[reject_full] = 0
-        if not cv2.imwrite(str(output / "depth" / depth_path.name), filtered):
+        output_depth_path = output / "depth" / depth_path.name
+        if not cv2.imwrite(str(output_depth_path), filtered):
             raise RuntimeError(f"Failed to write filtered depth {depth_path.name}")
 
         rejected = int(reject_full.sum())
@@ -258,6 +358,19 @@ def main() -> None:
         input_valid_ratios.append(float(valid_before.mean()))
         output_valid_ratios.append(float((filtered > 0).mean()))
         rejected_ratios.append(float(rejected / max(int(valid_before.sum()), 1)))
+        evidence = propagate_depth_evidence(
+            source,
+            output,
+            frame_index=int(frames[index]["idx"]),
+            sensor_time_ns=int(frames[index]["sensor_time_ns"]),
+            frame_name=depth_path.name,
+            rejected_mask=reject_full,
+            output_depth_path=output_depth_path,
+            output_valid_ratio=output_valid_ratios[-1],
+            rejected_valid_ratio=rejected_ratios[-1],
+        )
+        propagated_evidence_directories.update(evidence["propagated"])
+        left_right_verified_frames += int(evidence["left_right_verified"])
         per_frame.append(
             {
                 "frame": index,
@@ -298,6 +411,11 @@ def main() -> None:
         "absolute_time_contract_validated": True,
         "rgb_frames_preserved": True,
         "poses_preserved": True,
+        "depth_evidence": {
+            "propagated_directories": sorted(propagated_evidence_directories),
+            "left_right_verified_frames": left_right_verified_frames,
+            "coverage": left_right_verified_frames / max(1, len(depths)),
+        },
         "neighbor_offsets": offsets,
         "filter_scale": args.filter_scale,
         "min_judged_neighbors": args.min_judged_neighbors,

@@ -72,6 +72,12 @@ repositories:
     type: git
     url: git@github.com:koide3/small_gicp.git
     version: master
+  # External stereo-inertial VIO. Keep this commit immutable so robot
+  # acceptance reports identify the exact estimator implementation.
+  open_vins:
+    type: git
+    url: https://github.com/rpng/open_vins.git
+    version: 69488123ed9362dd44b6f28e7f4680abbff1442b
   vision_opencv:
     type: git
     url: https://github.com/ros-perception/vision_opencv.git

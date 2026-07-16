@@ -53,6 +53,9 @@ class QualityGateConfig:
     maximum_dynamic_unknown_ratio: float = 0.60
     minimum_largest_mesh_component_ratio: float = 0.10
     maximum_mesh_components: int = 1000
+    minimum_significant_mesh_component_area_m2: float = 5.0e-3
+    maximum_significant_mesh_components: int = 1000
+    maximum_tiny_mesh_area_ratio: float = 0.05
     maximum_semantic_pending_ratio: float = 0.10
     stage_p95_limits_ms: Mapping[str, float] = field(
         default_factory=lambda: {
@@ -93,12 +96,17 @@ class QualityGateConfig:
             self.maximum_dynamic_contamination_rate,
             self.maximum_dynamic_unknown_ratio,
             self.minimum_largest_mesh_component_ratio,
+            self.maximum_tiny_mesh_area_ratio,
             self.maximum_semantic_pending_ratio,
         )
         if any(value < 0.0 or value > 1.0 for value in ratios):
             raise ValueError("quality ratio thresholds must be in [0, 1]")
         if self.maximum_mesh_components < 1:
             raise ValueError("maximum_mesh_components must be positive")
+        if self.minimum_significant_mesh_component_area_m2 <= 0.0:
+            raise ValueError("minimum significant mesh component area must be positive")
+        if self.maximum_significant_mesh_components < 1:
+            raise ValueError("maximum significant mesh components must be positive")
         if any(value <= 0 for value in self.stage_p95_limits_ms.values()):
             raise ValueError("runtime latency limits must be positive")
         if any(value <= 0 for value in self.stage_queue_p95_limits_ms.values()):
@@ -182,25 +190,43 @@ class QualityGateRunner:
         temporal = float(evidence.get("temporal_agreement", 0.0))
         lr_consistency = float(evidence.get("left_right_consistency", 0.0))
         lr_coverage = float(evidence.get("left_right_coverage", 1.0))
+        lr_evidence_available = bool(
+            evidence.get(
+                "left_right_evidence_available",
+                "left_right_consistency" in evidence and lr_coverage > 0.0,
+            )
+        )
         passed = (
-            valid_ratio >= self.config.minimum_depth_valid_ratio
+            lr_evidence_available
+            and valid_ratio >= self.config.minimum_depth_valid_ratio
             and temporal >= self.config.minimum_depth_temporal_agreement
             and lr_consistency >= self.config.minimum_left_right_consistency
             and lr_coverage >= self.config.minimum_left_right_coverage
         )
+        if not lr_evidence_available:
+            code = "depth.missing_lr_evidence"
+            message = "Verifiable left/right depth evidence is missing"
+        elif passed:
+            code = "depth.quality"
+            message = "Depth validity and consistency passed"
+        else:
+            code = "depth.inconsistent"
+            message = (
+                "Depth validity, temporal agreement, or left/right consistency "
+                "is too low"
+            )
         return GateResult(
-            "depth.quality" if passed else "depth.inconsistent",
+            code,
             "depth",
             GateStatus.PASS if passed else GateStatus.FAIL,
             True,
-            "Depth validity and consistency passed"
-            if passed
-            else "Depth validity, temporal agreement, or left/right consistency is too low",
+            message,
             metrics={
                 "valid_ratio": valid_ratio,
                 "temporal_agreement": temporal,
                 "left_right_consistency": lr_consistency,
                 "left_right_coverage": lr_coverage,
+                "left_right_evidence_available": lr_evidence_available,
             },
             thresholds={
                 "minimum_valid_ratio": self.config.minimum_depth_valid_ratio,
@@ -393,31 +419,92 @@ class QualityGateRunner:
         )
 
     def evaluate_map(self, evidence: Mapping[str, Any]) -> GateResult:
-        largest = float(evidence.get("largest_component_ratio", 0.0))
-        components = int(evidence.get("connected_components", 2**31 - 1))
-        passed = (
-            largest >= self.config.minimum_largest_mesh_component_ratio
-            and components <= self.config.maximum_mesh_components
+        raw_components = int(evidence.get("connected_components", 2**31 - 1))
+        has_significant_metrics = all(
+            key in evidence
+            for key in (
+                "minimum_significant_component_area_m2",
+                "significant_connected_components",
+                "tiny_component_area_ratio",
+            )
         )
+        if has_significant_metrics:
+            measured_area_threshold = float(
+                evidence["minimum_significant_component_area_m2"]
+            )
+            significant_components = int(
+                evidence["significant_connected_components"]
+            )
+            tiny_area_ratio = float(evidence["tiny_component_area_ratio"])
+            largest = float(
+                evidence.get(
+                    "largest_component_area_ratio",
+                    evidence.get("largest_component_ratio", 0.0),
+                )
+            )
+            metric_contract_valid = (
+                abs(
+                    measured_area_threshold
+                    - self.config.minimum_significant_mesh_component_area_m2
+                )
+                <= 1.0e-12
+            )
+            passed = (
+                metric_contract_valid
+                and largest >= self.config.minimum_largest_mesh_component_ratio
+                and significant_components
+                <= self.config.maximum_significant_mesh_components
+                and tiny_area_ratio <= self.config.maximum_tiny_mesh_area_ratio
+            )
+        else:
+            measured_area_threshold = None
+            significant_components = None
+            tiny_area_ratio = None
+            metric_contract_valid = True
+            largest = float(evidence.get("largest_component_ratio", 0.0))
+            passed = (
+                largest >= self.config.minimum_largest_mesh_component_ratio
+                and raw_components <= self.config.maximum_mesh_components
+            )
+        if not metric_contract_valid:
+            code = "map.metric_contract_mismatch"
+            message = "Mesh significance evidence used the wrong area threshold"
+        elif passed:
+            code = "map.connectivity"
+            message = "Map connectivity passed"
+        else:
+            code = "map.fragmented_mesh"
+            message = "Mesh is too fragmented for a coherent scene map"
         return GateResult(
-            "map.connectivity" if passed else "map.fragmented_mesh",
+            code,
             "map",
             GateStatus.PASS if passed else GateStatus.FAIL,
             True,
-            "Map connectivity passed"
-            if passed
-            else "Mesh is too fragmented for a coherent scene map",
+            message,
             metrics={
                 "largest_component_ratio": largest,
-                "connected_components": components,
+                "connected_components": raw_components,
+                "significant_connected_components": significant_components,
+                "tiny_component_area_ratio": tiny_area_ratio,
+                "minimum_significant_component_area_m2": measured_area_threshold,
             },
             thresholds={
                 "minimum_largest_component_ratio": self.config.minimum_largest_mesh_component_ratio,
                 "maximum_connected_components": self.config.maximum_mesh_components,
+                "minimum_significant_component_area_m2": (
+                    self.config.minimum_significant_mesh_component_area_m2
+                ),
+                "maximum_significant_connected_components": (
+                    self.config.maximum_significant_mesh_components
+                ),
+                "maximum_tiny_component_area_ratio": (
+                    self.config.maximum_tiny_mesh_area_ratio
+                ),
             },
         )
 
     def evaluate_semantic(self, evidence: Mapping[str, Any]) -> GateResult:
+        required = bool(evidence.get("required", False))
         pending = int(evidence.get("pending", 0))
         applied = int(evidence.get("applied", 0)) + int(
             evidence.get("applied_alias", 0)
@@ -425,20 +512,68 @@ class QualityGateRunner:
         rejected = int(evidence.get("rejected", 0))
         total = max(1, pending + applied + rejected)
         pending_ratio = pending / total
-        passed = pending_ratio <= self.config.maximum_semantic_pending_ratio
+        submitted = int(evidence.get("submitted", pending + applied + rejected))
+        dsg = evidence.get("dsg", {})
+        if not isinstance(dsg, Mapping):
+            dsg = {}
+        dsg_applied = int(dsg.get("applied", 0))
+        dsg_pending = int(dsg.get("pending", 0))
+        dsg_unmapped = int(dsg.get("unmapped", 0))
+        dsg_errors = list(dsg.get("errors", []))
+        dsg_attached = bool(dsg.get("graph_attached", False))
+        worker_health = evidence.get("grounding_workers", {})
+        if not isinstance(worker_health, Mapping):
+            worker_health = {}
+        workers_ready = bool(worker_health.get("all_ready", False))
+        memory_passed = pending_ratio <= self.config.maximum_semantic_pending_ratio
+
+        if required and not workers_ready:
+            code = "semantic.worker_unavailable"
+            message = "DAM worker did not report successful model readiness"
+            passed = False
+        elif required and submitted <= 0:
+            code = "semantic.no_requests"
+            message = "DAM mode produced no auditable semantic corrections"
+            passed = False
+        elif not memory_passed:
+            code = "semantic.pending_backlog"
+            message = "Semantic correction backlog exceeds its limit"
+            passed = False
+        elif required and dsg_errors:
+            code = "semantic.dsg_error"
+            message = "Hydra DSG rejected one or more semantic corrections"
+            passed = False
+        elif required and not dsg_attached:
+            code = "semantic.dsg_not_attached"
+            message = "The finalized Hydra DSG was not attached for correction ACKs"
+            passed = False
+        elif required and (dsg_pending > 0 or dsg_unmapped > 0 or dsg_applied <= 0):
+            code = "semantic.dsg_pending"
+            message = "MapMemory updates have not all received real Hydra DSG ACKs"
+            passed = False
+        else:
+            code = "semantic.delivery"
+            message = "Semantic corrections are acknowledged"
+            passed = True
         return GateResult(
-            "semantic.delivery" if passed else "semantic.pending_backlog",
+            code,
             "semantic",
             GateStatus.PASS if passed else GateStatus.FAIL,
             True,
-            "Semantic corrections are acknowledged"
-            if passed
-            else "Semantic correction backlog exceeds its limit",
+            message,
             metrics={
+                "required": required,
+                "submitted": submitted,
                 "pending": pending,
                 "applied": applied,
                 "rejected": rejected,
                 "pending_ratio": pending_ratio,
+                "workers_ready": workers_ready,
+                "dsg_applied": dsg_applied,
+                "dsg_pending": dsg_pending,
+                "dsg_unmapped": dsg_unmapped,
+                "dsg_graph_attached": dsg_attached,
+                "dsg_errors": dsg_errors,
             },
             thresholds={
                 "maximum_pending_ratio": self.config.maximum_semantic_pending_ratio

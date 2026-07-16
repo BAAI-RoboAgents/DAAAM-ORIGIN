@@ -76,6 +76,8 @@ def build_run_manifest(
     dataset = dataset.resolve()
     tick_index = dataset / "tick_index.json"
     camera_info = dataset / "camera_info.json"
+    foundation_depth_report = dataset / "foundation_stereo_run.json"
+    temporal_depth_report = dataset / "temporal_depth_filter_report.json"
     submodule = repository_root / "third_party" / "FoundationStereo"
     manifest = {
         "manifest_version": 1,
@@ -95,6 +97,16 @@ def build_run_manifest(
             "path": str(dataset),
             "tick_index_sha256": sha256_file(tick_index) if tick_index.is_file() else None,
             "camera_info_sha256": sha256_file(camera_info) if camera_info.is_file() else None,
+            "foundation_stereo_run_sha256": (
+                sha256_file(foundation_depth_report)
+                if foundation_depth_report.is_file()
+                else None
+            ),
+            "temporal_depth_filter_report_sha256": (
+                sha256_file(temporal_depth_report)
+                if temporal_depth_report.is_file()
+                else None
+            ),
         },
         "runtime": {
             "python": sys.version,

@@ -11,6 +11,9 @@ maximum_dynamic_contamination_rate: 0.01
 maximum_dynamic_unknown_ratio: 0.60
 minimum_largest_mesh_component_ratio: 0.10
 maximum_mesh_components: 1000
+minimum_significant_mesh_component_area_m2: 0.005
+maximum_significant_mesh_components: 1000
+maximum_tiny_mesh_area_ratio: 0.05
 maximum_semantic_pending_ratio: 0.10
 stage_p95_limits_ms:
   pose: 30.0

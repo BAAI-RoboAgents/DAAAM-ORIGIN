@@ -22,6 +22,7 @@ from daaam.depth.confidence import (  # noqa: E402
     compute_left_right_confidence,
     disparity_to_metric_depth,
 )
+from daaam.realtime.gpu import SharedGpuCoordinator  # noqa: E402
 from run_foundation_stereo_depth import resolve_inference_profile  # noqa: E402
 
 
@@ -39,6 +40,8 @@ def parse_args():
     )
     parser.add_argument("--lr-absolute-tolerance-px", type=float, default=0.75)
     parser.add_argument("--lr-relative-tolerance", type=float, default=0.03)
+    parser.add_argument("--gpu-lock-path", type=Path)
+    parser.add_argument("--gpu-activity-path", type=Path)
     return parser.parse_args()
 
 
@@ -47,6 +50,10 @@ class InferenceWorker:
         import torch
         from omegaconf import OmegaConf
 
+        self.gpu = SharedGpuCoordinator(
+            lock_path=args.gpu_lock_path,
+            activity_path=args.gpu_activity_path,
+        )
         fs_root = args.fs_root.resolve()
         checkpoint_path = args.checkpoint.resolve()
         if not (fs_root / "core" / "foundation_stereo.py").is_file():
@@ -65,12 +72,13 @@ class InferenceWorker:
             cfg["vit_size"] = "vitl"
         torch.autograd.set_grad_enabled(False)
         torch.set_float32_matmul_precision("high")
-        model = FoundationStereo(cfg)
-        checkpoint = torch.load(checkpoint_path, weights_only=False)
-        model.load_state_dict(checkpoint["model"])
-        self.model = model.cuda().eval()
-        if self.profile["torch_compile"]:
-            self.model = torch.compile(self.model, mode="reduce-overhead")
+        with self.gpu.lease():
+            model = FoundationStereo(cfg)
+            checkpoint = torch.load(checkpoint_path, weights_only=False)
+            model.load_state_dict(checkpoint["model"])
+            self.model = model.cuda().eval()
+            if self.profile["torch_compile"]:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
         self.autocast_dtype = {
             "fp16": torch.float16,
             "bf16": torch.bfloat16,
@@ -119,6 +127,7 @@ class InferenceWorker:
 
     def infer(self, request: dict) -> dict:
         started = time.time()
+        self.gpu.touch_activity()
         confidence_mode = str(
             request.get("confidence_mode", self.profile["confidence_mode"])
         )
@@ -142,11 +151,12 @@ class InferenceWorker:
             actual_scale = 1.0
         left = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2RGB)
         right = cv2.cvtColor(right_bgr, cv2.COLOR_BGR2RGB)
-        left_disparity, right_disparity = self._infer_pair(
-            left,
-            right,
-            confidence_mode=confidence_mode,
-        )
+        with self.gpu.lease():
+            left_disparity, right_disparity = self._infer_pair(
+                left,
+                right,
+                confidence_mode=confidence_mode,
+            )
 
         def original_disparity(disparity):
             if actual_scale == 1.0:

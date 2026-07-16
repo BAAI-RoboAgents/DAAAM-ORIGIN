@@ -20,6 +20,21 @@ class ObjectAnnotation(Annotation):
 	semantic_id: int = Field(
 		..., description="Semantic ID of the object displayed in the image."
 	)
+	entity_id: Optional[str] = Field(
+		default=None, description="Stable MapMemory entity addressed by this result."
+	)
+	request_id: Optional[str] = Field(
+		default=None, description="Idempotent grounding request identifier."
+	)
+	sensor_time_ns: Optional[int] = Field(
+		default=None, description="Absolute capture timestamp of the grounding evidence."
+	)
+	map_revision: Optional[int] = Field(
+		default=None, description="Map revision used to create the grounding request."
+	)
+	source_model: Optional[str] = Field(
+		default=None, description="Grounding model/version that produced the label."
+	)
 	# Temporal observation history fields
 	frame_ids: Optional[List[int]] = Field(
 		default=None, description="List of frame IDs where this object was observed."

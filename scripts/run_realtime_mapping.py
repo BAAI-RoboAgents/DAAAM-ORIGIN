@@ -15,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -57,10 +57,13 @@ from daaam.realtime.manifest import (  # noqa: E402
     write_run_manifest,
 )
 from daaam.realtime.scheduler import MultiRateScheduler, StageSpec  # noqa: E402
+from daaam.realtime.gpu import SharedGpuCoordinator  # noqa: E402
 from daaam.slam.backend import PoseBackendConfig, PoseInputValidator  # noqa: E402
 
 
-STAGES = ("pose", "depth", "tracking", "fusion", "semantic", "global")
+STAGES = ("pose", "depth", "dynamic", "fusion", "global")
+SEMANTIC_STAGE = "semantic_frontend"
+LEGACY_STAGE_ALIASES = {"tracking": "dynamic"}
 
 
 @dataclass(frozen=True)
@@ -143,7 +146,11 @@ def parse_args():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--max-frames", type=int)
-    parser.add_argument("--stop-after", choices=STAGES, default="fusion")
+    parser.add_argument(
+        "--stop-after",
+        choices=STAGES + tuple(LEGACY_STAGE_ALIASES),
+        default="fusion",
+    )
     parser.add_argument(
         "--depth-backend",
         choices=("precomputed", "foundation-worker"),
@@ -188,7 +195,15 @@ def parse_args():
             "as a maximum dispatch rate. Absolute frame timestamps are unchanged."
         ),
     )
-    parser.add_argument("--stage-rate-multiplier", type=float, default=1.0)
+    parser.add_argument(
+        "--stage-rate-multiplier",
+        type=float,
+        default=1.0,
+        help=(
+            "Development-only multiplier for worker-stage service-rate caps. "
+            "The default preserves the documented per-stage rates."
+        ),
+    )
     parser.add_argument("--queue-capacity", type=int, default=8)
     parser.add_argument("--stage-deadline-ms", type=float)
     parser.add_argument("--drain-timeout-s", type=float, default=30.0)
@@ -205,8 +220,40 @@ def parse_args():
     parser.add_argument("--hydra-config-path", type=Path)
     parser.add_argument("--hydra-labelspace-path", type=Path)
     parser.add_argument("--hydra-labelspace-colors", type=Path)
+    parser.add_argument(
+        "--semantic-mode",
+        choices=("disabled", "frontend", "dam"),
+        default="disabled",
+        help=(
+            "Run the real FastSAM/BotSort side branch, optionally with asynchronous "
+            "DAM grounding. Geometry never waits for this branch."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-config",
+        type=Path,
+        default=REPOSITORY_ROOT / "config" / "pipeline_config_realtime.yaml",
+    )
+    parser.add_argument("--segmentation-rate-hz", type=float, default=5.0)
+    parser.add_argument("--semantic-frontend-rate-hz", type=float, default=10.0)
+    parser.add_argument("--semantic-queue-capacity", type=int, default=2)
+    parser.add_argument("--semantic-minimum-observations", type=int, default=5)
+    parser.add_argument("--semantic-drain-timeout-s", type=float, default=60.0)
+    parser.add_argument(
+        "--gpu-sharing-mode",
+        choices=("staggered", "unmanaged"),
+        default="staggered",
+        help=(
+            "Serialize CUDA models and defer DAM until the realtime frontend is "
+            "idle. Use unmanaged only for development on independently assigned GPUs."
+        ),
+    )
+    parser.add_argument("--dam-minimum-gpu-idle-s", type=float, default=1.0)
     parser.add_argument("--no-write-fusion-products", action="store_true")
-    parser.add_argument("--fault-stage", choices=STAGES)
+    parser.add_argument(
+        "--fault-stage",
+        choices=STAGES + (SEMANTIC_STAGE,) + tuple(LEGACY_STAGE_ALIASES),
+    )
     parser.add_argument("--fault-delay-ms", type=float, default=0.0)
     parser.add_argument("--fault-every", type=int, default=1)
     parser.add_argument("--fault-error-every", type=int, default=0)
@@ -342,6 +389,48 @@ def build_frames(dataset: Path, metadata: dict, poses: list[np.ndarray]) -> list
     return output
 
 
+def load_precomputed_depth_provenance(dataset: Path) -> Optional[dict]:
+    """Resolve the report that produced a precomputed metric-depth dataset."""
+
+    for name in ("foundation_stereo_run.json", "foundation_stereo_nominal_run.json"):
+        path = dataset / name
+        if not path.is_file():
+            continue
+        try:
+            report = json.loads(path.read_text())
+        except json.JSONDecodeError as error:
+            raise ValueError(f"Invalid precomputed depth report: {path}") from error
+        profile_value = report.get("profile")
+        if isinstance(profile_value, dict):
+            profile_name = profile_value.get("name")
+        else:
+            profile_name = profile_value
+        checkpoint_value = report.get("checkpoint")
+        checkpoint_path = (
+            Path(checkpoint_value).expanduser().resolve()
+            if checkpoint_value
+            else None
+        )
+        return {
+            "report": str(path.resolve()),
+            "report_sha256": sha256_file(path),
+            "profile": profile_name,
+            "valid_iters": report.get("valid_iters"),
+            "scale": report.get("scale"),
+            "precision": report.get("precision"),
+            "confidence_mode": report.get("confidence_mode"),
+            "checkpoint": str(checkpoint_path) if checkpoint_path is not None else None,
+            "checkpoint_sha256": (
+                sha256_file(checkpoint_path)
+                if checkpoint_path is not None and checkpoint_path.is_file()
+                else None
+            ),
+            "processed": report.get("processed"),
+            "failed": report.get("failed"),
+        }
+    return None
+
+
 class ReplayEngine:
     def __init__(
         self,
@@ -377,6 +466,7 @@ class ReplayEngine:
         self.depth_confidence_mode = depth_confidence_mode
         self.depth_lr_interval = depth_lr_interval
         self.static_map_backend = static_map_backend
+        self.semantic_label_provider: Optional[Callable[[int], Optional[np.ndarray]]] = None
         position_variance = pose_position_std_m**2
         rotation_variance = math.radians(pose_rotation_std_deg) ** 2
         self.pose_covariance = np.diag(
@@ -831,7 +921,7 @@ class ReplayEngine:
                 self.motion_unknown_ratios.append(float(unknown.mean()))
                 self.dynamic_ratios.append(float(dynamic.mean()))
             self.previous = current
-            self.frames_by_stage["tracking"] += 1
+            self.frames_by_stage["dynamic"] += 1
         payload = TrackedFrame(
             current.source,
             current.rgb_image,
@@ -895,30 +985,6 @@ class ReplayEngine:
             trace_id=envelope.trace_id,
         )
 
-    def semantic(self, envelope: RealtimeEnvelope) -> RealtimeEnvelope:
-        payload: FusionFrame = envelope.payload
-        with self.state_lock:
-            objects = list(self.dynamic_layer.active_objects.values())
-        for obj in objects:
-            label = (
-                max(obj.semantic_probabilities, key=obj.semantic_probabilities.get)
-                if obj.semantic_probabilities
-                else "dynamic object"
-            )
-            self.memory.observe_entity(
-                "replay",
-                obj.entity_id,
-                obj.position_m,
-                sensor_time_ns=payload.tracked.source.sensor_time_ns,
-                semantic_label=label,
-                dimensions_m=obj.dimensions_m,
-                confidence=0.5,
-                entity_type="dynamic_object",
-            )
-        with self.state_lock:
-            self.frames_by_stage["semantic"] += 1
-        return envelope
-
     def global_map(self, envelope: RealtimeEnvelope) -> RealtimeEnvelope:
         payload: FusionFrame = envelope.payload
         frame = payload.tracked.source
@@ -930,11 +996,17 @@ class ReplayEngine:
                 self._commit_path_segment(final=False)
             self.frames_by_stage["global"] += 1
         if self.static_map_backend is not None:
+            semantic_labels = (
+                self.semantic_label_provider(frame.sensor_time_ns)
+                if self.semantic_label_provider is not None
+                else None
+            )
             self.static_map_backend.integrate(
                 sensor_time_ns=frame.sensor_time_ns,
                 rgb_image=payload.tracked.rgb_image,
                 static_depth_m=payload.static_depth_m,
                 world_T_camera=frame.world_T_camera,
+                semantic_labels=semantic_labels,
             )
         return envelope
 
@@ -1042,6 +1114,9 @@ class ReplayEngine:
                     if self.depth_frames_evaluated
                     else 0.0
                 ),
+                "left_right_evidence_available": bool(
+                    self.left_right_verified_frames and self.stereo_consistency
+                ),
             },
             "pose": {
                 "maximum_translation_step_m": max(self.pose_translation_steps, default=0.0),
@@ -1123,12 +1198,70 @@ def rebuild_static_map_prefix(
     return rebuilt
 
 
+def add_semantic_runtime_metrics(
+    scheduler_report: dict,
+    semantic_stats: dict,
+) -> None:
+    """Expose model service time separately from sidecar orchestration time."""
+
+    elapsed_s = max(float(scheduler_report.get("elapsed_seconds", 0.0)), 1.0e-9)
+    empty_latency = {
+        "samples": 0,
+        "p50": None,
+        "p95": None,
+        "p99": None,
+        "max": None,
+    }
+    stage_contracts = {
+        "segmentation": (
+            "segmentation_calls",
+            "segmentation_failures",
+            "segmentation_ms",
+        ),
+        "tracking": ("tracking_calls", "tracking_failures", "tracking_ms"),
+    }
+    stages = scheduler_report.setdefault("stages", {})
+    for stage, (calls_key, failures_key, latency_key) in stage_contracts.items():
+        processed = int(semantic_stats.get(calls_key, 0))
+        failures = int(semantic_stats.get(failures_key, 0))
+        service_latency = dict(
+            semantic_stats.get("latency", {}).get(latency_key, empty_latency)
+        )
+        stages[stage] = {
+            "processed": processed,
+            "errors": failures,
+            "throughput_hz": processed / elapsed_s,
+            "queue_high_water": 0,
+            "drops": {},
+            "latency": {
+                "queue_wait_ms": dict(empty_latency),
+                "service_ms": service_latency,
+                "end_to_end_ms": service_latency,
+            },
+        }
+
+
 def main() -> None:
     args = parse_args()
+    requested_stop_after = args.stop_after
+    requested_fault_stage = args.fault_stage
+    args.stop_after = LEGACY_STAGE_ALIASES.get(args.stop_after, args.stop_after)
+    args.fault_stage = LEGACY_STAGE_ALIASES.get(args.fault_stage, args.fault_stage)
     if args.rate_hz <= 0 or args.stage_rate_multiplier <= 0:
         raise ValueError("Replay and stage rates must be positive")
     if args.queue_capacity <= 0 or args.drain_timeout_s <= 0:
         raise ValueError("Queue and drain settings must be positive")
+    if (
+        args.segmentation_rate_hz <= 0
+        or args.semantic_frontend_rate_hz <= 0
+        or args.semantic_queue_capacity <= 0
+        or args.semantic_minimum_observations <= 0
+        or args.semantic_drain_timeout_s <= 0
+        or args.dam_minimum_gpu_idle_s < 0
+    ):
+        raise ValueError("Semantic rates, queues, observations, and drain timeout must be positive")
+    if args.semantic_mode != "disabled" and not args.semantic_config.is_file():
+        raise ValueError("Real semantic mode requires a valid --semantic-config")
     if args.depth_lr_interval <= 0:
         raise ValueError("--depth-lr-interval must be positive")
     if args.static_map_backend == "hydra":
@@ -1136,7 +1269,20 @@ def main() -> None:
             raise ValueError("Hydra static map backend requires --stop-after global")
         if args.hydra_config_path is None or not args.hydra_config_path.is_file():
             raise ValueError("Hydra static map backend requires a valid config path")
+    if args.semantic_mode == "dam" and args.static_map_backend != "hydra":
+        raise ValueError("DAM mode requires the Hydra backend for durable DSG ACKs")
     dataset = args.dataset.resolve()
+    precomputed_depth_provenance = (
+        load_precomputed_depth_provenance(dataset)
+        if args.depth_backend == "precomputed"
+        else None
+    )
+    effective_depth_confidence_mode = (
+        precomputed_depth_provenance.get("confidence_mode")
+        if precomputed_depth_provenance
+        and precomputed_depth_provenance.get("confidence_mode")
+        else args.depth_confidence_mode
+    )
     foundation_stereo_python = None
     effective_depth_profile = None
     if args.depth_backend == "foundation-worker":
@@ -1191,11 +1337,27 @@ def main() -> None:
     if args.overwrite and run_dir.exists():
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    gpu_lock_path = (
+        run_dir / "gpu_coordination" / "single_gpu.lock"
+        if args.gpu_sharing_mode == "staggered"
+        else None
+    )
+    gpu_activity_path = (
+        run_dir / "gpu_coordination" / "realtime.activity"
+        if args.gpu_sharing_mode == "staggered"
+        else None
+    )
+    gpu_coordinator = SharedGpuCoordinator(
+        lock_path=gpu_lock_path,
+        activity_path=gpu_activity_path,
+    )
 
     configuration = {
         "stop_after": args.stop_after,
+        "requested_stop_after": requested_stop_after,
         "depth_backend": args.depth_backend,
-        "depth_confidence_mode": args.depth_confidence_mode,
+        "depth_confidence_mode": effective_depth_confidence_mode,
+        "requested_depth_confidence_mode": args.depth_confidence_mode,
         "depth_lr_interval": args.depth_lr_interval,
         "rate_hz": args.rate_hz,
         "no_throttle": args.no_throttle,
@@ -1219,20 +1381,55 @@ def main() -> None:
             if args.hydra_config_path is not None
             else None
         ),
+        "semantic": {
+            "mode": args.semantic_mode,
+            "config": str(args.semantic_config.resolve()),
+            "config_sha256": sha256_file(args.semantic_config),
+            "segmentation_rate_hz": args.segmentation_rate_hz,
+            "frontend_rate_hz": args.semantic_frontend_rate_hz,
+            "queue_capacity": args.semantic_queue_capacity,
+            "minimum_observations": args.semantic_minimum_observations,
+            "drain_timeout_s": args.semantic_drain_timeout_s,
+        },
+        "gpu_coordination": {
+            "mode": args.gpu_sharing_mode,
+            "lock_path": str(gpu_lock_path) if gpu_lock_path is not None else None,
+            "activity_path": (
+                str(gpu_activity_path) if gpu_activity_path is not None else None
+            ),
+            "dam_minimum_idle_s": args.dam_minimum_gpu_idle_s,
+        },
         "quality_config": str(args.quality_config.resolve()),
         "quality_config_sha256": sha256_file(args.quality_config),
         "fault": {
             "stage": args.fault_stage,
+            "requested_stage": requested_fault_stage,
             "delay_ms": args.fault_delay_ms,
             "every": args.fault_every,
             "error_every": args.fault_error_every,
         },
     }
     depth_profile_manifest = effective_depth_profile or {
-        "name": None,
-        "valid_iters": None,
-        "scale": None,
-        "precision": None,
+        "name": (
+            precomputed_depth_provenance.get("profile")
+            if precomputed_depth_provenance
+            else None
+        ),
+        "valid_iters": (
+            precomputed_depth_provenance.get("valid_iters")
+            if precomputed_depth_provenance
+            else None
+        ),
+        "scale": (
+            precomputed_depth_provenance.get("scale")
+            if precomputed_depth_provenance
+            else None
+        ),
+        "precision": (
+            precomputed_depth_provenance.get("precision")
+            if precomputed_depth_provenance
+            else None
+        ),
     }
     manifest = build_run_manifest(
         REPOSITORY_ROOT,
@@ -1251,20 +1448,29 @@ def main() -> None:
                 "root": str(args.foundation_stereo_root.resolve()),
                 "checkpoint": str(args.checkpoint.resolve())
                 if args.checkpoint is not None
-                else None,
+                else (
+                    precomputed_depth_provenance.get("checkpoint")
+                    if precomputed_depth_provenance
+                    else None
+                ),
                 "checkpoint_sha256": (
                     sha256_file(args.checkpoint.expanduser().resolve())
                     if args.checkpoint is not None
-                    else None
+                    else (
+                        precomputed_depth_provenance.get("checkpoint_sha256")
+                        if precomputed_depth_provenance
+                        else None
+                    )
                 ),
                 "license": "NVIDIA research/non-commercial",
                 "profile": depth_profile_manifest["name"],
                 "valid_iters": depth_profile_manifest["valid_iters"],
                 "scale": depth_profile_manifest["scale"],
                 "precision": depth_profile_manifest["precision"],
-                "confidence_mode": args.depth_confidence_mode,
+                "confidence_mode": effective_depth_confidence_mode,
                 "left_right_interval": args.depth_lr_interval,
                 "torch_compile": args.depth_torch_compile,
+                "precomputed_provenance": precomputed_depth_provenance,
             },
         },
     )
@@ -1276,6 +1482,11 @@ def main() -> None:
             "dataset": str(dataset),
             "frame_count": len(metadata["frames"]),
             "stages": list(STAGES[: STAGES.index(args.stop_after) + 1]),
+            "semantic_branch": (
+                []
+                if args.semantic_mode == "disabled"
+                else ["depth", SEMANTIC_STAGE, args.semantic_mode]
+            ),
             "time_contract": time_contract,
         }
         (run_dir / "dry_run_plan.json").write_text(
@@ -1329,6 +1540,10 @@ def main() -> None:
         ]
         if args.depth_torch_compile:
             command.append("--torch-compile")
+        if gpu_lock_path is not None:
+            command.extend(["--gpu-lock-path", str(gpu_lock_path)])
+        if gpu_activity_path is not None:
+            command.extend(["--gpu-activity-path", str(gpu_activity_path)])
         depth_worker = SubprocessDepthBackend(
             command,
             startup_timeout_s=args.depth_startup_timeout_s,
@@ -1392,6 +1607,47 @@ def main() -> None:
     if start_index > 0:
         engine.initialize_previous(frames[start_index - 1])
 
+    semantic_adapter = None
+    semantic_startup_seconds = 0.0
+    if args.semantic_mode != "disabled":
+        from daaam.config import PipelineConfig
+        from daaam.realtime.semantic import (
+            RealtimeSemanticAdapter,
+            RealtimeSemanticConfig,
+        )
+
+        pipeline_config = PipelineConfig.from_yaml(str(args.semantic_config.resolve()))
+        pipeline_config.log_dir = str(run_dir / "semantic_sidecar" / "logs")
+        pipeline_config.workers.dam_grounding_config.gpu_lock_path = (
+            str(gpu_lock_path) if gpu_lock_path is not None else None
+        )
+        pipeline_config.workers.dam_grounding_config.gpu_activity_path = (
+            str(gpu_activity_path) if gpu_activity_path is not None else None
+        )
+        pipeline_config.workers.dam_grounding_config.gpu_minimum_idle_s = (
+            args.dam_minimum_gpu_idle_s
+        )
+        gpu_coordinator.touch_activity()
+        semantic_started = time.monotonic()
+        semantic_adapter = RealtimeSemanticAdapter(
+            pipeline_config,
+            engine.memory,
+            session_id="replay",
+            output_dir=run_dir / "semantic_sidecar",
+            config=RealtimeSemanticConfig(
+                segmentation_rate_hz=args.segmentation_rate_hz,
+                minimum_observations=args.semantic_minimum_observations,
+                prompt_queue_capacity=max(2, args.semantic_queue_capacity * 10),
+                correction_queue_capacity=max(10, args.semantic_queue_capacity * 20),
+                grounding_enabled=args.semantic_mode == "dam",
+                gpu_lock_path=gpu_lock_path,
+                gpu_activity_path=gpu_activity_path,
+            ),
+        )
+        semantic_adapter.start()
+        engine.semantic_label_provider = semantic_adapter.label_image_for
+        semantic_startup_seconds = time.monotonic() - semantic_started
+
     injector = FaultInjector(
         args.fault_stage,
         delay_ms=args.fault_delay_ms,
@@ -1402,17 +1658,15 @@ def main() -> None:
     base_rates = {
         "pose": 50.0,
         "depth": 30.0,
-        "tracking": 10.0,
+        "dynamic": 10.0,
         "fusion": 10.0,
-        "semantic": 5.0,
         "global": 10.0,
     }
     handlers = {
         "pose": engine.pose,
         "depth": engine.depth,
-        "tracking": engine.tracking,
+        "dynamic": engine.tracking,
         "fusion": engine.fusion,
-        "semantic": engine.semantic,
         "global": engine.global_map,
     }
     enabled_stages = STAGES[: STAGES.index(args.stop_after) + 1]
@@ -1429,6 +1683,19 @@ def main() -> None:
                 args.stage_deadline_ms,
             )
         )
+    if semantic_adapter is not None and "depth" in enabled_stages:
+        scheduler.add_stage(
+            StageSpec(
+                SEMANTIC_STAGE,
+                injector.wrap(SEMANTIC_STAGE, semantic_adapter.handle),
+                args.semantic_frontend_rate_hz * args.stage_rate_multiplier,
+                args.semantic_queue_capacity,
+                args.stage_deadline_ms,
+            )
+        )
+        # Offer each depth frame to the independently bounded sidecar before
+        # continuing the geometry chain. Neither destination waits for the other.
+        scheduler.connect("depth", SEMANTIC_STAGE)
     for source, destination in zip(enabled_stages, enabled_stages[1:]):
         scheduler.connect(source, destination)
     scheduler.start()
@@ -1443,6 +1710,7 @@ def main() -> None:
     dispatched = 0
     replay_sleep_seconds = 0.0
     for frame in source_frames:
+        gpu_coordinator.touch_activity()
         if not args.no_throttle and previous_source_time is not None:
             capture_delta_s = (frame.sensor_time_ns - previous_source_time) / 1e9
             scaled_delay = capture_delta_s * nominal_hz / args.rate_hz
@@ -1475,6 +1743,18 @@ def main() -> None:
     if "global" in enabled_stages:
         engine.finalize_paths()
         engine.finalize_static_map()
+    semantic_stats = None
+    if semantic_adapter is not None:
+        if static_map_backend is not None:
+            semantic_adapter.attach_hydra_dsg(
+                run_dir / "hydra_realtime" / "backend" / "dsg.json"
+            )
+        semantic_stats = semantic_adapter.stop(
+            timeout_s=args.semantic_drain_timeout_s,
+            drain=True,
+        )
+        add_semantic_runtime_metrics(scheduler_report, semantic_stats)
+        scheduler_report["semantic_sidecar"] = semantic_stats
     terminal_now = checkpoint.completed_indices | {
         int(value) for value in checkpoint.state.get("dropped_frames", {})
     }
@@ -1496,15 +1776,26 @@ def main() -> None:
     )
     context = engine.quality_context(scheduler_report, map_metrics=map_metrics)
     context["time"] = time_contract
+    if args.semantic_mode == "dam":
+        assert semantic_stats is not None
+        corrections = semantic_stats.get("memory", {}).get("corrections", {})
+        context["semantic"] = {
+            **corrections,
+            "required": True,
+            "submitted": int(semantic_stats.get("corrections_submitted", 0)),
+            "prompts_submitted": int(semantic_stats.get("prompts_submitted", 0)),
+            "dsg": semantic_stats.get("dsg", {}),
+            "grounding_workers": semantic_stats.get("grounding_workers", {}),
+        }
     (run_dir / "quality_context.json").write_text(
         json.dumps(context, indent=2, allow_nan=False) + "\n"
     )
     required = ["time", "pose", "runtime"]
     if "depth" in enabled_stages:
         required.append("depth")
-    if "tracking" in enabled_stages:
+    if "dynamic" in enabled_stages:
         required.append("dynamic")
-    if "semantic" in enabled_stages:
+    if args.semantic_mode == "dam":
         required.append("semantic")
     if args.stop_after == "global":
         required.append("map")
@@ -1546,6 +1837,9 @@ def main() -> None:
         "depth_backend_stats": depth_worker.stats() if depth_worker is not None else None,
         "depth_peak_cuda_memory_bytes": engine.depth_peak_cuda_memory_bytes,
         "depth_peak_worker_rss_bytes": engine.depth_peak_worker_rss_bytes,
+        "semantic_mode": args.semantic_mode,
+        "semantic_startup_seconds": semantic_startup_seconds,
+        "semantic_stats": semantic_stats,
         "left_right_verified_frames": engine.left_right_verified_frames,
         "depth_frames_evaluated": engine.depth_frames_evaluated,
         "left_right_coverage": (

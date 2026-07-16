@@ -101,6 +101,91 @@ def test_depth_gate_rejects_insufficient_left_right_validation_coverage():
     assert depth["metrics"]["left_right_coverage"] == 0.2
 
 
+def test_depth_gate_distinguishes_missing_lr_provenance_from_bad_consistency():
+    context = valid_context()
+    context["depth"].update(
+        {
+            "left_right_consistency": 0.0,
+            "left_right_coverage": 0.0,
+            "left_right_evidence_available": False,
+        }
+    )
+    report = QualityGateRunner().evaluate(context)
+    assert result_codes(report)["depth"] == "depth.missing_lr_evidence"
+
+
+def test_required_dam_gate_requires_real_worker_and_hydra_ack():
+    context = valid_context()
+    context["semantic"] = {
+        "required": True,
+        "submitted": 1,
+        "pending": 0,
+        "applied": 1,
+        "rejected": 0,
+        "grounding_workers": {"all_ready": True},
+        "dsg": {
+            "graph_attached": True,
+            "applied": 1,
+            "pending": 0,
+            "unmapped": 0,
+            "errors": [],
+        },
+    }
+    assert QualityGateRunner().evaluate(context)["passed"]
+
+    context["semantic"]["dsg"]["pending"] = 1
+    report = QualityGateRunner().evaluate(context)
+    assert result_codes(report)["semantic"] == "semantic.dsg_pending"
+
+
+def test_required_dam_gate_rejects_missing_work_and_worker_readiness():
+    context = valid_context()
+    context["semantic"] = {
+        "required": True,
+        "submitted": 0,
+        "pending": 0,
+        "applied": 0,
+        "rejected": 0,
+        "grounding_workers": {"all_ready": True},
+        "dsg": {"graph_attached": True, "errors": []},
+    }
+    report = QualityGateRunner().evaluate(context)
+    assert result_codes(report)["semantic"] == "semantic.no_requests"
+
+    context["semantic"]["grounding_workers"]["all_ready"] = False
+    report = QualityGateRunner().evaluate(context)
+    assert result_codes(report)["semantic"] == "semantic.worker_unavailable"
+
+
+def test_mesh_gate_uses_significant_area_without_hiding_raw_fragmentation():
+    context = valid_context()
+    context["map"] = {
+        "connected_components": 2459,
+        "largest_component_area_ratio": 0.71,
+        "minimum_significant_component_area_m2": 0.005,
+        "significant_connected_components": 466,
+        "tiny_component_area_ratio": 0.049,
+    }
+    report = QualityGateRunner().evaluate(context)
+    result = next(value for value in report["results"] if value["stage"] == "map")
+    assert result["code"] == "map.connectivity"
+    assert result["metrics"]["connected_components"] == 2459
+    assert result["metrics"]["significant_connected_components"] == 466
+
+
+def test_mesh_gate_rejects_excess_tiny_surface_area():
+    context = valid_context()
+    context["map"] = {
+        "connected_components": 900,
+        "largest_component_area_ratio": 0.8,
+        "minimum_significant_component_area_m2": 0.005,
+        "significant_connected_components": 100,
+        "tiny_component_area_ratio": 0.051,
+    }
+    report = QualityGateRunner().evaluate(context)
+    assert result_codes(report)["map"] == "map.fragmented_mesh"
+
+
 def test_runtime_queue_backlog_and_drop_ratio_are_hard_failures():
     context = valid_context()
     context["runtime"]["stages"]["depth"]["latency"]["queue_wait_ms"] = {

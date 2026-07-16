@@ -17,6 +17,8 @@ ORIGIN_NS = 1_783_933_507_759_540_877
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 from run_realtime_mapping import (  # noqa: E402
+    add_semantic_runtime_metrics,
+    load_precomputed_depth_provenance,
     resolve_environment_python,
     scheduled_confidence_mode,
 )
@@ -146,7 +148,7 @@ def test_dry_run_writes_manifest_and_absolute_time_plan(tmp_path):
     assert manifest["time_contract"]["valid"]
     assert manifest["dataset"]["tick_index_sha256"]
     assert plan["frame_count"] == 4
-    assert plan["stages"] == ["pose", "depth", "tracking", "fusion"]
+    assert plan["stages"] == ["pose", "depth", "dynamic", "fusion"]
     assert not (run_dir / "realtime_checkpoint.json").exists()
 
 
@@ -179,6 +181,92 @@ def test_foundation_dry_run_records_effective_profile_values(tmp_path):
     assert profile["valid_iters"] == 8
     assert profile["scale"] == 0.15
     assert profile["precision"] == "fp16"
+
+
+def test_precomputed_depth_manifest_keeps_generation_profile_and_report_hash(tmp_path):
+    dataset = create_dataset(tmp_path)
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"depth model")
+    (dataset / "foundation_stereo_run.json").write_text(
+        json.dumps(
+            {
+                "profile": {"name": "online"},
+                "valid_iters": 8,
+                "scale": 0.15,
+                "precision": "fp16",
+                "confidence_mode": "left-right",
+                "checkpoint": str(checkpoint),
+                "processed": 4,
+                "failed": 0,
+            }
+        )
+    )
+    provenance = load_precomputed_depth_provenance(dataset)
+    assert provenance is not None
+    assert provenance["report_sha256"]
+    run_dir = tmp_path / "precomputed-dry"
+    run_replay(dataset, run_dir, "--dry-run")
+    model = json.loads((run_dir / "run_manifest.json").read_text())["models"][
+        "foundation_stereo"
+    ]
+    assert model["profile"] == "online"
+    assert model["valid_iters"] == 8
+    assert model["scale"] == 0.15
+    assert model["precision"] == "fp16"
+    assert model["checkpoint_sha256"]
+    assert model["precomputed_provenance"]["report_sha256"]
+
+
+def test_semantic_dry_run_records_independent_real_frontend_branch(tmp_path):
+    dataset = create_dataset(tmp_path)
+    run_dir = tmp_path / "semantic-dry"
+    run_replay(
+        dataset,
+        run_dir,
+        "--dry-run",
+        "--semantic-mode",
+        "frontend",
+    )
+    plan = json.loads((run_dir / "dry_run_plan.json").read_text())
+    assert plan["stages"] == ["pose", "depth", "dynamic", "fusion"]
+    assert plan["semantic_branch"] == [
+        "depth",
+        "semantic_frontend",
+        "frontend",
+    ]
+
+
+def test_semantic_model_latency_is_reported_under_real_stage_names():
+    report = {"elapsed_seconds": 2.0, "stages": {}}
+    semantic_stats = {
+        "segmentation_calls": 5,
+        "segmentation_failures": 0,
+        "tracking_calls": 10,
+        "tracking_failures": 1,
+        "latency": {
+            "segmentation_ms": {
+                "samples": 5,
+                "p50": 90.0,
+                "p95": 120.0,
+                "p99": 125.0,
+                "max": 130.0,
+            },
+            "tracking_ms": {
+                "samples": 11,
+                "p50": 12.0,
+                "p95": 20.0,
+                "p99": 23.0,
+                "max": 25.0,
+            },
+        },
+    }
+    add_semantic_runtime_metrics(report, semantic_stats)
+    assert report["stages"]["segmentation"]["throughput_hz"] == 2.5
+    assert report["stages"]["tracking"]["errors"] == 1
+    assert (
+        report["stages"]["tracking"]["latency"]["service_ms"]["p95"]
+        == 20.0
+    )
 
 
 def test_periodic_left_right_validation_never_skips_left_depth_inference():
@@ -304,7 +392,7 @@ def test_stage_failure_is_observable_and_frame_is_not_silently_committed(tmp_pat
     assert report["status"] == "stage_error"
     assert report["frames_completed"] == 2
     assert set(report["dropped_frames"].values()) == {"pipeline_not_completed"}
-    assert metrics["stages"]["tracking"]["errors"] == 2
+    assert metrics["stages"]["dynamic"]["errors"] == 2
     assert len(metrics["handler_errors"]) == 2
     assert runtime_gate["code"] == "runtime.stage_error"
     assert runtime_gate["blocks_pipeline"]

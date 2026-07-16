@@ -20,6 +20,8 @@ class GroundingService:
 		self.query_group_queue: Optional[mp.Queue] = None
 		self.correction_queue: Optional[mp.Queue] = None
 		self.worker_ready_queue: Optional[mp.Queue] = None
+		self._worker_status: Dict[str, Dict[str, Any]] = {}
+		self._last_worker_health: Optional[Dict[str, Any]] = None
 		self._running = False
 	
 	def start(self, query_group_queue: mp.Queue, correction_queue: mp.Queue, pipeline_config, output_dir=None, color_map=None, log_dir=None) -> None:
@@ -32,6 +34,8 @@ class GroundingService:
 		self.correction_queue = correction_queue
 		self.stop_event = mp.Event()
 		self.worker_ready_queue = mp.Queue()
+		self._worker_status = {}
+		self._last_worker_health = None
 		
 		# Get worker-specific configuration - ensure proper parameter passing for multi_image_min_n_masks
 		if hasattr(pipeline_config, 'get_worker_config'):
@@ -113,8 +117,10 @@ class GroundingService:
 					worker.terminate()
 					worker.join(timeout=2.0)
 
-		self.workers.clear()
 		self._running = False
+		self._drain_worker_status()
+		self._last_worker_health = self._build_worker_health()
+		self.workers.clear()
 		self.logger.info("Stopped grounding workers")
 	
 	def _get_grounding_worker_process(self):
@@ -134,6 +140,13 @@ class GroundingService:
 	
 	def get_worker_health(self) -> Dict[str, Any]:
 		"""Get health status of grounding workers."""
+		self._drain_worker_status()
+		if not self.workers and self._last_worker_health is not None:
+			return dict(self._last_worker_health)
+		return self._build_worker_health()
+
+	def _build_worker_health(self) -> Dict[str, Any]:
+		"""Build a stable readiness snapshot, including after worker shutdown."""
 		health_status = {
 			"running": self._running,
 			"num_workers": len(self.workers),
@@ -141,32 +154,45 @@ class GroundingService:
 		}
 		
 		for worker in self.workers:
+			status = self._worker_status.get(worker.name, {})
 			health_status["workers"].append({
 				"name": worker.name,
 				"pid": worker.pid,
 				"is_alive": worker.is_alive(),
-				"is_ready": self.check_worker_ready(worker.name),
+				"is_ready": bool(status.get("ready", False)),
+				"error": status.get("error"),
 				"exitcode": worker.exitcode
 			})
-		
+		health_status["ready_count"] = sum(
+			bool(worker["is_ready"]) for worker in health_status["workers"]
+		)
+		health_status["all_ready"] = bool(health_status["workers"]) and all(
+			bool(worker["is_ready"]) and not worker["error"]
+			for worker in health_status["workers"]
+		)
 		return health_status
+
+	def _drain_worker_status(self) -> None:
+		"""Cache structured readiness without requeueing and duplicating messages."""
+		if not self.worker_ready_queue:
+			return
+		while True:
+			try:
+				message = self.worker_ready_queue.get_nowait()
+			except queue.Empty:
+				break
+			if isinstance(message, dict):
+				name = str(message.get("worker", ""))
+				if name:
+					self._worker_status[name] = {
+						"ready": bool(message.get("ready", False)),
+						"error": message.get("error"),
+					}
+			else:
+				# Backward-compatible status from older/custom workers.
+				self._worker_status[str(message)] = {"ready": True, "error": None}
 	
 	def check_worker_ready(self, worker_name: str) -> bool:
 		"""Check if a specific worker has reported ready."""
-		if not self.worker_ready_queue:
-			return False
-			
-		# Check for ready messages without blocking
-		ready_workers = set()
-		try:
-			while True:
-				ready_name = self.worker_ready_queue.get_nowait()
-				ready_workers.add(ready_name)
-		except:
-			pass
-			
-		# Put messages back for future checks
-		for name in ready_workers:
-			self.worker_ready_queue.put(name)
-			
-		return worker_name in ready_workers
+		self._drain_worker_status()
+		return bool(self._worker_status.get(worker_name, {}).get("ready", False))

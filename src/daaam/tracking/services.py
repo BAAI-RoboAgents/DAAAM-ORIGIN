@@ -83,13 +83,19 @@ class TrackingService:
 		if self.tracker is None:
 			raise RuntimeError("Tracker not initialized")
 		
-		if len(detections) > 0:
-			tracks = self.tracker.update(detections, frame)
-			# increment track IDs by 1
-			tracks[:, 4] += 1
-			return tracks
-		else:
-			return np.empty((0, 8))
+		detections = np.asarray(detections, dtype=np.float32)
+		if detections.size == 0:
+			detections = np.empty((0, 6), dtype=np.float32)
+		tracks = self.tracker.update(detections, frame)
+		if tracks is None or len(tracks) == 0:
+			return np.empty((0, 8), dtype=np.float32)
+		tracks = np.asarray(tracks)
+		if tracks.ndim != 2 or tracks.shape[1] < 8:
+			raise ValueError("BotSort output must be an Mx8 array")
+		# BotSort IDs are zero-based; public DAAAM semantic IDs reserve zero.
+		tracks = tracks.copy()
+		tracks[:, 4] += 1
+		return tracks
 	
 	def get_track_buffer(self) -> int:
 		"""Get the track buffer value."""

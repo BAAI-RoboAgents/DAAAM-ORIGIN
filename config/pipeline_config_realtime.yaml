@@ -43,6 +43,10 @@ workers:
     dam_conv_mode: "v1"
     dam_prompt_mode: "focal_prompt"
     multi_image_min_n_masks: 16
+    max_batch_age_s: 1.0
+    gpu_lock_path: null
+    gpu_activity_path: null
+    gpu_minimum_idle_s: 1.0
     sentence_embedding_model_name: ""
     compute_full_image_description: false
     save_grounding_images: false

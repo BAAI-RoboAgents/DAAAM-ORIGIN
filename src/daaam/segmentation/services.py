@@ -18,6 +18,8 @@ class SegmentationService:
 		self.config = config
 		self.logger = logger or get_default_logger()
 		self.segmenter: Optional[SegmenterInterface] = None
+		self.last_status = "initializing"
+		self.last_error: Optional[str] = None
 
 		self._initialize_segmenter()
 	
@@ -85,13 +87,34 @@ class SegmentationService:
 			raise RuntimeError("Segmenter not initialized")
 		
 		try:
-			return self.segmenter(frame)
+			result = self.segmenter(frame)
+			self.last_status = "ok" if len(result[0]) else "ok_empty"
+			self.last_error = None
+			return result
 		except NotImplementedError as e:
 			self.logger.info(f"Segmentation failed: {e}. This likely means SAM2 was selected but is not implemented.")
+			self.last_status = "failed"
+			self.last_error = repr(e)
 			return np.empty((0, 6)), []
 		except Exception as e:
 			self.logger.error(f"Error during segmentation: {e}")
+			self.last_status = "failed"
+			self.last_error = repr(e)
 			return np.empty((0, 6)), []
+
+	def segment_checked(self, frame: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
+		"""Run inference while preserving the difference between empty and failed."""
+		if self.segmenter is None:
+			raise RuntimeError("Segmenter not initialized")
+		try:
+			result = self.segmenter(frame)
+		except Exception as error:
+			self.last_status = "failed"
+			self.last_error = repr(error)
+			raise
+		self.last_status = "ok" if len(result[0]) else "ok_empty"
+		self.last_error = None
+		return result
 
 
 class UniversalSegmenterAdapter(SegmenterInterface):

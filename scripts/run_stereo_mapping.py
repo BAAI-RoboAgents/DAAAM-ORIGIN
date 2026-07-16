@@ -37,6 +37,7 @@ FILTER_TEMPORAL_DEPTH = (
 DIAGNOSE_RGBD_FUSION = REPOSITORY_ROOT / "scripts" / "diagnose_rgbd_fusion.py"
 RUN_PIPELINE = REPOSITORY_ROOT / "scripts" / "run_pipeline.py"
 DEFAULT_FS_ROOT = REPOSITORY_ROOT / "third_party" / "FoundationStereo"
+DEFAULT_G1_HYDRA_CONFIG = REPOSITORY_ROOT / "config" / "hydra_g1_high_quality.yaml"
 STAGES = (
     "prepare",
     "select",
@@ -167,7 +168,15 @@ def parse_args() -> argparse.Namespace:
 
     mapping = parser.add_argument_group("DAAAM/Hydra mapping")
     mapping.add_argument("--pipeline-config", type=Path)
-    mapping.add_argument("--hydra-config-path", type=Path)
+    mapping.add_argument(
+        "--hydra-config-path",
+        type=Path,
+        default=DEFAULT_G1_HYDRA_CONFIG,
+        help=(
+            "Hydra configuration. Defaults to the 5 cm G1 indoor reconstruction "
+            "profile; pass another file to override it."
+        ),
+    )
     mapping.add_argument("--labelspace-path", type=Path)
     mapping.add_argument("--labelspace-colors", type=Path)
     mapping.add_argument("--depth-lb", type=float, default=0.25)

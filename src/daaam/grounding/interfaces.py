@@ -17,6 +17,7 @@ import traceback
 from daaam.utils.logging import setup_worker_logging, get_default_logger
 from daaam.interfaces import QueueWorkerProcessInterface
 from daaam.pipeline.models import PromptRecord
+from daaam.realtime.gpu import SharedGpuCoordinator
 
 
 class GroundingWorkerInterface(QueueWorkerProcessInterface):
@@ -62,6 +63,11 @@ class GroundingWorkerInterface(QueueWorkerProcessInterface):
 		self.ready_queue = ready_queue
 		self.worker_id = mp.current_process().name
 		self._setup_worker_logging()
+		self.gpu = SharedGpuCoordinator(
+			lock_path=config.get("gpu_lock_path"),
+			activity_path=config.get("gpu_activity_path"),
+			minimum_idle_s=float(config.get("gpu_minimum_idle_s", 0.0)),
+		)
 
 		import torch
 		import os
@@ -69,11 +75,21 @@ class GroundingWorkerInterface(QueueWorkerProcessInterface):
 		device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
 		self.worker_logger.info(f"[GPU] CUDA_VISIBLE_DEVICES={effective_cvd}, device_count={device_count}")
 
-		self._initialize_models()
+		try:
+			with self.gpu.lease(self.stop_event):
+				self._initialize_models()
+		except Exception as error:
+			if self.ready_queue:
+				self.ready_queue.put(
+					{"worker": self.worker_id, "ready": False, "error": repr(error)}
+				)
+			raise
 		
-		# Signal that worker is ready after model initialization
+		# Signal readiness only after every model initialized successfully.
 		if self.ready_queue:
-			self.ready_queue.put(self.worker_id)
+			self.ready_queue.put(
+				{"worker": self.worker_id, "ready": True, "error": None}
+			)
 			if hasattr(self, 'worker_logger'):
 				self.worker_logger.info(f"Worker {self.worker_id} signaled ready")
 		

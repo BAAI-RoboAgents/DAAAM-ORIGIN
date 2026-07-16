@@ -24,6 +24,10 @@ def test_manifest_records_code_dataset_configuration_and_time_contract(tmp_path)
     dataset = tmp_path / "dataset"
     dataset.mkdir()
     (dataset / "tick_index.json").write_text('{"frames": []}')
+    (dataset / "foundation_stereo_run.json").write_text('{"processed": 10}')
+    (dataset / "temporal_depth_filter_report.json").write_text(
+        '{"frame_count": 10}'
+    )
     manifest = build_run_manifest(
         REPOSITORY_ROOT,
         dataset,
@@ -37,6 +41,8 @@ def test_manifest_records_code_dataset_configuration_and_time_contract(tmp_path)
     assert loaded["repository"]["git_sha"]
     assert loaded["repository"]["foundation_stereo_sha"]
     assert loaded["dataset"]["tick_index_sha256"]
+    assert loaded["dataset"]["foundation_stereo_run_sha256"]
+    assert loaded["dataset"]["temporal_depth_filter_report_sha256"]
     assert loaded["configuration"]["queue_capacity"] == 8
     assert loaded["time_contract"]["valid"]
 
