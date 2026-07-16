@@ -7,6 +7,7 @@ import sys
 
 import numpy as np
 import cv2
+import pytest
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -114,6 +115,48 @@ def test_hydra_backend_receives_static_depth_and_original_absolute_time(tmp_path
     assert backend.stats()["frames_processed"] == 2
     backend.close()
     assert integration.closed
+
+
+def test_hydra_close_without_finalize_only_releases_pipeline(tmp_path):
+    config = tmp_path / "hydra.yaml"
+    config.write_text("frontend: {}\n")
+    integration = FakeHydraIntegration()
+    backend = HydraStaticMapBackend(
+        config,
+        tmp_path / "map",
+        integration_factory=lambda **_kwargs: integration,
+    )
+    backend.initialize(64, 48, np.eye(3))
+
+    backend.close(finalize=False)
+
+    assert not integration.saved
+    assert integration.closed
+    assert not backend.stats()["finalized"]
+
+
+def test_hydra_close_shuts_down_when_finalize_fails(tmp_path):
+    class FailingSaveIntegration(FakeHydraIntegration):
+        def save_results(self, _output):
+            self.saved = True
+            return False
+
+    config = tmp_path / "hydra.yaml"
+    config.write_text("frontend: {}\n")
+    integration = FailingSaveIntegration()
+    backend = HydraStaticMapBackend(
+        config,
+        tmp_path / "map",
+        integration_factory=lambda **_kwargs: integration,
+    )
+    backend.initialize(64, 48, np.eye(3))
+
+    with pytest.raises(RuntimeError, match="failed to save"):
+        backend.close()
+
+    assert integration.saved
+    assert integration.closed
+    backend.close()
 
 
 def test_hydra_resume_rebuilds_only_committed_frames_with_absolute_time(tmp_path):

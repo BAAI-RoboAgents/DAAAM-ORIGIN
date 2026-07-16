@@ -1,40 +1,9 @@
-import requests
-import base64
-from io import BytesIO
 from PIL import Image
-from typing import List, Union, Optional, Dict, Any, Tuple, Literal
-import subprocess
-import time
-import os
-import sys
-from pathlib import Path
-import signal
-import numpy as np
-from urllib.parse import urlparse
-import shlex
-import threading
-import gradio as gr
-import torch
-import io
-from openai import OpenAI
-import multiprocessing as mp
-import requests
-import json
+from typing import List, Optional, Tuple
 
-# avoid CUDA issues
-if mp.get_start_method(allow_none=True) != 'spawn':
-    try:
-        mp.set_start_method('spawn', force=True)
-    except RuntimeError:
-        # If already set, ignore the error
-        pass
-
-from daaam.query_manager.mmllm import Agent
 
 from dam import DescribeAnythingModel, disable_torch_init
 
-import sys
-from pathlib import Path
 
 
 class DAMAgentPanoptic:

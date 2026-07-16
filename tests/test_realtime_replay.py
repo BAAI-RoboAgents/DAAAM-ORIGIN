@@ -9,6 +9,7 @@ import sys
 
 import cv2
 import numpy as np
+import pytest
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -16,13 +17,85 @@ RUNNER = REPOSITORY_ROOT / "scripts" / "run_realtime_mapping.py"
 ORIGIN_NS = 1_783_933_507_759_540_877
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
+import run_realtime_mapping as realtime_runner  # noqa: E402
 from run_realtime_mapping import (  # noqa: E402
+    RealtimeResourceState,
     add_semantic_runtime_metrics,
+    cleanup_realtime_resources,
     load_precomputed_depth_provenance,
     load_semantic_model_provenance,
     resolve_environment_python,
     scheduled_confidence_mode,
 )
+
+
+def test_resource_cleanup_is_reverse_order_best_effort_and_idempotent():
+    calls = []
+
+    class Scheduler:
+        def stop(self, *, timeout, drain):
+            calls.append(("scheduler", timeout, drain))
+
+    class SemanticAdapter:
+        def stop(self, *, timeout_s, drain):
+            calls.append(("semantic_adapter", timeout_s, drain))
+            raise RuntimeError("semantic cleanup failed")
+
+    class DepthWorker:
+        def close(self):
+            calls.append(("depth_worker",))
+
+    class Memory:
+        def close(self):
+            calls.append(("map_memory",))
+            raise RuntimeError("memory cleanup failed")
+
+    class StaticMapBackend:
+        def close(self, *, finalize):
+            calls.append(("static_map_backend", finalize))
+
+    resources = RealtimeResourceState(
+        scheduler=Scheduler(),
+        semantic_adapter=SemanticAdapter(),
+        depth_worker=DepthWorker(),
+        memory=Memory(),
+        static_map_backend=StaticMapBackend(),
+    )
+
+    errors = cleanup_realtime_resources(resources, timeout_s=1.25)
+
+    assert calls == [
+        ("scheduler", 1.25, False),
+        ("semantic_adapter", 1.25, False),
+        ("depth_worker",),
+        ("map_memory",),
+        ("static_map_backend", False),
+    ]
+    assert [name for name, _error in errors] == ["semantic_adapter", "map_memory"]
+    assert cleanup_realtime_resources(resources) == []
+
+
+def test_main_preserves_run_error_when_cleanup_also_fails(monkeypatch, capsys):
+    calls = []
+    run_error = ValueError("semantic startup failed")
+
+    class Scheduler:
+        def stop(self, *, timeout, drain):
+            calls.append((timeout, drain))
+            raise RuntimeError("scheduler cleanup failed")
+
+    def fail_during_run(resources):
+        resources.scheduler = Scheduler()
+        raise run_error
+
+    monkeypatch.setattr(realtime_runner, "_run_realtime_mapping", fail_during_run)
+
+    with pytest.raises(ValueError) as captured:
+        realtime_runner.main()
+
+    assert captured.value is run_error
+    assert calls == [(5.0, False)]
+    assert "cleanup failed for scheduler" in capsys.readouterr().err
 
 
 def create_dataset(root: Path, frame_count: int = 4) -> Path:
@@ -385,6 +458,37 @@ def test_resume_continues_from_checkpoint_without_reprocessing_prefix(tmp_path):
     assert resumed["frames_resumed_from"] == 2
     assert resumed["frames_completed"] == 4
     assert resumed["frames_by_stage"]["fusion"] == 2
+
+
+def test_failed_resume_does_not_leave_stale_complete_report(tmp_path):
+    dataset = create_dataset(tmp_path)
+    run_dir = tmp_path / "failed-resume"
+    run_replay(dataset, run_dir)
+    assert json.loads((run_dir / "realtime_run_report.json").read_text())[
+        "status"
+    ] == "complete"
+
+    foundation_root = tmp_path / "FoundationStereo"
+    foundation_root.mkdir()
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"test checkpoint")
+    failed = run_replay(
+        dataset,
+        run_dir,
+        "--resume",
+        "--depth-backend",
+        "foundation-worker",
+        "--foundation-stereo-python",
+        "/bin/false",
+        "--foundation-stereo-root",
+        str(foundation_root),
+        "--checkpoint",
+        str(checkpoint),
+        check=False,
+    )
+
+    assert failed.returncode != 0
+    assert not (run_dir / "realtime_run_report.json").exists()
 
 
 def test_global_path_history_survives_checkpoint_resume(tmp_path):

@@ -226,8 +226,11 @@ class RealtimeSemanticAdapter:
             lock_path=config.gpu_lock_path,
             activity_path=config.gpu_activity_path,
         )
-        self.query_queue: mp.Queue = mp.Queue(maxsize=config.prompt_queue_capacity)
-        self.correction_queue: mp.Queue = mp.Queue(
+        self._mp_context = mp.get_context("spawn")
+        self.query_queue: mp.Queue = self._mp_context.Queue(
+            maxsize=config.prompt_queue_capacity
+        )
+        self.correction_queue: mp.Queue = self._mp_context.Queue(
             maxsize=config.correction_queue_capacity
         )
         self.processor = VersionedCorrectionProcessor(memory, dsg_sink)
@@ -246,6 +249,9 @@ class RealtimeSemanticAdapter:
         self._propagation_audit: OrderedDict[int, dict[str, Any]] = OrderedDict()
         self._track_mask_states: OrderedDict[int, _TrackMaskState] = OrderedDict()
         self._started = False
+        self._processor_start_attempted = False
+        self._grounding_start_attempted = False
+        self._correction_thread_start_attempted = False
         self._stats: dict[str, Any] = {
             "frames": 0,
             "segmentation_calls": 0,
@@ -274,6 +280,7 @@ class RealtimeSemanticAdapter:
             "corrections_skipped": 0,
             "label_cache_hits": 0,
             "label_cache_misses": 0,
+            "cleanup_errors": [],
             "segmentation_service_ms": [],
             "tracking_service_ms": [],
         }
@@ -281,31 +288,43 @@ class RealtimeSemanticAdapter:
     def start(self) -> None:
         if self._started:
             return
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.gpu_coordinator.touch_activity()
-        with self.gpu_coordinator.lease():
-            self.segmentation_service.warmup()
-            self.tracking_service.warmup()
-        self.processor.start()
-        if self.config.grounding_enabled:
-            if self.grounding_service is None:
-                raise RuntimeError("grounding service is required in DAM mode")
-            self.grounding_service.start(
-                self.query_queue,
-                self.correction_queue,
-                self.pipeline_config,
-                output_dir=str(self.output_dir),
-                color_map=getattr(self.dsg_sink.service, "color_map", None),
-                log_dir=str(self.output_dir / "logs"),
-            )
-            self._correction_stop.clear()
-            self._correction_thread = threading.Thread(
-                target=self._correction_loop,
-                daemon=True,
-                name="realtime-dam-corrections",
-            )
-            self._correction_thread.start()
-        self._started = True
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.gpu_coordinator.touch_activity()
+            with self.gpu_coordinator.lease():
+                self.segmentation_service.warmup()
+                self.tracking_service.warmup()
+            self._processor_start_attempted = True
+            self.processor.start()
+            if self.config.grounding_enabled:
+                if self.grounding_service is None:
+                    raise RuntimeError("grounding service is required in DAM mode")
+                self._grounding_start_attempted = True
+                self.grounding_service.start(
+                    self.query_queue,
+                    self.correction_queue,
+                    self.pipeline_config,
+                    output_dir=str(self.output_dir),
+                    color_map=getattr(self.dsg_sink.service, "color_map", None),
+                    log_dir=str(self.output_dir / "logs"),
+                )
+                self._correction_stop.clear()
+                self._correction_thread = threading.Thread(
+                    target=self._correction_loop,
+                    daemon=True,
+                    name="realtime-dam-corrections",
+                )
+                self._correction_thread_start_attempted = True
+                self._correction_thread.start()
+            self._started = True
+        except BaseException:
+            # Startup is transactional. Cleanup failures remain auditable but
+            # must never replace the model/service exception that triggered it.
+            try:
+                self.stop(timeout_s=5.0, drain=False)
+            except BaseException:
+                pass
+            raise
 
     @staticmethod
     def _source_payload(
@@ -913,6 +932,7 @@ class RealtimeSemanticAdapter:
     def stats(self) -> dict[str, Any]:
         with self._lock:
             values = dict(self._stats)
+            values["cleanup_errors"] = list(values["cleanup_errors"])
             segmentation_ms = list(values.pop("segmentation_service_ms"))
             tracking_ms = list(values.pop("tracking_service_ms"))
             recent_audit = [
@@ -944,28 +964,59 @@ class RealtimeSemanticAdapter:
         return values
 
     def stop(self, timeout_s: float = 30.0, *, drain: bool = True) -> dict[str, Any]:
-        if not self._started:
-            return self.stats()
         deadline = time.monotonic() + timeout_s
-        if drain and self.config.grounding_enabled:
+        cleanup_errors: list[BaseException] = []
+        if drain and self._grounding_start_attempted:
             while time.monotonic() < deadline - 5.0 and not self.query_queue.empty():
                 time.sleep(0.05)
-        if self.grounding_service is not None:
-            self.grounding_service.stop()
-        if self._correction_thread is not None:
-            if drain:
-                while (
-                    time.monotonic() < deadline - 2.0
-                    and not self.correction_queue.empty()
-                ):
-                    time.sleep(0.05)
-            self._correction_stop.set()
-            self._correction_thread.join(max(0.1, deadline - time.monotonic()))
-            if self._correction_thread.is_alive():
-                raise RuntimeError("DAM correction consumer did not stop")
-        self.processor.stop(
-            timeout_s=max(0.1, deadline - time.monotonic()), drain=drain
-        )
-        self.dsg_sink.persist()
-        self._started = False
+        if self._grounding_start_attempted and self.grounding_service is not None:
+            try:
+                self.grounding_service.stop()
+            except BaseException as error:
+                cleanup_errors.append(error)
+            finally:
+                self._grounding_start_attempted = False
+
+        thread = self._correction_thread
+        if self._correction_thread_start_attempted or thread is not None:
+            try:
+                if drain and thread is not None and thread.is_alive():
+                    while (
+                        time.monotonic() < deadline - 2.0
+                        and not self.correction_queue.empty()
+                    ):
+                        time.sleep(0.05)
+                self._correction_stop.set()
+                if thread is not None and thread.is_alive():
+                    thread.join(max(0.1, deadline - time.monotonic()))
+                    if thread.is_alive():
+                        raise RuntimeError("DAM correction consumer did not stop")
+            except BaseException as error:
+                cleanup_errors.append(error)
+            finally:
+                self._correction_thread_start_attempted = False
+                self._correction_thread = None
+
+        if self._processor_start_attempted:
+            try:
+                self.processor.stop(
+                    timeout_s=max(0.1, deadline - time.monotonic()), drain=drain
+                )
+            except BaseException as error:
+                cleanup_errors.append(error)
+            finally:
+                self._processor_start_attempted = False
+        try:
+            self.dsg_sink.persist()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        finally:
+            self._started = False
+
+        if cleanup_errors:
+            with self._lock:
+                self._stats["cleanup_errors"].extend(
+                    repr(error) for error in cleanup_errors
+                )
+            raise cleanup_errors[0]
         return self.stats()

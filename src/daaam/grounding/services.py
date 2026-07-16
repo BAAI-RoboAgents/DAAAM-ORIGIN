@@ -1,9 +1,7 @@
 from typing import Optional, Dict, List, Any
 import multiprocessing as mp
 from multiprocessing.synchronize import Event
-import threading
 import queue
-import time
 
 from daaam.utils.logging import PipelineLogger, get_default_logger
 from daaam.config import WorkerConfig
@@ -15,6 +13,10 @@ class GroundingService:
 	def __init__(self, config: WorkerConfig, logger: Optional[PipelineLogger] = None):
 		self.config = config
 		self.logger = logger or get_default_logger()
+		# DAM initializes CUDA in a child process, so every synchronization
+		# primitive crossing that boundary must come from the spawn context.
+		# Do not mutate multiprocessing's process-wide default context here.
+		self._mp_context = mp.get_context("spawn")
 		self.workers: List[mp.Process] = []
 		self.stop_event: Optional[Event] = None
 		self.query_group_queue: Optional[mp.Queue] = None
@@ -32,8 +34,8 @@ class GroundingService:
 		
 		self.query_group_queue = query_group_queue
 		self.correction_queue = correction_queue
-		self.stop_event = mp.Event()
-		self.worker_ready_queue = mp.Queue()
+		self.stop_event = self._mp_context.Event()
+		self.worker_ready_queue = self._mp_context.Queue()
 		self._worker_status = {}
 		self._last_worker_health = None
 		
@@ -67,22 +69,33 @@ class GroundingService:
 			worker_config['color_map'] = color_map
 		
 		# Start grounding worker processes
-		for i in range(self.config.num_grounding_workers):
-			worker = mp.Process(
-				target=self._get_grounding_worker_process(),
-				args=(
-					self.query_group_queue,
-					self.correction_queue,
-					self.stop_event,
-					worker_config,
-					self.worker_ready_queue,
-				),
-				name=f"GroundingWorker-{i}"
-			)
-			worker.start()
-			self.workers.append(worker)
-		
 		self._running = True
+		try:
+			for i in range(self.config.num_grounding_workers):
+				worker = self._mp_context.Process(
+					target=self._get_grounding_worker_process(),
+					args=(
+						self.query_group_queue,
+						self.correction_queue,
+						self.stop_event,
+						worker_config,
+						self.worker_ready_queue,
+					),
+					name=f"GroundingWorker-{i}"
+				)
+				worker.start()
+				self.workers.append(worker)
+		except BaseException:
+			# A later Process.start() may fail after earlier workers are live.
+			# Roll those workers back, but never replace the spawn exception.
+			try:
+				self.stop()
+			except BaseException as cleanup_error:
+				self.logger.error(
+					f"Grounding startup rollback failed: {cleanup_error!r}"
+				)
+			raise
+
 		self.logger.info(f"Started {self.config.num_grounding_workers} {self.config.grounding_worker} grounding workers")
 	
 	def stop(self) -> None:
@@ -95,33 +108,47 @@ class GroundingService:
 		  4. Join again with 5s
 		  5. Force terminate as last resort
 		"""
-		if not self._running:
+		if not self._running and not self.workers and self.stop_event is None:
 			return
 
+		cleanup_errors = []
 		if self.stop_event:
-			self.stop_event.set()
+			try:
+				self.stop_event.set()
+			except BaseException as error:
+				cleanup_errors.append(error)
 
 		for worker in self.workers:
-			worker.join(timeout=20.0)
-			if worker.is_alive():
-				# Try SIGINT first — allows clean queue flush in worker's finally block
-				self.logger.warning(f"Sending SIGINT to grounding worker {worker.name}")
-				try:
-					import os, signal
-					os.kill(worker.pid, signal.SIGINT)
-				except (ProcessLookupError, OSError):
-					pass
-				worker.join(timeout=5.0)
+			try:
+				worker.join(timeout=20.0)
 				if worker.is_alive():
-					self.logger.warning(f"Force terminating grounding worker {worker.name}")
-					worker.terminate()
-					worker.join(timeout=2.0)
+					# Try SIGINT first — allows clean queue flush in worker's finally block
+					self.logger.warning(f"Sending SIGINT to grounding worker {worker.name}")
+					try:
+						import os
+						import signal
+						os.kill(worker.pid, signal.SIGINT)
+					except (ProcessLookupError, OSError):
+						pass
+					worker.join(timeout=5.0)
+					if worker.is_alive():
+						self.logger.warning(f"Force terminating grounding worker {worker.name}")
+						worker.terminate()
+						worker.join(timeout=2.0)
+			except BaseException as error:
+				cleanup_errors.append(error)
 
 		self._running = False
-		self._drain_worker_status()
-		self._last_worker_health = self._build_worker_health()
+		try:
+			self._drain_worker_status()
+			self._last_worker_health = self._build_worker_health()
+		except BaseException as error:
+			cleanup_errors.append(error)
 		self.workers.clear()
+		self.stop_event = None
 		self.logger.info("Stopped grounding workers")
+		if cleanup_errors:
+			raise cleanup_errors[0]
 	
 	def _get_grounding_worker_process(self):
 		"""Get grounding worker process function dynamically."""

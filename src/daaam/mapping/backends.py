@@ -203,10 +203,15 @@ class HydraStaticMapBackend:
 
         return analyze_ascii_ply_mesh(self.output_dir / "backend" / "mesh.ply")
 
-    def close(self) -> None:
+    def close(self, *, finalize: bool = True) -> None:
         if self._integration is None:
             return
-        if not self._finalized:
-            self.finalize()
-        self._integration.shutdown()
-        self._integration = None
+        integration = self._integration
+        try:
+            if finalize and not self._finalized:
+                self.finalize()
+        finally:
+            try:
+                integration.shutdown()
+            finally:
+                self._integration = None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
 from types import SimpleNamespace
 from pathlib import Path
 import queue
@@ -9,6 +10,7 @@ import sys
 import threading
 
 import numpy as np
+import pytest
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -30,10 +32,15 @@ from daaam.realtime.semantic import (  # noqa: E402
     RealtimeSemanticAdapter,
     RealtimeSemanticConfig,
 )
+import daaam.realtime.semantic as semantic_module  # noqa: E402
 from daaam.tracking.models import Track  # noqa: E402
 
 
 ORIGIN_NS = 1_783_933_507_759_540_877
+
+
+def _semantic_queue_round_trip(incoming, outgoing):
+    outgoing.put(incoming.get(timeout=5.0))
 
 
 class FakeSegmenter:
@@ -134,6 +141,70 @@ class StrictFakeDsgSink(FakeDsgSink):
         super().register_entity(entity_id, semantic_id)
 
 
+class FakeLifecycleProcessor:
+    def __init__(self, *, start_error=None, stop_error=None):
+        self.start_error = start_error
+        self.stop_error = stop_error
+        self.start_calls = 0
+        self.stop_calls = []
+
+    def start(self):
+        self.start_calls += 1
+        if self.start_error is not None:
+            raise self.start_error
+
+    def stop(self, *, timeout_s, drain):
+        self.stop_calls.append((timeout_s, drain))
+        if self.stop_error is not None:
+            raise self.stop_error
+        return self.stats()
+
+    def stats(self):
+        return {
+            "corrections": {"pending": 0, "applied": 0, "rejected": 0},
+            "deliveries": {},
+            "consumer_errors": [],
+        }
+
+
+class FakeLifecycleGrounding:
+    def __init__(self, *, start_error=None, stop_error=None):
+        self.start_error = start_error
+        self.stop_error = stop_error
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    def start(self, *_args, **_kwargs):
+        self.start_calls += 1
+        if self.start_error is not None:
+            raise self.start_error
+
+    def stop(self):
+        self.stop_calls += 1
+        if self.stop_error is not None:
+            raise self.stop_error
+
+    def get_worker_health(self):
+        return {
+            "running": False,
+            "num_workers": 0,
+            "workers": [],
+            "ready_count": 0,
+            "all_ready": False,
+        }
+
+
+class FakeFailingStartThread:
+    def __init__(self, error):
+        self.error = error
+
+    def start(self):
+        raise self.error
+
+    def is_alive(self):
+        return False
+
+
 def pipeline_config():
     return SimpleNamespace(
         segmentation=SimpleNamespace(polygon_epsilon_factor=0.001),
@@ -158,6 +229,162 @@ def envelope(sensor_time_ns):
     return RealtimeEnvelope(
         MessageKey(sensor_time_ns), payload, FrameValue.ROUTINE, source="test"
     )
+
+
+def test_semantic_dam_queues_are_compatible_with_spawn_workers(tmp_path):
+    memory = MapMemory(tmp_path / "memory.sqlite3")
+    memory.create_session("replay", ORIGIN_NS, canonical=True)
+    adapter = RealtimeSemanticAdapter(
+        pipeline_config(),
+        memory,
+        session_id="replay",
+        output_dir=tmp_path / "semantic",
+        config=RealtimeSemanticConfig(grounding_enabled=False),
+        segmentation_service=FakeSegmenter(),
+        tracking_service=FakeTracker(),
+        dsg_sink=FakeDsgSink(),
+    )
+    process = mp.get_context("spawn").Process(
+        target=_semantic_queue_round_trip,
+        args=(adapter.query_queue, adapter.correction_queue),
+    )
+    adapter.query_queue.put("spawn-compatible")
+    process.start()
+    process.join(10.0)
+    assert process.exitcode == 0
+    assert adapter.correction_queue.get(timeout=1.0) == "spawn-compatible"
+    adapter.query_queue.close()
+    adapter.correction_queue.close()
+    adapter.query_queue.join_thread()
+    adapter.correction_queue.join_thread()
+    memory.close()
+
+
+def test_semantic_start_preserves_grounding_error_when_rollback_also_fails(
+    tmp_path,
+):
+    memory = MapMemory(tmp_path / "memory.sqlite3")
+    memory.create_session("replay", ORIGIN_NS, canonical=True)
+    start_error = RuntimeError("grounding spawn failed")
+    processor = FakeLifecycleProcessor(
+        stop_error=RuntimeError("processor rollback failed")
+    )
+    grounding = FakeLifecycleGrounding(
+        start_error=start_error,
+        stop_error=RuntimeError("grounding rollback failed"),
+    )
+    adapter = RealtimeSemanticAdapter(
+        pipeline_config(),
+        memory,
+        session_id="replay",
+        output_dir=tmp_path / "semantic",
+        config=RealtimeSemanticConfig(grounding_enabled=True),
+        segmentation_service=FakeSegmenter(),
+        tracking_service=FakeTracker(),
+        grounding_service=grounding,
+        dsg_sink=FakeDsgSink(),
+    )
+    adapter.processor = processor
+
+    with pytest.raises(RuntimeError) as captured:
+        adapter.start()
+
+    assert captured.value is start_error
+    assert grounding.start_calls == 1
+    assert grounding.stop_calls == 1
+    assert processor.start_calls == 1
+    assert len(processor.stop_calls) == 1
+    assert not adapter._started
+    assert not adapter._grounding_start_attempted
+    assert not adapter._processor_start_attempted
+    assert len(adapter.stats()["cleanup_errors"]) == 2
+
+    # Rollback reset every lifecycle flag, so a later idempotent stop neither
+    # leaks nor repeats cleanup just because _started was never set.
+    adapter.stop(drain=False)
+    assert grounding.stop_calls == 1
+    assert len(processor.stop_calls) == 1
+    adapter.query_queue.close()
+    adapter.correction_queue.close()
+    adapter.query_queue.join_thread()
+    adapter.correction_queue.join_thread()
+    memory.close()
+
+
+def test_semantic_start_rolls_back_after_correction_thread_start_failure(
+    tmp_path,
+    monkeypatch,
+):
+    memory = MapMemory(tmp_path / "memory.sqlite3")
+    memory.create_session("replay", ORIGIN_NS, canonical=True)
+    start_error = RuntimeError("correction thread failed")
+    processor = FakeLifecycleProcessor()
+    grounding = FakeLifecycleGrounding()
+    adapter = RealtimeSemanticAdapter(
+        pipeline_config(),
+        memory,
+        session_id="replay",
+        output_dir=tmp_path / "semantic",
+        config=RealtimeSemanticConfig(grounding_enabled=True),
+        segmentation_service=FakeSegmenter(),
+        tracking_service=FakeTracker(),
+        grounding_service=grounding,
+        dsg_sink=FakeDsgSink(),
+    )
+    adapter.processor = processor
+    monkeypatch.setattr(
+        semantic_module.threading,
+        "Thread",
+        lambda **_kwargs: FakeFailingStartThread(start_error),
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        adapter.start()
+
+    assert captured.value is start_error
+    assert grounding.stop_calls == 1
+    assert len(processor.stop_calls) == 1
+    assert adapter._correction_stop.is_set()
+    assert adapter._correction_thread is None
+    assert not adapter._correction_thread_start_attempted
+    assert not adapter._started
+    adapter.query_queue.close()
+    adapter.correction_queue.close()
+    adapter.query_queue.join_thread()
+    adapter.correction_queue.join_thread()
+    memory.close()
+
+
+def test_semantic_processor_start_failure_is_still_stopped(tmp_path):
+    memory = MapMemory(tmp_path / "memory.sqlite3")
+    memory.create_session("replay", ORIGIN_NS, canonical=True)
+    start_error = RuntimeError("processor thread failed")
+    processor = FakeLifecycleProcessor(start_error=start_error)
+    adapter = RealtimeSemanticAdapter(
+        pipeline_config(),
+        memory,
+        session_id="replay",
+        output_dir=tmp_path / "semantic",
+        config=RealtimeSemanticConfig(grounding_enabled=False),
+        segmentation_service=FakeSegmenter(),
+        tracking_service=FakeTracker(),
+        dsg_sink=FakeDsgSink(),
+    )
+    adapter.processor = processor
+
+    with pytest.raises(RuntimeError) as captured:
+        adapter.start()
+
+    assert captured.value is start_error
+    assert processor.start_calls == 1
+    assert len(processor.stop_calls) == 1
+    assert not adapter._processor_start_attempted
+    assert not adapter._started
+    adapter.query_queue.close()
+    adapter.correction_queue.close()
+    adapter.query_queue.join_thread()
+    adapter.correction_queue.join_thread()
+    memory.close()
 
 
 def test_semantic_frontend_segments_at_5hz_but_ticks_tracker_every_frame(tmp_path):

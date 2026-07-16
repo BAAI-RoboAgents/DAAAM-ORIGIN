@@ -631,6 +631,9 @@ class ReplayEngine:
             self.memory.create_session("replay", time.time_ns(), canonical=True)
         except sqlite3.IntegrityError:
             pass
+        except BaseException:
+            self.memory.close()
+            raise
 
     def initialize_previous(self, frame: ReplayFrame) -> None:
         try:
@@ -1251,12 +1254,92 @@ class ReplayEngine:
             context["map"] = map_metrics
         return context
 
-    def close(self) -> None:
-        if self.depth_worker is not None:
-            self.depth_worker.close()
-        if self.static_map_backend is not None:
-            self.static_map_backend.close()
-        self.memory.close()
+    def close(self, *, finalize_static_map: bool = True) -> None:
+        try:
+            if self.depth_worker is not None:
+                self.depth_worker.close()
+        finally:
+            try:
+                self.memory.close()
+            finally:
+                if self.static_map_backend is not None:
+                    self.static_map_backend.close(finalize=finalize_static_map)
+
+
+@dataclass
+class RealtimeResourceState:
+    """Resources whose lifetime extends beyond a single startup call."""
+
+    scheduler: Optional[MultiRateScheduler] = None
+    semantic_adapter: Optional[object] = None
+    depth_worker: Optional[SubprocessDepthBackend] = None
+    memory: Optional[MapMemory] = None
+    static_map_backend: Optional[HydraStaticMapBackend] = None
+
+
+def cleanup_realtime_resources(
+    resources: RealtimeResourceState,
+    *,
+    timeout_s: float = 5.0,
+) -> list[tuple[str, BaseException]]:
+    """Best-effort reverse-order cleanup without masking a run failure."""
+
+    errors: list[tuple[str, BaseException]] = []
+
+    def attempt(name: str, callback: Callable[[], None]) -> None:
+        try:
+            callback()
+        except BaseException as error:
+            errors.append((name, error))
+
+    scheduler = resources.scheduler
+    resources.scheduler = None
+    if scheduler is not None:
+        attempt(
+            "scheduler",
+            lambda: scheduler.stop(timeout=timeout_s, drain=False),
+        )
+
+    semantic_adapter = resources.semantic_adapter
+    resources.semantic_adapter = None
+    if semantic_adapter is not None:
+        attempt(
+            "semantic_adapter",
+            lambda: semantic_adapter.stop(timeout_s=timeout_s, drain=False),
+        )
+
+    depth_worker = resources.depth_worker
+    resources.depth_worker = None
+    if depth_worker is not None:
+        attempt("depth_worker", depth_worker.close)
+
+    memory = resources.memory
+    resources.memory = None
+    if memory is not None:
+        attempt("map_memory", memory.close)
+
+    static_map_backend = resources.static_map_backend
+    resources.static_map_backend = None
+    if static_map_backend is not None:
+        attempt(
+            "static_map_backend",
+            lambda: static_map_backend.close(finalize=False),
+        )
+
+    return errors
+
+
+def _log_cleanup_errors(
+    errors: list[tuple[str, BaseException]],
+) -> None:
+    for resource_name, error in errors:
+        try:
+            print(
+                f"cleanup failed for {resource_name}: {error!r}",
+                file=sys.stderr,
+            )
+        except BaseException:
+            pass
 
 
 def terminal_prefix(checkpoint: RealtimeCheckpoint, total_frames: int) -> int:
@@ -1352,7 +1435,7 @@ def add_semantic_runtime_metrics(
         }
 
 
-def main() -> None:
+def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
     args = parse_args()
     requested_stop_after = args.stop_after
     requested_fault_stage = args.fault_stage
@@ -1622,6 +1705,9 @@ def main() -> None:
         print(json.dumps(plan, indent=2, allow_nan=False))
         return
 
+    run_report_path = run_dir / "realtime_run_report.json"
+    run_report_path.unlink(missing_ok=True)
+
     poses = read_poses(dataset)
     frames = build_frames(dataset, metadata, poses)
     if args.max_frames is not None:
@@ -1677,6 +1763,7 @@ def main() -> None:
             request_timeout_s=args.depth_request_timeout_s,
             maximum_retries=args.depth_maximum_retries,
         )
+        resources.depth_worker = depth_worker
     if args.static_map_backend == "hydra":
         first_rgb = cv2.imread(str(frames[0].rgb_path), cv2.IMREAD_COLOR)
         if first_rgb is None:
@@ -1692,6 +1779,7 @@ def main() -> None:
             labelspace_colors=args.hydra_labelspace_colors,
             maximum_depth_m=float(metadata.get("recommended_max_depth_m", 20.0)),
         )
+        resources.static_map_backend = static_map_backend
         static_map_backend.initialize(
             first_rgb.shape[1],
             first_rgb.shape[0],
@@ -1716,6 +1804,7 @@ def main() -> None:
         static_map_backend=static_map_backend,
         checkpoint_state=checkpoint_state,
     )
+    resources.memory = engine.memory
     if static_map_backend is not None and start_index > 0:
         static_map_frames_rebuilt = rebuild_static_map_prefix(
             static_map_backend,
@@ -1774,6 +1863,7 @@ def main() -> None:
                 gpu_activity_path=gpu_activity_path,
             ),
         )
+        resources.semantic_adapter = semantic_adapter
         semantic_adapter.start()
         engine.semantic_label_provider = semantic_adapter.label_image_for
         semantic_startup_seconds = time.monotonic() - semantic_started
@@ -1785,6 +1875,7 @@ def main() -> None:
         error_every=args.fault_error_every,
     )
     scheduler = MultiRateScheduler(active_revision=engine.submaps.map_revision)
+    resources.scheduler = scheduler
     # These are worker service-capacity ceilings, not requested map publication
     # rates. Keeping them above the 1 Hz dispatch target avoids accumulating one
     # scheduler period at every stage of the geometry chain.
@@ -1875,6 +1966,7 @@ def main() -> None:
     scheduler_report = scheduler.stop(
         timeout=max(5.0, args.drain_timeout_s), drain=not idle
     )
+    resources.scheduler = None
     if "global" in enabled_stages:
         engine.finalize_paths()
         engine.finalize_static_map()
@@ -1888,6 +1980,7 @@ def main() -> None:
             timeout_s=args.semantic_drain_timeout_s,
             drain=True,
         )
+        resources.semantic_adapter = None
         add_semantic_runtime_metrics(scheduler_report, semantic_stats)
         scheduler_report["semantic_sidecar"] = semantic_stats
     terminal_now = checkpoint.completed_indices | {
@@ -1990,15 +2083,35 @@ def main() -> None:
         "quality_passed": quality["passed"],
         "hard_quality_failures": quality["hard_failures"],
     }
-    (run_dir / "realtime_run_report.json").write_text(
+    cleanup_errors = cleanup_realtime_resources(resources)
+    if cleanup_errors:
+        _log_cleanup_errors(cleanup_errors[1:])
+        resource_name, error = cleanup_errors[0]
+        raise RuntimeError(f"cleanup failed for {resource_name}") from error
+    run_report_path.write_text(
         json.dumps(report, indent=2, allow_nan=False) + "\n"
     )
     print(json.dumps(report, indent=2, allow_nan=False))
-    engine.close()
     if not idle:
         raise SystemExit(3)
     if not quality["passed"] and not args.quality_report_only:
         raise SystemExit(2)
+
+
+def main() -> None:
+    resources = RealtimeResourceState()
+    try:
+        _run_realtime_mapping(resources)
+    except BaseException:
+        cleanup_errors = cleanup_realtime_resources(resources)
+        _log_cleanup_errors(cleanup_errors)
+        raise
+
+    cleanup_errors = cleanup_realtime_resources(resources)
+    if cleanup_errors:
+        _log_cleanup_errors(cleanup_errors[1:])
+        resource_name, error = cleanup_errors[0]
+        raise RuntimeError(f"cleanup failed for {resource_name}") from error
 
 
 if __name__ == "__main__":
