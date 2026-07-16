@@ -8,6 +8,7 @@ import sys
 import numpy as np
 import cv2
 import pytest
+import yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,18 @@ from run_realtime_mapping import ReplayFrame, rebuild_static_map_prefix  # noqa:
 
 
 ORIGIN_NS = 1_783_933_507_759_540_877
+
+
+def test_g1_hydra_mesh_rejects_clamped_extra_distance_padding():
+    configuration = yaml.safe_load(
+        (REPOSITORY_ROOT / "config" / "hydra_g1_high_quality.yaml").read_text()
+    )
+    active_window = configuration["active_window"]
+    projective = active_window["projective_integrator"]
+    assert projective["extra_integration_distance"] > 0.0
+    assert active_window["mesh_integrator"]["min_weight"] > projective.get(
+        "min_measurement_weight", 1.0e-4
+    )
 
 
 class FakeHydraIntegration:
@@ -83,9 +96,7 @@ def test_hydra_backend_receives_static_depth_and_original_absolute_time(tmp_path
         tmp_path / "map",
         integration_factory=factory,
     )
-    intrinsics = np.array(
-        [[80.0, 0.0, 31.5], [0.0, 81.0, 23.5], [0.0, 0.0, 1.0]]
-    )
+    intrinsics = np.array([[80.0, 0.0, 31.5], [0.0, 81.0, 23.5], [0.0, 0.0, 1.0]])
     backend.initialize(64, 48, intrinsics)
     rgb = np.zeros((48, 64, 3), dtype=np.uint8)
     depth = np.ones((48, 64), dtype=np.float32)

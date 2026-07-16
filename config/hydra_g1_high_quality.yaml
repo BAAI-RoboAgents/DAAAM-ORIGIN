@@ -10,6 +10,10 @@ map_window:
 
 active_window:
   type: ActiveWindow
+  # Reject the 1e-4 clamped padding voxels created beyond the TSDF truncation
+  # band while retaining ordinary RGB-D surface observations.
+  mesh_integrator:
+    min_weight: 0.5
   volumetric_map:
     with_semantics: true
     voxels_per_side: 16
