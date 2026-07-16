@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 from typing import Any
 
 
@@ -71,6 +72,23 @@ def _semantic_object_bindings(document: dict[str, Any]) -> dict[str, dict[str, A
             "has_place_parent": not places or node_id in parented_objects,
         }
     return bindings
+
+
+def _normalized_label(value: Any) -> str:
+    return " ".join(str(value).split()).strip().casefold()
+
+
+def _dsg_labelspace(document: dict[str, Any], key: str) -> dict[int, str]:
+    labelspaces = document.get("metadata", {}).get("labelspaces", {})
+    entries = labelspaces.get(key)
+    if not isinstance(entries, list):
+        raise ValueError(f"DSG labelspace is missing: {key}")
+    labels: dict[int, str] = {}
+    for entry in entries:
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise ValueError(f"DSG labelspace entry is invalid: {key}")
+        labels[int(entry[0])] = _normalized_label(entry[1])
+    return labels
 
 
 def _validate_semantic_dsg_commit(
@@ -160,6 +178,42 @@ def _validate_semantic_dsg_commit(
             for binding in committed_bindings.values()
         ):
             raise ValueError("semantic DSG contains inactive or orphaned bindings")
+        labels_to_entities: dict[int, str] = {}
+        for entity_id, binding in committed_bindings.items():
+            semantic_label = int(binding["semantic_label"])
+            previous_entity = labels_to_entities.setdefault(semantic_label, entity_id)
+            if previous_entity != entity_id:
+                raise ValueError("semantic label is bound to multiple entities")
+            expected_description = _normalized_label(binding["description"])
+            for name, document in documents.items():
+                object_labels = _dsg_labelspace(document, "_l2p0")
+                mesh_labels = _dsg_labelspace(document, "mesh")
+                if object_labels.get(semantic_label) != expected_description:
+                    raise ValueError(f"Object labelspace disagrees with binding: {name}")
+                if mesh_labels.get(semantic_label) != expected_description:
+                    raise ValueError(f"mesh labelspace disagrees with binding: {name}")
+
+        memory_path = root / "map_memory.sqlite3"
+        if not memory_path.is_file():
+            raise ValueError("MapMemory database is missing")
+        connection = sqlite3.connect(f"file:{memory_path}?mode=ro", uri=True)
+        try:
+            rows = connection.execute(
+                "SELECT entity_id, canonical_name FROM entities "
+                "WHERE deleted_ns IS NULL"
+            ).fetchall()
+        finally:
+            connection.close()
+        memory_names = {str(entity_id): str(name) for entity_id, name in rows}
+        for entity_id, binding in committed_bindings.items():
+            if entity_id not in memory_names:
+                raise ValueError(f"semantic DSG entity is absent from MapMemory: {entity_id}")
+            if _normalized_label(memory_names[entity_id]) != _normalized_label(
+                binding["description"]
+            ):
+                raise ValueError(
+                    f"semantic DSG description disagrees with MapMemory: {entity_id}"
+                )
         verified_entities = int(manifest.get("verified_entity_count", -1))
         verified_operations = int(manifest.get("verified_operation_count", -1))
         if verified_entities != int(dsg_stats.get("verified_entities", -2)):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import sys
 
 
@@ -22,6 +23,12 @@ def write_run(root: Path, rate_hz: float, *, dirty: bool = False) -> Path:
     backend = root / "hydra_realtime" / "backend"
     backend.mkdir(parents=True)
     graph = {
+        "metadata": {
+            "labelspaces": {
+                "_l2p0": [[7, "wooden chair"]],
+                "mesh": [[7, "wooden chair"]],
+            }
+        },
         "nodes": [
             {
                 "id": 10,
@@ -88,6 +95,19 @@ def write_run(root: Path, rate_hz: float, *, dirty: bool = False) -> Path:
     semantic_commit_sha256 = hashlib.sha256(
         semantic_commit_path.read_bytes()
     ).hexdigest()
+    connection = sqlite3.connect(root / "map_memory.sqlite3")
+    try:
+        connection.execute(
+            "CREATE TABLE entities ("
+            "entity_id TEXT PRIMARY KEY, canonical_name TEXT NOT NULL, deleted_ns INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO entities(entity_id, canonical_name, deleted_ns) VALUES (?, ?, ?)",
+            ("entity-chair", "Wooden Chair", None),
+        )
+        connection.commit()
+    finally:
+        connection.close()
     quality_config = REPOSITORY_ROOT / "config" / "realtime_quality_gates.yaml"
     quality_sha256 = hashlib.sha256(quality_config.read_bytes()).hexdigest()
     documents = {
@@ -221,6 +241,29 @@ def test_1_hz_authority_reloads_and_hashes_final_semantic_dsg(tmp_path):
         if item["code"] == "semantic.final_dsg_artifacts"
     )
     assert "hash changed" in check["detail"]["error"]
+
+
+def test_1_hz_authority_matches_dsg_descriptions_to_map_memory(tmp_path):
+    run = write_run(tmp_path / "stale-memory", 1.0)
+    connection = sqlite3.connect(run / "map_memory.sqlite3")
+    try:
+        connection.execute(
+            "UPDATE entities SET canonical_name=? WHERE entity_id=?",
+            ("metal table", "entity-chair"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    verdict = validate_realtime_run(run, expected_rate_hz=1.0)
+
+    assert "semantic.final_dsg_artifacts" in verdict["blocking_failures"]
+    check = next(
+        item
+        for item in verdict["checks"]
+        if item["code"] == "semantic.final_dsg_artifacts"
+    )
+    assert "MapMemory" in check["detail"]["error"]
 
 
 def test_development_overrides_never_create_single_run_authority(tmp_path):
