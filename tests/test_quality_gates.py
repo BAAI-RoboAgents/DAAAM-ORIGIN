@@ -92,6 +92,22 @@ def test_runtime_latency_failure_and_missing_evidence_block_pipeline():
     assert result_codes(missing)["time"] == "time.missing_evidence"
 
 
+def test_runtime_rejects_map_cycle_slower_than_1_hz_target():
+    context = valid_context()
+    context["runtime"]["stages"]["global"] = {
+        "latency": {
+            "service_ms": {"p95": 100.0},
+            "end_to_end_ms": {"p95": 1000.1},
+        }
+    }
+    report = QualityGateRunner().evaluate(context)
+    runtime = next(
+        result for result in report["results"] if result["stage"] == "runtime"
+    )
+    assert runtime["code"] == "runtime.p95_exceeded"
+    assert runtime["metrics"]["end_to_end_exceeded"]["global"]["limit_ms"] == 1000.0
+
+
 def test_depth_gate_rejects_insufficient_left_right_validation_coverage():
     context = valid_context()
     context["depth"]["left_right_coverage"] = 0.2
@@ -188,12 +204,12 @@ def test_mesh_gate_rejects_excess_tiny_surface_area():
 
 def test_runtime_queue_backlog_and_drop_ratio_are_hard_failures():
     context = valid_context()
-    context["runtime"]["stages"]["depth"]["latency"]["queue_wait_ms"] = {
-        "p95": 900.0
-    }
+    context["runtime"]["stages"]["depth"]["latency"]["queue_wait_ms"] = {"p95": 900.0}
     context["runtime"]["totals"] = {"processed": 80, "dropped": 20}
     report = QualityGateRunner().evaluate(context)
-    runtime = next(result for result in report["results"] if result["stage"] == "runtime")
+    runtime = next(
+        result for result in report["results"] if result["stage"] == "runtime"
+    )
     assert runtime["code"] == "runtime.p95_exceeded"
     assert "depth" in runtime["metrics"]["queue_exceeded"]
     assert runtime["metrics"]["drop_ratio"] == 0.2

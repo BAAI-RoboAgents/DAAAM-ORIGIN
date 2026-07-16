@@ -1,7 +1,8 @@
-"""Acceptance tests for clean-HEAD paired realtime benchmark authority."""
+"""Acceptance tests for clean-HEAD realtime benchmark authority."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -10,19 +11,29 @@ import sys
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
-from daaam.quality.benchmark import validate_benchmark_pair  # noqa: E402
+from daaam.quality.benchmark import (  # noqa: E402
+    validate_benchmark_pair,
+    validate_realtime_run,
+)
 
 
 def write_run(root: Path, rate_hz: float, *, dirty: bool = False) -> Path:
     root.mkdir()
+    quality_config = REPOSITORY_ROOT / "config" / "realtime_quality_gates.yaml"
+    quality_sha256 = hashlib.sha256(quality_config.read_bytes()).hexdigest()
     documents = {
         "run_manifest.json": {
             "repository": {"git_sha": "abc123", "git_dirty": dirty},
             "dataset": {"tick_index_sha256": "dataset-sha"},
+            "time_contract": {"frame_count": 20},
             "configuration": {
                 "rate_hz": rate_hz,
+                "max_frames": None,
+                "allow_source_bursts": False,
                 "stage_rate_multiplier": 1.0,
                 "no_throttle": False,
+                "quality_config_sha256": quality_sha256,
+                "fault": {"stage": None, "delay_ms": 0.0, "error_every": 0},
             },
             "models": {
                 "foundation_stereo": {
@@ -41,6 +52,7 @@ def write_run(root: Path, rate_hz: float, *, dirty: bool = False) -> Path:
             },
         },
         "realtime_metrics.json": {
+            "elapsed_seconds": 20.0,
             "totals": {"processed": 100, "dropped": 0, "errors": 0},
             "stages": {
                 "segmentation": {
@@ -51,17 +63,25 @@ def write_run(root: Path, rate_hz: float, *, dirty: bool = False) -> Path:
                     "processed": 20,
                     "latency": {"service_ms": {"p95": 20.0}},
                 },
+                "global": {
+                    "processed": 20,
+                    "latency": {"end_to_end_ms": {"p95": 50.0}},
+                },
             },
         },
         "quality_report.json": {"passed": True, "hard_failures": 0},
         "realtime_run_report.json": {
             "status": "complete",
             "frames_requested": 20,
+            "frames_dispatched": 20,
             "frames_completed": 20,
+            "frames_resumed_from": 0,
             "dropped_frames": {},
             "quality_passed": True,
             "semantic_mode": "dam",
             "semantic_stats": {
+                "segmentation_calls": 10,
+                "tracking_calls": 20,
                 "prompts_submitted": 1,
                 "corrections_submitted": 1,
                 "dsg": {
@@ -72,6 +92,12 @@ def write_run(root: Path, rate_hz: float, *, dirty: bool = False) -> Path:
                     "errors": [],
                 },
             },
+            "replay_pacing": {
+                "configured_max_rate_hz": rate_hz,
+                "source_bursts_allowed": False,
+                "absolute_timestamps_preserved": True,
+                "sleep_seconds": 19.0 / rate_hz,
+            },
         },
     }
     for name, document in documents.items():
@@ -79,12 +105,79 @@ def write_run(root: Path, rate_hz: float, *, dirty: bool = False) -> Path:
     return root
 
 
-def test_clean_matching_5_and_10_hz_runs_are_authoritative(tmp_path):
+def test_clean_1_hz_run_is_authoritative(tmp_path):
+    run = write_run(tmp_path / "one", 1.0)
+    verdict = validate_realtime_run(run, expected_rate_hz=1.0)
+    assert verdict["passed"]
+    assert verdict["authoritative"]
+    assert verdict["expected_rate_hz"] == 1.0
+
+
+def test_1_hz_authority_rejects_wrong_rate_or_slow_map_cycle(tmp_path):
+    wrong_rate = write_run(tmp_path / "wrong-rate", 2.0)
+    rate_verdict = validate_realtime_run(wrong_rate, expected_rate_hz=1.0)
+    assert "configuration.rate" in rate_verdict["blocking_failures"]
+
+    slow = write_run(tmp_path / "slow", 1.0)
+    metrics_path = slow / "realtime_metrics.json"
+    metrics = json.loads(metrics_path.read_text())
+    metrics["stages"]["global"]["latency"]["end_to_end_ms"]["p95"] = 1000.1
+    metrics_path.write_text(json.dumps(metrics))
+    slow_verdict = validate_realtime_run(slow, expected_rate_hz=1.0)
+    assert "runtime.mapping_cycle_p95" in slow_verdict["blocking_failures"]
+
+
+def test_development_overrides_never_create_single_run_authority(tmp_path):
+    run = write_run(tmp_path / "no-dam", 1.0)
+    verdict = validate_realtime_run(run, expected_rate_hz=1.0, require_dam=False)
+    assert verdict["passed"]
+    assert not verdict["authoritative"]
+
+
+def test_1_hz_authority_rejects_partial_resume_faults_and_scheduler_drops(tmp_path):
+    partial = write_run(tmp_path / "partial", 1.0)
+    partial_manifest = json.loads((partial / "run_manifest.json").read_text())
+    partial_manifest["time_contract"]["frame_count"] = 21
+    (partial / "run_manifest.json").write_text(json.dumps(partial_manifest))
+    assert (
+        "run.full_dataset"
+        in validate_realtime_run(partial, expected_rate_hz=1.0)["blocking_failures"]
+    )
+
+    resumed = write_run(tmp_path / "resumed", 1.0)
+    resumed_report = json.loads((resumed / "realtime_run_report.json").read_text())
+    resumed_report["frames_resumed_from"] = 5
+    (resumed / "realtime_run_report.json").write_text(json.dumps(resumed_report))
+    assert (
+        "run.no_resume"
+        in validate_realtime_run(resumed, expected_rate_hz=1.0)["blocking_failures"]
+    )
+
+    faulted = write_run(tmp_path / "faulted", 1.0)
+    faulted_manifest = json.loads((faulted / "run_manifest.json").read_text())
+    faulted_manifest["configuration"]["fault"]["delay_ms"] = 1.0
+    (faulted / "run_manifest.json").write_text(json.dumps(faulted_manifest))
+    assert (
+        "configuration.no_fault_injection"
+        in validate_realtime_run(faulted, expected_rate_hz=1.0)["blocking_failures"]
+    )
+
+    dropped = write_run(tmp_path / "dropped", 1.0)
+    dropped_metrics = json.loads((dropped / "realtime_metrics.json").read_text())
+    dropped_metrics["totals"]["dropped"] = 1
+    (dropped / "realtime_metrics.json").write_text(json.dumps(dropped_metrics))
+    assert (
+        "runtime.zero_scheduler_drops"
+        in validate_realtime_run(dropped, expected_rate_hz=1.0)["blocking_failures"]
+    )
+
+
+def test_clean_matching_5_and_10_hz_runs_pass_optional_stress_checks(tmp_path):
     run_5hz = write_run(tmp_path / "five", 5.0)
     run_10hz = write_run(tmp_path / "ten", 10.0)
     verdict = validate_benchmark_pair(run_5hz, run_10hz)
     assert verdict["passed"]
-    assert verdict["authoritative"]
+    assert not verdict["authoritative"]
     assert verdict["pair_checks"] == {
         "same_clean_commit": True,
         "same_dataset": True,

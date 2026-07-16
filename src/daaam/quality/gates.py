@@ -81,6 +81,9 @@ class QualityGateConfig:
             "global": 1000.0,
         }
     )
+    stage_end_to_end_p95_limits_ms: Mapping[str, float] = field(
+        default_factory=lambda: {"global": 1000.0}
+    )
     maximum_runtime_drop_ratio: float = 0.10
     maximum_depth_peak_cuda_memory_bytes: int = 20_000_000_000
     maximum_depth_worker_rss_bytes: int = 16_000_000_000
@@ -111,15 +114,22 @@ class QualityGateConfig:
             raise ValueError("runtime latency limits must be positive")
         if any(value <= 0 for value in self.stage_queue_p95_limits_ms.values()):
             raise ValueError("runtime queue limits must be positive")
+        if any(value <= 0 for value in self.stage_end_to_end_p95_limits_ms.values()):
+            raise ValueError("runtime end-to-end limits must be positive")
         if not 0.0 <= self.maximum_runtime_drop_ratio <= 1.0:
             raise ValueError("maximum_runtime_drop_ratio must be in [0, 1]")
-        if min(
-            self.maximum_depth_peak_cuda_memory_bytes,
-            self.maximum_depth_worker_rss_bytes,
-        ) <= 0 or min(
-            self.maximum_depth_worker_restarts,
-            self.maximum_runtime_errors,
-        ) < 0:
+        if (
+            min(
+                self.maximum_depth_peak_cuda_memory_bytes,
+                self.maximum_depth_worker_rss_bytes,
+            )
+            <= 0
+            or min(
+                self.maximum_depth_worker_restarts,
+                self.maximum_runtime_errors,
+            )
+            < 0
+        ):
             raise ValueError("runtime resource limits are invalid")
 
     @classmethod
@@ -159,10 +169,7 @@ class QualityGateRunner:
         passed = (
             required_true
             and stereo_delta <= self.config.maximum_stereo_delta_ms
-            and (
-                not self.config.require_pinhole_projection
-                or projection == "pinhole"
-            )
+            and (not self.config.require_pinhole_projection or projection == "pinhole")
         )
         return GateResult(
             "time.contract" if passed else "time.contract_violation",
@@ -297,10 +304,14 @@ class QualityGateRunner:
             return self._missing("runtime")
         exceeded = {}
         queue_exceeded = {}
+        end_to_end_exceeded = {}
         measured = {}
         measured_queue = {}
-        configured_stages = set(self.config.stage_p95_limits_ms) | set(
-            self.config.stage_queue_p95_limits_ms
+        measured_end_to_end = {}
+        configured_stages = (
+            set(self.config.stage_p95_limits_ms)
+            | set(self.config.stage_queue_p95_limits_ms)
+            | set(self.config.stage_end_to_end_p95_limits_ms)
         )
         for stage in sorted(configured_stages):
             if stage not in stages:
@@ -317,9 +328,7 @@ class QualityGateRunner:
                         "limit_ms": service_limit,
                     }
             queue_p95 = (
-                stage_data.get("latency", {})
-                .get("queue_wait_ms", {})
-                .get("p95")
+                stage_data.get("latency", {}).get("queue_wait_ms", {}).get("p95")
             )
             if queue_p95 is not None:
                 measured_queue[stage] = float(queue_p95)
@@ -328,6 +337,20 @@ class QualityGateRunner:
                     queue_exceeded[stage] = {
                         "p95_ms": float(queue_p95),
                         "limit_ms": queue_limit,
+                    }
+            end_to_end_p95 = (
+                stage_data.get("latency", {}).get("end_to_end_ms", {}).get("p95")
+            )
+            if end_to_end_p95 is not None:
+                measured_end_to_end[stage] = float(end_to_end_p95)
+                end_to_end_limit = self.config.stage_end_to_end_p95_limits_ms.get(stage)
+                if (
+                    end_to_end_limit is not None
+                    and float(end_to_end_p95) > end_to_end_limit
+                ):
+                    end_to_end_exceeded[stage] = {
+                        "p95_ms": float(end_to_end_p95),
+                        "limit_ms": end_to_end_limit,
                     }
         if not measured:
             return self._missing("runtime")
@@ -353,6 +376,7 @@ class QualityGateRunner:
             GateStatus.PASS
             if not exceeded
             and not queue_exceeded
+            and not end_to_end_exceeded
             and not drop_exceeded
             and not errors_exceeded
             and not resource_exceeded
@@ -363,6 +387,8 @@ class QualityGateRunner:
             failed_parts.append(f"service: {', '.join(sorted(exceeded))}")
         if queue_exceeded:
             failed_parts.append(f"queue: {', '.join(sorted(queue_exceeded))}")
+        if end_to_end_exceeded:
+            failed_parts.append(f"end-to-end: {', '.join(sorted(end_to_end_exceeded))}")
         if drop_exceeded:
             failed_parts.append("drop ratio")
         if errors_exceeded:
@@ -373,7 +399,7 @@ class QualityGateRunner:
         if status is GateStatus.FAIL:
             if errors_exceeded:
                 code = "runtime.stage_error"
-            elif exceeded or queue_exceeded or drop_exceeded:
+            elif exceeded or queue_exceeded or end_to_end_exceeded or drop_exceeded:
                 code = "runtime.p95_exceeded"
             else:
                 code = "runtime.resource_exceeded"
@@ -388,8 +414,10 @@ class QualityGateRunner:
             metrics={
                 "stage_p95_ms": measured,
                 "stage_queue_p95_ms": measured_queue,
+                "stage_end_to_end_p95_ms": measured_end_to_end,
                 "service_exceeded": exceeded,
                 "queue_exceeded": queue_exceeded,
+                "end_to_end_exceeded": end_to_end_exceeded,
                 "drop_ratio": drop_ratio,
                 "errors": errors,
                 "resources": {
@@ -403,6 +431,9 @@ class QualityGateRunner:
                 "stage_p95_limits_ms": dict(self.config.stage_p95_limits_ms),
                 "stage_queue_p95_limits_ms": dict(
                     self.config.stage_queue_p95_limits_ms
+                ),
+                "stage_end_to_end_p95_limits_ms": dict(
+                    self.config.stage_end_to_end_p95_limits_ms
                 ),
                 "maximum_drop_ratio": self.config.maximum_runtime_drop_ratio,
                 "maximum_runtime_errors": self.config.maximum_runtime_errors,
@@ -432,9 +463,7 @@ class QualityGateRunner:
             measured_area_threshold = float(
                 evidence["minimum_significant_component_area_m2"]
             )
-            significant_components = int(
-                evidence["significant_connected_components"]
-            )
+            significant_components = int(evidence["significant_connected_components"])
             tiny_area_ratio = float(evidence["tiny_component_area_ratio"])
             largest = float(
                 evidence.get(

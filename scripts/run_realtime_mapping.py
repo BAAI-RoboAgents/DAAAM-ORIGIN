@@ -187,7 +187,15 @@ def parse_args():
     parser.add_argument("--depth-startup-timeout-s", type=float, default=120.0)
     parser.add_argument("--depth-request-timeout-s", type=float, default=2.0)
     parser.add_argument("--depth-maximum-retries", type=int, default=1)
-    parser.add_argument("--rate-hz", type=float, default=10.0)
+    parser.add_argument(
+        "--rate-hz",
+        type=float,
+        default=1.0,
+        help=(
+            "Maximum wall-clock replay/map dispatch rate. Absolute sensor timestamps "
+            "remain unchanged (default: 1 Hz)."
+        ),
+    )
     parser.add_argument("--no-throttle", action="store_true")
     parser.add_argument(
         "--allow-source-bursts",
@@ -203,7 +211,8 @@ def parse_args():
         default=1.0,
         help=(
             "Development-only multiplier for worker-stage service-rate caps. "
-            "The default preserves the documented per-stage rates."
+            "The default preserves per-stage service-capacity limits; this is not "
+            "the map dispatch target."
         ),
     )
     parser.add_argument("--queue-capacity", type=int, default=8)
@@ -236,8 +245,18 @@ def parse_args():
         type=Path,
         default=REPOSITORY_ROOT / "config" / "pipeline_config_realtime.yaml",
     )
-    parser.add_argument("--segmentation-rate-hz", type=float, default=5.0)
-    parser.add_argument("--semantic-frontend-rate-hz", type=float, default=10.0)
+    parser.add_argument(
+        "--segmentation-rate-hz",
+        type=float,
+        default=5.0,
+        help="FastSAM service-capacity limit; effective calls cannot exceed map input.",
+    )
+    parser.add_argument(
+        "--semantic-frontend-rate-hz",
+        type=float,
+        default=10.0,
+        help="Sidecar service-capacity limit; the map dispatch target is --rate-hz.",
+    )
     parser.add_argument("--semantic-queue-capacity", type=int, default=2)
     parser.add_argument("--semantic-minimum-observations", type=int, default=5)
     parser.add_argument("--semantic-drain-timeout-s", type=float, default=60.0)
@@ -297,7 +316,9 @@ def resolve_environment_python(
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"failed to list Conda environments: {result.stderr.strip()}")
+        raise RuntimeError(
+            f"failed to list Conda environments: {result.stderr.strip()}"
+        )
     try:
         environments = json.loads(result.stdout)["envs"]
     except (KeyError, TypeError, json.JSONDecodeError) as error:
@@ -358,7 +379,9 @@ def scheduled_confidence_mode(
     return "validity"
 
 
-def build_frames(dataset: Path, metadata: dict, poses: list[np.ndarray]) -> list[ReplayFrame]:
+def build_frames(
+    dataset: Path, metadata: dict, poses: list[np.ndarray]
+) -> list[ReplayFrame]:
     intrinsics = load_intrinsics(dataset, metadata)
     output = []
     for index, frame in enumerate(metadata["frames"]):
@@ -371,9 +394,7 @@ def build_frames(dataset: Path, metadata: dict, poses: list[np.ndarray]) -> list
                 rgb_path=Path(frame["cam0"]),
                 right_path=Path(frame["cam1"]),
                 depth_path=dataset / "depth" / f"{frame_index:08d}.png",
-                confidence_path=dataset
-                / "depth_confidence"
-                / f"{frame_index:08d}.png",
+                confidence_path=dataset / "depth_confidence" / f"{frame_index:08d}.png",
                 consistency_path=dataset
                 / "depth_consistency"
                 / f"{frame_index:08d}.png",
@@ -409,9 +430,7 @@ def load_precomputed_depth_provenance(dataset: Path) -> Optional[dict]:
             profile_name = profile_value
         checkpoint_value = report.get("checkpoint")
         checkpoint_path = (
-            Path(checkpoint_value).expanduser().resolve()
-            if checkpoint_value
-            else None
+            Path(checkpoint_value).expanduser().resolve() if checkpoint_value else None
         )
         return {
             "report": str(path.resolve()),
@@ -476,10 +495,7 @@ def load_semantic_model_provenance(
         )
     )
     dam_revision_path = (
-        cache_root
-        / f"models--{str(dam_model).replace('/', '--')}"
-        / "refs"
-        / "main"
+        cache_root / f"models--{str(dam_model).replace('/', '--')}" / "refs" / "main"
         if dam_model
         else None
     )
@@ -547,7 +563,9 @@ class ReplayEngine:
         self.depth_confidence_mode = depth_confidence_mode
         self.depth_lr_interval = depth_lr_interval
         self.static_map_backend = static_map_backend
-        self.semantic_label_provider: Optional[Callable[[int], Optional[np.ndarray]]] = None
+        self.semantic_label_provider: Optional[
+            Callable[[int], Optional[np.ndarray]]
+        ] = None
         position_variance = pose_position_std_m**2
         rotation_variance = math.radians(pose_rotation_std_deg) ** 2
         self.pose_covariance = np.diag(
@@ -561,9 +579,7 @@ class ReplayEngine:
                 maximum_rotation_std_deg=max(5.0, pose_rotation_std_deg * 5),
             )
         )
-        self.motion_config = MotionConfig(
-            minimum_dynamic_pixels=minimum_dynamic_pixels
-        )
+        self.motion_config = MotionConfig(minimum_dynamic_pixels=minimum_dynamic_pixels)
         if motion_analysis_width < 64:
             raise ValueError("motion_analysis_width must be at least 64 pixels")
         self.motion_analysis_width = motion_analysis_width
@@ -644,8 +660,12 @@ class ReplayEngine:
                 self.pose_translation_steps.append(
                     float(np.linalg.norm(relative[:3, 3]))
                 )
-                rotation_trace = np.clip((np.trace(relative[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)
-                self.pose_rotation_steps.append(float(np.degrees(np.arccos(rotation_trace))))
+                rotation_trace = np.clip(
+                    (np.trace(relative[:3, :3]) - 1.0) / 2.0, -1.0, 1.0
+                )
+                self.pose_rotation_steps.append(
+                    float(np.degrees(np.arccos(rotation_trace)))
+                )
             self.previous_pose = frame.world_T_camera.copy()
             self.frames_by_stage["pose"] += 1
         return envelope
@@ -682,9 +702,10 @@ class ReplayEngine:
             else None
         )
         if depth_metadata is not None:
-            left_right_verified = bool(
-                depth_metadata.get("left_right_verified", False)
-            ) and depth_metadata.get("confidence_mode") == "left-right"
+            left_right_verified = (
+                bool(depth_metadata.get("left_right_verified", False))
+                and depth_metadata.get("confidence_mode") == "left-right"
+            )
             consistency_raw = (
                 cv2.imread(str(frame.consistency_path), cv2.IMREAD_UNCHANGED)
                 if left_right_verified and frame.consistency_path.is_file()
@@ -718,14 +739,10 @@ class ReplayEngine:
                         depth_metadata is not None
                         and depth_metadata.get("left_right_consistency") is not None
                     ):
-                        consistency = float(
-                            depth_metadata["left_right_consistency"]
-                        )
+                        consistency = float(depth_metadata["left_right_consistency"])
                     else:
                         consistent_pixels = int(
-                            np.count_nonzero(
-                                consistency_raw.astype(np.float32) > 0.0
-                            )
+                            np.count_nonzero(consistency_raw.astype(np.float32) > 0.0)
                         )
                         consistency = min(
                             1.0,
@@ -923,11 +940,14 @@ class ReplayEngine:
                         (width, height),
                         interpolation=cv2.INTER_NEAREST,
                     ).astype(bool)
-                    residual_px = cv2.resize(
-                        motion.residual_px,
-                        (width, height),
-                        interpolation=cv2.INTER_LINEAR,
-                    ) / scale
+                    residual_px = (
+                        cv2.resize(
+                            motion.residual_px,
+                            (width, height),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                        / scale
+                    )
                 else:
                     dynamic = motion.dynamic_mask
                     unknown = motion.unknown_mask
@@ -965,8 +985,14 @@ class ReplayEngine:
                     continue
                 z = float(np.median(valid_depth))
                 u, v = centroids[component]
-                fx, fy = current.source.intrinsics[0, 0], current.source.intrinsics[1, 1]
-                cx, cy = current.source.intrinsics[0, 2], current.source.intrinsics[1, 2]
+                fx, fy = (
+                    current.source.intrinsics[0, 0],
+                    current.source.intrinsics[1, 1],
+                )
+                cx, cy = (
+                    current.source.intrinsics[0, 2],
+                    current.source.intrinsics[1, 2],
+                )
                 camera_point = np.array([(u - cx) * z / fx, (v - cy) * z / fy, z])
                 world_point = (
                     current.source.world_T_camera @ np.r_[camera_point, 1.0]
@@ -1165,10 +1191,10 @@ class ReplayEngine:
 
         return wrapped
 
-    def quality_context(self, scheduler_report: dict, *, map_metrics: Optional[dict]) -> dict:
-        maximum_position_std = float(
-            np.sqrt(np.max(np.diag(self.pose_covariance)[:3]))
-        )
+    def quality_context(
+        self, scheduler_report: dict, *, map_metrics: Optional[dict]
+    ) -> dict:
+        maximum_position_std = float(np.sqrt(np.max(np.diag(self.pose_covariance)[:3])))
         runtime = json.loads(json.dumps(scheduler_report))
         runtime["resources"] = {
             "depth_peak_cuda_memory_bytes": self.depth_peak_cuda_memory_bytes,
@@ -1200,13 +1226,17 @@ class ReplayEngine:
                 ),
             },
             "pose": {
-                "maximum_translation_step_m": max(self.pose_translation_steps, default=0.0),
+                "maximum_translation_step_m": max(
+                    self.pose_translation_steps, default=0.0
+                ),
                 "maximum_rotation_step_deg": max(self.pose_rotation_steps, default=0.0),
                 "maximum_position_std_m": maximum_position_std,
                 "timestamps_monotonic": True,
             },
             "dynamic": {
-                "dynamic_contamination_rate": max(self.contamination_rates, default=0.0),
+                "dynamic_contamination_rate": max(
+                    self.contamination_rates, default=0.0
+                ),
                 "unknown_ratio": float(np.mean(self.motion_unknown_ratios))
                 if self.motion_unknown_ratios
                 else 1.0,
@@ -1340,7 +1370,9 @@ def main() -> None:
         or args.semantic_drain_timeout_s <= 0
         or args.dam_minimum_gpu_idle_s < 0
     ):
-        raise ValueError("Semantic rates, queues, observations, and drain timeout must be positive")
+        raise ValueError(
+            "Semantic rates, queues, observations, and drain timeout must be positive"
+        )
     if args.semantic_mode != "disabled" and not args.semantic_config.is_file():
         raise ValueError("Real semantic mode requires a valid --semantic-config")
     if args.depth_lr_interval <= 0:
@@ -1402,7 +1434,10 @@ def main() -> None:
             "pose_exact_match": True,
             "relative_time_consistent": True,
             "maximum_stereo_delta_ms": max(
-                (float(frame.get("stereo_delta_ms", 0.0)) for frame in metadata["frames"]),
+                (
+                    float(frame.get("stereo_delta_ms", 0.0))
+                    for frame in metadata["frames"]
+                ),
                 default=0.0,
             ),
             "projection_model": metadata.get("projection_model"),
@@ -1418,7 +1453,11 @@ def main() -> None:
     )
     if args.overwrite and args.resume:
         raise ValueError("--overwrite and --resume are mutually exclusive")
-    if run_dir.exists() and any(run_dir.iterdir()) and not (args.resume or args.overwrite):
+    if (
+        run_dir.exists()
+        and any(run_dir.iterdir())
+        and not (args.resume or args.overwrite)
+    ):
         raise FileExistsError(f"Run directory is not empty: {run_dir}")
     if args.overwrite and run_dir.exists():
         shutil.rmtree(run_dir)
@@ -1445,6 +1484,7 @@ def main() -> None:
         "depth_confidence_mode": effective_depth_confidence_mode,
         "requested_depth_confidence_mode": args.depth_confidence_mode,
         "depth_lr_interval": args.depth_lr_interval,
+        "max_frames": args.max_frames,
         "rate_hz": args.rate_hz,
         "no_throttle": args.no_throttle,
         "allow_source_bursts": args.allow_source_bursts,
@@ -1687,7 +1727,10 @@ def main() -> None:
         startup_started = time.monotonic()
         depth_worker.start()
         depth_backend_startup_seconds = time.monotonic() - startup_started
-        if start_index < len(frames) and "depth" in STAGES[: STAGES.index(args.stop_after) + 1]:
+        if (
+            start_index < len(frames)
+            and "depth" in STAGES[: STAGES.index(args.stop_after) + 1]
+        ):
             warmup_started = time.monotonic()
             engine.materialize_depth(frames[start_index])
             depth_backend_warmup_seconds = time.monotonic() - warmup_started
@@ -1742,6 +1785,9 @@ def main() -> None:
         error_every=args.fault_error_every,
     )
     scheduler = MultiRateScheduler(active_revision=engine.submaps.map_revision)
+    # These are worker service-capacity ceilings, not requested map publication
+    # rates. Keeping them above the 1 Hz dispatch target avoids accumulating one
+    # scheduler period at every stage of the geometry chain.
     base_rates = {
         "pose": 50.0,
         "depth": 30.0,
@@ -1791,7 +1837,9 @@ def main() -> None:
     source_deltas = np.diff([frame.sensor_time_ns for frame in source_frames]) / 1e9
     positive_deltas = source_deltas[source_deltas > 0]
     nominal_hz = (
-        1.0 / float(np.median(positive_deltas)) if len(positive_deltas) else args.rate_hz
+        1.0 / float(np.median(positive_deltas))
+        if len(positive_deltas)
+        else args.rate_hz
     )
     previous_source_time = None
     dispatched = 0
@@ -1856,9 +1904,7 @@ def main() -> None:
         json.loads(args.map_metrics_json.read_text())
         if args.map_metrics_json is not None
         else (
-            static_map_backend.map_metrics()
-            if static_map_backend is not None
-            else None
+            static_map_backend.map_metrics() if static_map_backend is not None else None
         )
     )
     context = engine.quality_context(scheduler_report, map_metrics=map_metrics)
@@ -1897,9 +1943,7 @@ def main() -> None:
             "drain_timeout"
             if not idle
             else (
-                "stage_error"
-                if scheduler_report.get("handler_errors")
-                else "complete"
+                "stage_error" if scheduler_report.get("handler_errors") else "complete"
             )
         ),
         "dataset": str(dataset),
@@ -1921,7 +1965,9 @@ def main() -> None:
         "depth_backend": args.depth_backend,
         "depth_backend_startup_seconds": depth_backend_startup_seconds,
         "depth_backend_warmup_seconds": depth_backend_warmup_seconds,
-        "depth_backend_stats": depth_worker.stats() if depth_worker is not None else None,
+        "depth_backend_stats": depth_worker.stats()
+        if depth_worker is not None
+        else None,
         "depth_peak_cuda_memory_bytes": engine.depth_peak_cuda_memory_bytes,
         "depth_peak_worker_rss_bytes": engine.depth_peak_worker_rss_bytes,
         "semantic_mode": args.semantic_mode,
