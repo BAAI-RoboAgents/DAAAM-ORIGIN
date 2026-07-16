@@ -2,7 +2,7 @@
 torch==2.8.0+cu128
 torchvision==0.23.0+cu128
 torchaudio==2.8.0+cu128
-boxmot @ git+https://github.com/nicogorlo/boxmot.git
+boxmot @ git+https://github.com/nicogorlo/boxmot.git@1dfa11e6a33c8172d07b3877a5f27a82ff8fb4cf
 dam @ git+https://github.com/nicogorlo/describe-anything-batch.git
 perception_models @ git+https://github.com/nicogorlo/perception_models
 natsort

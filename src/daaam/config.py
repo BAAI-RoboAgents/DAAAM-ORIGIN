@@ -23,6 +23,9 @@ class TrackingConfig:
 	reid_weights: str = "checkpoints/reid_weights/clip_general.engine"  # ReID model weights (supports .pt, .onnx, .engine)
 	with_reid: bool = True  # Enable ReID features for track association
 	reid_half: bool = False  # Use FP16 for ReID inference (False for CLIP models which require FP32)
+	batch_reid_crops: bool = False  # Batch CPU crop preparation into one device transfer
+	cmc_method: str = "ecc"  # Camera-motion compensation backend used by BotSort
+	cmc_ecc_max_iterations: int = 100  # Bound ECC tail latency; realtime profile overrides this
 
 
 @dataclass

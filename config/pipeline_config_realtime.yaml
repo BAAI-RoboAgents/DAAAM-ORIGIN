@@ -14,6 +14,9 @@ tracking:
   reid_weights: "checkpoints/reid_weights/clip_general.engine"
   with_reid: true
   reid_half: false
+  batch_reid_crops: true
+  cmc_method: "ecc"
+  cmc_ecc_max_iterations: 20
 
 grounding:
   agent_model_name: "gpt-5-mini"
