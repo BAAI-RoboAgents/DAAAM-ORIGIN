@@ -19,6 +19,75 @@ from daaam.quality.benchmark import (  # noqa: E402
 
 def write_run(root: Path, rate_hz: float, *, dirty: bool = False) -> Path:
     root.mkdir()
+    backend = root / "hydra_realtime" / "backend"
+    backend.mkdir(parents=True)
+    graph = {
+        "nodes": [
+            {
+                "id": 10,
+                "layer": 3,
+                "partition": 0,
+                "attributes": {"type": "PlaceNodeAttributes"},
+            },
+            {
+                "id": 20,
+                "layer": 2,
+                "partition": 0,
+                "attributes": {
+                    "type": "KhronosObjectAttributes",
+                    "semantic_label": 7,
+                    "is_active": True,
+                    "metadata": {
+                        "entity_id": "entity-chair",
+                        "description": "wooden chair",
+                    },
+                },
+            },
+        ],
+        "edges": [{"source": 10, "target": 20, "info": {}}],
+    }
+    dsg_path = backend / "dsg.json"
+    dsg_with_mesh_path = backend / "dsg_with_mesh.json"
+    dsg_path.write_text(json.dumps(graph))
+    mesh_graph = {
+        **graph,
+        "mesh": {
+            "points": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            "faces": [[0, 1, 2]],
+        },
+    }
+    dsg_with_mesh_path.write_text(json.dumps(mesh_graph))
+    semantic_commit = {
+        "schema": "daaam.semantic_dsg_commit.v1",
+        "artifacts": {
+            "dsg.json": {
+                "sha256": hashlib.sha256(dsg_path.read_bytes()).hexdigest(),
+                "requested_include_mesh": False,
+                "has_mesh": False,
+                "mesh_vertices": 0,
+                "mesh_faces": 0,
+                "object_count": 1,
+            },
+            "dsg_with_mesh.json": {
+                "sha256": hashlib.sha256(
+                    dsg_with_mesh_path.read_bytes()
+                ).hexdigest(),
+                "requested_include_mesh": True,
+                "has_mesh": True,
+                "mesh_vertices": 3,
+                "mesh_faces": 1,
+                "object_count": 1,
+            },
+        },
+        "object_count": 1,
+        "verified_entity_count": 1,
+        "verified_operation_count": 1,
+    }
+    semantic_commit_path = backend / "semantic_dsg_commit.json"
+    semantic_commit_path.write_text(json.dumps(semantic_commit))
+    semantic_commit_sha256 = hashlib.sha256(
+        semantic_commit_path.read_bytes()
+    ).hexdigest()
     quality_config = REPOSITORY_ROOT / "config" / "realtime_quality_gates.yaml"
     quality_sha256 = hashlib.sha256(quality_config.read_bytes()).hexdigest()
     documents = {
@@ -86,9 +155,18 @@ def write_run(root: Path, rate_hz: float, *, dirty: bool = False) -> Path:
                 "corrections_submitted": 1,
                 "dsg": {
                     "graph_attached": True,
+                    "commit_valid": True,
                     "applied": 1,
                     "pending": 0,
                     "unmapped": 0,
+                    "commit_manifest_path": str(semantic_commit_path.resolve()),
+                    "commit_manifest_sha256": semantic_commit_sha256,
+                    "verified_artifacts": [
+                        str(dsg_path.resolve()),
+                        str(dsg_with_mesh_path.resolve()),
+                    ],
+                    "verified_entities": 1,
+                    "verified_operations": 1,
                     "errors": [],
                 },
             },
@@ -125,6 +203,24 @@ def test_1_hz_authority_rejects_wrong_rate_or_slow_map_cycle(tmp_path):
     metrics_path.write_text(json.dumps(metrics))
     slow_verdict = validate_realtime_run(slow, expected_rate_hz=1.0)
     assert "runtime.mapping_cycle_p95" in slow_verdict["blocking_failures"]
+
+
+def test_1_hz_authority_reloads_and_hashes_final_semantic_dsg(tmp_path):
+    run = write_run(tmp_path / "tampered-dsg", 1.0)
+    dsg_with_mesh = run / "hydra_realtime" / "backend" / "dsg_with_mesh.json"
+    document = json.loads(dsg_with_mesh.read_text())
+    document["nodes"][1]["attributes"]["metadata"]["description"] = "tampered"
+    dsg_with_mesh.write_text(json.dumps(document))
+
+    verdict = validate_realtime_run(run, expected_rate_hz=1.0)
+
+    assert "semantic.final_dsg_artifacts" in verdict["blocking_failures"]
+    check = next(
+        item
+        for item in verdict["checks"]
+        if item["code"] == "semantic.final_dsg_artifacts"
+    )
+    assert "hash changed" in check["detail"]["error"]
 
 
 def test_development_overrides_never_create_single_run_authority(tmp_path):
