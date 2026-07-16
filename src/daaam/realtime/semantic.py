@@ -236,6 +236,7 @@ class RealtimeSemanticAdapter:
         self._lock = threading.RLock()
         self._last_segmentation_time_ns: Optional[int] = None
         self._semantic_ids_by_track: dict[int, int] = {}
+        self._semantic_id_by_entity: dict[str, int] = {}
         self._entity_by_semantic_id: dict[int, str] = {}
         self._context_by_semantic_id: dict[int, tuple[int, int]] = {}
         self._observations_by_entity: dict[str, int] = {}
@@ -254,6 +255,8 @@ class RealtimeSemanticAdapter:
             "tracking_calls": 0,
             "tracking_failures": 0,
             "tracked_instances": 0,
+            "entity_semantic_merges": 0,
+            "entity_semantic_reassignments": 0,
             "label_frames_cached": 0,
             "propagation_frames": 0,
             "propagation_frames_with_labels": 0,
@@ -331,6 +334,33 @@ class RealtimeSemanticAdapter:
             semantic_id = self._next_semantic_id
             self._next_semantic_id += 1
             self._semantic_ids_by_track[track_id] = semantic_id
+        return semantic_id
+
+    def _canonical_entity_semantic_id(
+        self,
+        state: _TrackMaskState,
+        entity_id: str,
+    ) -> int:
+        """Make the stable MapMemory entity, not a transient track, authoritative."""
+
+        existing = self._semantic_id_by_entity.get(entity_id)
+        if existing is not None:
+            if existing != state.semantic_id:
+                with self._lock:
+                    self._stats["entity_semantic_merges"] += 1
+            semantic_id = existing
+        else:
+            semantic_id = state.semantic_id
+            owner = self._entity_by_semantic_id.get(semantic_id)
+            if owner is not None and owner != entity_id:
+                semantic_id = self._next_semantic_id
+                self._next_semantic_id += 1
+                with self._lock:
+                    self._stats["entity_semantic_reassignments"] += 1
+            self._semantic_id_by_entity[entity_id] = semantic_id
+        state.semantic_id = semantic_id
+        self._semantic_ids_by_track[state.track_id] = semantic_id
+        self._entity_by_semantic_id[semantic_id] = entity_id
         return semantic_id
 
     @staticmethod
@@ -661,10 +691,16 @@ class RealtimeSemanticAdapter:
                 dimensions_m=np.asarray([width_m, 0.2, height_m]),
                 confidence=state.confidence,
             )
+            provisional_semantic_id = semantic_id
+            semantic_id = self._canonical_entity_semantic_id(state, entity_id)
+            if semantic_id != provisional_semantic_id:
+                label_image[
+                    mask & (label_image == provisional_semantic_id)
+                ] = semantic_id
+                audit_track["semantic_id"] = semantic_id
             state.entity_id = entity_id
             audit_track["entity_id"] = entity_id
             self.dsg_sink.register_entity(entity_id, semantic_id)
-            self._entity_by_semantic_id[semantic_id] = entity_id
             self._context_by_semantic_id[semantic_id] = (
                 sensor_time_ns,
                 envelope.key.map_revision,

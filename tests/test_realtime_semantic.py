@@ -72,6 +72,33 @@ class FakePredictingTracker(FakeTracker):
         return np.asarray([[16, 8, 32, 24, 1, 0.8, 0, -1]], dtype=np.float32)
 
 
+class FakeDuplicateSegmenter(FakeSegmenter):
+    def segment_checked(self, image):
+        self.calls += 1
+        mask = np.zeros(image.shape[:2], dtype=bool)
+        mask[8:24, 12:28] = True
+        detections = np.asarray(
+            [
+                [12, 8, 28, 24, 0.9, 0],
+                [12, 8, 28, 24, 0.8, 0],
+            ],
+            dtype=np.float32,
+        )
+        return detections, [mask, mask.copy()]
+
+
+class FakeDuplicateTracker(FakeTracker):
+    def update(self, detections, _image):
+        self.calls.append(len(detections))
+        return np.asarray(
+            [
+                [12, 8, 28, 24, 1, 0.9, 0, 0],
+                [12, 8, 28, 24, 2, 0.8, 0, 1],
+            ],
+            dtype=np.float32,
+        )
+
+
 class FakeDsgSink:
     def __init__(self):
         self.service = SimpleNamespace(color_map=None)
@@ -97,6 +124,14 @@ class FakeDsgSink:
 
     def persist(self):
         return None
+
+
+class StrictFakeDsgSink(FakeDsgSink):
+    def register_entity(self, entity_id, semantic_id):
+        existing = self.mappings.get(entity_id)
+        if existing is not None and existing != semantic_id:
+            raise ValueError("stable entity was assigned multiple semantic IDs")
+        super().register_entity(entity_id, semantic_id)
 
 
 def pipeline_config():
@@ -211,6 +246,33 @@ def test_non_segmentation_mask_follows_botsort_bbox_with_exact_provenance(tmp_pa
     assert stats["propagation_bbox_warps"] == 1
     assert stats["propagation_carry_forwards"] == 0
     assert stats["dsg"]["mapped_entities"] == 1
+    memory.close()
+
+
+def test_mapmemory_entity_owns_canonical_semantic_id_across_duplicate_tracks(
+    tmp_path,
+):
+    memory = MapMemory(tmp_path / "memory.sqlite3")
+    memory.create_session("replay", ORIGIN_NS, canonical=True)
+    sink = StrictFakeDsgSink()
+    adapter = RealtimeSemanticAdapter(
+        pipeline_config(),
+        memory,
+        session_id="replay",
+        output_dir=tmp_path / "semantic",
+        config=RealtimeSemanticConfig(grounding_enabled=False),
+        segmentation_service=FakeDuplicateSegmenter(),
+        tracking_service=FakeDuplicateTracker(),
+        dsg_sink=sink,
+    )
+    sensor_time_ns = ORIGIN_NS + 1
+    adapter.handle(envelope(sensor_time_ns))
+    labels = adapter.label_image_for(sensor_time_ns)
+    stats = adapter.stats()
+    assert labels is not None and set(np.unique(labels)) == {0, 1}
+    assert len(sink.mappings) == 1
+    assert stats["entity_semantic_merges"] == 1
+    assert memory.stats()["entities"]["active"] == 1
     memory.close()
 
 
