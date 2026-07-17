@@ -80,6 +80,27 @@ def test_checkpoint_tracks_sparse_completion_and_restores_state(tmp_path):
     assert restored.state["paths"]["paths"][0]["path_id"] == "path-one"
 
 
+def test_checkpoint_can_batch_completion_until_mapping_state_flush(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    checkpoint = RealtimeCheckpoint(path, dataset_fingerprint="abc")
+
+    checkpoint.record_completed(0, 100)
+    checkpoint.record_completed(1, 200)
+    assert checkpoint.completed_indices == {0, 1}
+    assert not path.exists()
+
+    checkpoint.update_mapping_state(
+        map_revision=3,
+        dynamic_layer={"active": [], "history": []},
+        submaps={"map_revision": 3, "submaps": []},
+        paths={"paths": []},
+        path_buffer={"sensor_times_ns": [], "points_m": []},
+    )
+    persisted = json.loads(path.read_text())
+    assert persisted["completed_frame_indices"] == [0, 1]
+    assert persisted["last_sensor_time_ns"] == 200
+
+
 def test_checkpoint_refuses_different_dataset(tmp_path):
     path = tmp_path / "checkpoint.json"
     first = RealtimeCheckpoint(path, dataset_fingerprint="first")

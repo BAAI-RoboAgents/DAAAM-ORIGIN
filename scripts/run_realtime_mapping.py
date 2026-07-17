@@ -224,6 +224,15 @@ def parse_args():
     parser.add_argument("--motion-analysis-width", type=int, default=160)
     parser.add_argument("--submap-frames", type=int, default=30)
     parser.add_argument(
+        "--checkpoint-interval-frames",
+        type=int,
+        default=30,
+        help=(
+            "Atomically persist replay state every N completed frames; completion "
+            "is still tracked in memory per frame and flushed at shutdown."
+        ),
+    )
+    parser.add_argument(
         "--static-map-backend",
         choices=("submaps", "hydra"),
         default="submaps",
@@ -539,6 +548,7 @@ class ReplayEngine:
         minimum_dynamic_pixels: int,
         motion_analysis_width: int,
         submap_frames: int,
+        checkpoint_interval_frames: int,
         write_fusion_products: bool,
         depth_worker: Optional[SubprocessDepthBackend] = None,
         stereo_fx: Optional[float] = None,
@@ -582,7 +592,11 @@ class ReplayEngine:
         self.motion_config = MotionConfig(minimum_dynamic_pixels=minimum_dynamic_pixels)
         if motion_analysis_width < 64:
             raise ValueError("motion_analysis_width must be at least 64 pixels")
+        if checkpoint_interval_frames <= 0:
+            raise ValueError("checkpoint_interval_frames must be positive")
         self.motion_analysis_width = motion_analysis_width
+        self.checkpoint_interval_frames = checkpoint_interval_frames
+        self.terminal_completions = 0
         self.dynamic_config = DynamicLayerConfig()
         self.state_lock = threading.RLock()
         if checkpoint_state:
@@ -1163,6 +1177,16 @@ class ReplayEngine:
         if self.static_map_backend is not None:
             self.static_map_backend.finalize()
 
+    def flush_checkpoint(self) -> None:
+        with self.state_lock:
+            self.checkpoint.update_mapping_state(
+                map_revision=self.submaps.map_revision,
+                dynamic_layer=self.dynamic_layer.snapshot(),
+                submaps=self.submaps.snapshot(),
+                paths=self.path_repository.snapshot(),
+                path_buffer=self._path_buffer_snapshot(),
+            )
+
     def static_map_stats(self) -> dict:
         if self.static_map_backend is None:
             return {"backend": "submaps", "submaps": len(self.submaps.submaps)}
@@ -1181,15 +1205,15 @@ class ReplayEngine:
             else:
                 frame = payload
             with self.state_lock:
-                self.checkpoint.mark_completed(
-                    frame.frame_index,
-                    frame.sensor_time_ns,
-                    map_revision=self.submaps.map_revision,
-                    dynamic_layer=self.dynamic_layer.snapshot(),
-                    submaps=self.submaps.snapshot(),
-                    paths=self.path_repository.snapshot(),
-                    path_buffer=self._path_buffer_snapshot(),
+                self.checkpoint.record_completed(
+                    frame.frame_index, frame.sensor_time_ns
                 )
+                self.terminal_completions += 1
+                if (
+                    self.terminal_completions == 1
+                    or self.terminal_completions % self.checkpoint_interval_frames == 0
+                ):
+                    self.flush_checkpoint()
             return output
 
         return wrapped
@@ -1452,7 +1476,11 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
     args.fault_stage = LEGACY_STAGE_ALIASES.get(args.fault_stage, args.fault_stage)
     if args.rate_hz <= 0 or args.stage_rate_multiplier <= 0:
         raise ValueError("Replay and stage rates must be positive")
-    if args.queue_capacity <= 0 or args.drain_timeout_s <= 0:
+    if (
+        args.queue_capacity <= 0
+        or args.drain_timeout_s <= 0
+        or args.checkpoint_interval_frames <= 0
+    ):
         raise ValueError("Queue and drain settings must be positive")
     if (
         args.segmentation_rate_hz <= 0
@@ -1595,6 +1623,7 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         "minimum_dynamic_pixels": args.minimum_dynamic_pixels,
         "motion_analysis_width": args.motion_analysis_width,
         "submap_frames": args.submap_frames,
+        "checkpoint_interval_frames": args.checkpoint_interval_frames,
         "static_map_backend": args.static_map_backend,
         "hydra_config_path": (
             str(args.hydra_config_path.resolve())
@@ -1811,6 +1840,7 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         minimum_dynamic_pixels=args.minimum_dynamic_pixels,
         motion_analysis_width=args.motion_analysis_width,
         submap_frames=args.submap_frames,
+        checkpoint_interval_frames=args.checkpoint_interval_frames,
         write_fusion_products=not args.no_write_fusion_products,
         depth_worker=depth_worker,
         stereo_fx=float(metadata.get("fx", frames[0].intrinsics[0, 0])),
@@ -1996,6 +2026,8 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
     if "global" in enabled_stages:
         engine.finalize_paths()
         engine.finalize_static_map()
+    else:
+        engine.flush_checkpoint()
     semantic_stats = None
     if semantic_adapter is not None:
         if static_map_backend is not None:

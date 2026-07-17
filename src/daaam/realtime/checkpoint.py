@@ -25,6 +25,7 @@ class RealtimeCheckpoint:
             "paths": {"paths": []},
             "path_buffer": {"sensor_times_ns": [], "points_m": []},
         }
+        self._completed_indices: set[int] = set()
 
     def load(self) -> bool:
         with self._lock:
@@ -36,16 +37,20 @@ class RealtimeCheckpoint:
             if state.get("dataset_fingerprint") != self.dataset_fingerprint:
                 raise ValueError("checkpoint dataset fingerprint does not match")
             self._state = state
+            self._completed_indices = {
+                int(value) for value in state["completed_frame_indices"]
+            }
             return True
 
     @property
     def completed_indices(self) -> set[int]:
         with self._lock:
-            return {int(value) for value in self._state["completed_frame_indices"]}
+            return set(self._completed_indices)
 
     @property
     def state(self) -> dict[str, Any]:
         with self._lock:
+            self._sync_completed_indices()
             return json.loads(json.dumps(self._state))
 
     def mark_completed(
@@ -62,14 +67,9 @@ class RealtimeCheckpoint:
         if frame_index < 0 or sensor_time_ns <= 0 or map_revision < 0:
             raise ValueError("checkpoint completion values are invalid")
         with self._lock:
-            completed = self.completed_indices
-            completed.add(frame_index)
+            self._record_completed(frame_index, sensor_time_ns)
             self._state.update(
                 {
-                    "completed_frame_indices": sorted(completed),
-                    "last_sensor_time_ns": max(
-                        sensor_time_ns, self._state.get("last_sensor_time_ns") or 0
-                    ),
                     "map_revision": map_revision,
                     "dynamic_layer": dict(dynamic_layer),
                     "submaps": dict(submaps),
@@ -80,6 +80,14 @@ class RealtimeCheckpoint:
             if path_buffer is not None:
                 self._state["path_buffer"] = dict(path_buffer)
             self._write_atomic()
+
+    def record_completed(self, frame_index: int, sensor_time_ns: int) -> None:
+        """Record completion in memory without forcing a checkpoint write."""
+
+        if frame_index < 0 or sensor_time_ns <= 0:
+            raise ValueError("checkpoint completion values are invalid")
+        with self._lock:
+            self._record_completed(frame_index, sensor_time_ns)
 
     def update_mapping_state(
         self,
@@ -112,7 +120,17 @@ class RealtimeCheckpoint:
             self._write_atomic()
 
     def _write_atomic(self) -> None:
+        self._sync_completed_indices()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(json.dumps(self._state, indent=2, allow_nan=False) + "\n")
         temporary.replace(self.path)
+
+    def _record_completed(self, frame_index: int, sensor_time_ns: int) -> None:
+        self._completed_indices.add(frame_index)
+        self._state["last_sensor_time_ns"] = max(
+            sensor_time_ns, self._state.get("last_sensor_time_ns") or 0
+        )
+
+    def _sync_completed_indices(self) -> None:
+        self._state["completed_frame_indices"] = sorted(self._completed_indices)
