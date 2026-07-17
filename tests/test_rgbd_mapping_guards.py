@@ -153,11 +153,33 @@ class RgbdMappingGuardTests(unittest.TestCase):
         self.assertEqual(captured["tr_solver"], "lsmr")
         self.assertEqual(captured["x_scale"], "jac")
         self.assertEqual(
-            captured["tr_options"], {"atol": 1.0e-10, "btol": 1.0e-10}
+            captured["tr_options"], {"atol": 1.0e-9, "btol": 1.0e-9}
         )
         self.assertEqual(report["status"], 2)
         self.assertEqual(report["optimality"], 0.0)
-        self.assertEqual(report["solver"]["lsmr_atol"], 1.0e-10)
+        self.assertEqual(report["solver"]["lsmr_atol"], 1.0e-9)
+        self.assertEqual(report["solver"]["max_nfev"], 10)
+        self.assertEqual(report["solver"]["variable_count"], 6)
+        self.assertEqual(report["solver"]["finite_difference_jacobian"], "2-point")
+        self.assertEqual(captured["ftol"], 1.0e-8)
+
+        captured.clear()
+        with mock.patch.object(
+            optimizer, "least_squares", side_effect=fake_least_squares
+        ):
+            _, planar_report = optimizer.optimize_planar_gravity(
+                poses,
+                [edge],
+                max_nfev=11,
+                initial_poses=poses,
+            )
+        self.assertEqual(captured["tr_solver"], "lsmr")
+        self.assertEqual(captured["x_scale"], "jac")
+        self.assertEqual(
+            captured["tr_options"], {"atol": 1.0e-9, "btol": 1.0e-9}
+        )
+        self.assertEqual(planar_report["solver"]["max_nfev"], 11)
+        self.assertEqual(planar_report["solver"]["variable_count"], 3)
 
     def test_one_click_dry_run_plans_full_chain_without_writes(self):
         with tempfile.TemporaryDirectory() as temporary:
