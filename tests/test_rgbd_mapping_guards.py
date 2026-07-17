@@ -9,6 +9,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -103,6 +105,60 @@ def create_rgbd_dataset(root: Path) -> tuple[Path, list[int]]:
 
 
 class RgbdMappingGuardTests(unittest.TestCase):
+    def test_gravity_pose_graph_uses_accurate_scaled_sparse_solver(self):
+        optimizer = load_script_module(
+            "optimize_rgbd_pose_graph_solver_test",
+            REPOSITORY_ROOT / "scripts/optimize_rgbd_pose_graph.py",
+        )
+        poses = np.repeat(np.eye(4, dtype=np.float64)[None], 2, axis=0)
+        poses[1, 0, 3] = 0.1
+        edge = optimizer.GraphEdge(
+            0,
+            1,
+            optimizer.relative_pose(poses, 0, 1),
+            0.04,
+            1.5,
+            "rgbd_odometry",
+        )
+        captured = {}
+
+        def fake_least_squares(residual, initial, **kwargs):
+            captured.update(kwargs)
+            values = residual(initial)
+            return SimpleNamespace(
+                success=True,
+                status=2,
+                message="ftol satisfied",
+                cost=float(np.dot(values, values) / 2.0),
+                nfev=1,
+                njev=1,
+                optimality=0.0,
+                x=initial,
+                fun=values,
+            )
+
+        with mock.patch.object(
+            optimizer, "least_squares", side_effect=fake_least_squares
+        ):
+            _, report = optimizer.optimize_gravity_se3(
+                poses,
+                [edge],
+                max_nfev=10,
+                z_sigma_m=0.04,
+                roll_pitch_sigma_deg=2.0,
+                initial_poses=poses,
+            )
+
+        self.assertEqual(captured["method"], "trf")
+        self.assertEqual(captured["tr_solver"], "lsmr")
+        self.assertEqual(captured["x_scale"], "jac")
+        self.assertEqual(
+            captured["tr_options"], {"atol": 1.0e-10, "btol": 1.0e-10}
+        )
+        self.assertEqual(report["status"], 2)
+        self.assertEqual(report["optimality"], 0.0)
+        self.assertEqual(report["solver"]["lsmr_atol"], 1.0e-10)
+
     def test_one_click_dry_run_plans_full_chain_without_writes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
