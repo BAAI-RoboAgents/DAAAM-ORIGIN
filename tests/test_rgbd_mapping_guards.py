@@ -297,7 +297,7 @@ class RgbdMappingGuardTests(unittest.TestCase):
                             "sensor_time_ns": timestamp,
                             "confidence_mode": "left-right",
                             "left_right_verified": True,
-                            "left_right_consistency": 1.0,
+                            "left_right_consistency": 0.75,
                         }
                     )
                 )
@@ -348,6 +348,117 @@ class RgbdMappingGuardTests(unittest.TestCase):
                 (output / "temporal_depth_filter_report.json").read_text()
             )
             self.assertEqual(report["depth_evidence"]["coverage"], 1.0)
+
+    def test_temporal_filter_accepts_separate_timestamp_aligned_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset, timestamps = create_rgbd_dataset(root)
+            evidence = root / "evidence"
+            evidence.mkdir()
+            for name in ("camera_info.json", "tick_index.json"):
+                (evidence / name).write_bytes((dataset / name).read_bytes())
+            for directory in (
+                "depth_confidence",
+                "depth_consistency",
+                "depth_occlusion",
+                "depth_metadata",
+            ):
+                (evidence / directory).mkdir()
+            for index, timestamp in enumerate(timestamps):
+                cv2.imwrite(
+                    str(evidence / "depth_confidence" / f"{index:08d}.png"),
+                    np.full((24, 32), 220, dtype=np.uint8),
+                )
+                cv2.imwrite(
+                    str(evidence / "depth_consistency" / f"{index:08d}.png"),
+                    np.full((24, 32), 255, dtype=np.uint8),
+                )
+                cv2.imwrite(
+                    str(evidence / "depth_occlusion" / f"{index:08d}.png"),
+                    np.zeros((24, 32), dtype=np.uint8),
+                )
+                (evidence / "depth_metadata" / f"{index:08d}.json").write_text(
+                    json.dumps(
+                        {
+                            "frame_idx": index,
+                            "sensor_time_ns": timestamp,
+                            "confidence_mode": "left-right",
+                            "left_right_verified": True,
+                            "left_right_consistency": 0.75,
+                        }
+                    )
+                )
+
+            output = root / "filtered-with-external-evidence"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPOSITORY_ROOT
+                        / "scripts/filter_temporal_depth_consistency.py"
+                    ),
+                    "--dataset",
+                    str(dataset),
+                    "--depth-evidence-dataset",
+                    str(evidence),
+                    "--output",
+                    str(output),
+                    "--neighbor-offsets",
+                    "1,2",
+                    "--filter-scale",
+                    "1",
+                    "--min-judged-neighbors",
+                    "1",
+                    "--min-support-ratio",
+                    "0.5",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            report = json.loads(
+                (output / "temporal_depth_filter_report.json").read_text()
+            )
+            self.assertEqual(report["depth_evidence"]["coverage"], 1.0)
+            self.assertEqual(
+                report["depth_evidence"]["source_dataset"], str(evidence.resolve())
+            )
+            metadata = json.loads(
+                (output / "depth_metadata" / "00000000.json").read_text()
+            )
+            self.assertTrue(metadata["left_right_verified"])
+            self.assertEqual(metadata["left_right_consistency"], 0.75)
+            self.assertEqual(
+                metadata["temporal_filter"]["output_consistent_valid_ratio"], 1.0
+            )
+
+            (evidence / "depth_confidence" / "00000004.png").unlink()
+            incomplete = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPOSITORY_ROOT
+                        / "scripts/filter_temporal_depth_consistency.py"
+                    ),
+                    "--dataset",
+                    str(dataset),
+                    "--depth-evidence-dataset",
+                    str(evidence),
+                    "--output",
+                    str(root / "incomplete-evidence-output"),
+                    "--neighbor-offsets",
+                    "1",
+                    "--filter-scale",
+                    "1",
+                    "--min-judged-neighbors",
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(incomplete.returncode, 0)
+            self.assertIn("Incomplete depth_confidence evidence", incomplete.stderr)
 
     def test_nonuniform_time_temporal_gate_uses_every_adjacent_pair(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -35,6 +35,14 @@ def parse_args() -> argparse.Namespace:
         description="Mask temporally contradicted depth while preserving every frame."
     )
     parser.add_argument("--dataset", required=True, type=Path)
+    parser.add_argument(
+        "--depth-evidence-dataset",
+        type=Path,
+        help=(
+            "Optional timestamp-aligned source for FoundationStereo confidence, "
+            "consistency, occlusion, and metadata artifacts."
+        ),
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
         "--neighbor-offsets",
@@ -69,7 +77,9 @@ def sorted_depths(directory: Path) -> list[Path]:
     return paths
 
 
-def prepare_output(source: Path, output: Path, overwrite: bool) -> None:
+def prepare_output(
+    source: Path, evidence_source: Path, output: Path, overwrite: bool
+) -> None:
     if output.exists() and any(output.iterdir()):
         if not overwrite:
             raise RuntimeError(f"Output exists: {output}. Pass --overwrite to replace it.")
@@ -83,7 +93,7 @@ def prepare_output(source: Path, output: Path, overwrite: bool) -> None:
             )
     (output / "depth").mkdir()
     for directory in DEPTH_EVIDENCE_DIRECTORIES:
-        if (source / directory).is_dir():
+        if (evidence_source / directory).is_dir():
             (output / directory).mkdir()
     (output / "pose").mkdir()
     shutil.copy2(source / "pose" / "poses.txt", output / "pose" / "poses.txt")
@@ -114,22 +124,72 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def validate_evidence_alignment(source: Path, evidence_source: Path) -> None:
+    """Require evidence to describe the exact same ordered capture frames."""
+
+    source_tick = json.loads((source / "tick_index.json").read_text())
+    evidence_tick = json.loads((evidence_source / "tick_index.json").read_text())
+
+    contract_keys = (
+        "idx",
+        "source_idx",
+        "source_frame_idx",
+        "cam0_source_idx",
+        "cam1_source_idx",
+        "pose_row",
+        "source_pose_row",
+        "sensor_time_ns",
+        "cam0_sensor_time_ns",
+        "cam1_sensor_time_ns",
+        "pose_sensor_time_ns",
+        "stereo_delta_ms",
+    )
+
+    def frame_contract(tick: dict) -> list[tuple[object, ...]]:
+        return [
+            tuple(frame.get(key) for key in contract_keys)
+            for frame in tick.get("frames", [])
+        ]
+
+    if frame_contract(source_tick) != frame_contract(evidence_tick):
+        raise ValueError(
+            "Depth evidence dataset does not match the ordered frame/timestamp contract"
+        )
+    source_camera = json.loads((source / "camera_info.json").read_text())
+    evidence_camera = json.loads((evidence_source / "camera_info.json").read_text())
+    for key in ("model", "width", "height"):
+        if source_camera[key] != evidence_camera[key]:
+            raise ValueError(f"Depth evidence camera {key} does not match the dataset")
+    for key in ("fx", "fy", "cx", "cy"):
+        if not np.isclose(
+            float(source_camera[key]),
+            float(evidence_camera[key]),
+            rtol=0.0,
+            atol=1.0e-9,
+        ):
+            raise ValueError(f"Depth evidence camera {key} does not match the dataset")
+    if source_tick.get("projection_model") != evidence_tick.get("projection_model"):
+        raise ValueError("Depth evidence projection model does not match the dataset")
+
+
 def propagate_depth_evidence(
-    source: Path,
+    evidence_source: Path,
     output: Path,
     *,
     frame_index: int,
     sensor_time_ns: int,
     frame_name: str,
     rejected_mask: np.ndarray,
+    output_valid_mask: np.ndarray,
     output_depth_path: Path,
     output_valid_ratio: float,
     rejected_valid_ratio: float,
 ) -> dict[str, object]:
     """Copy verifiable stereo evidence while applying the temporal reject mask."""
     propagated: list[str] = []
+    output_consistent_valid_ratio: float | None = None
     for directory in ("depth_confidence", "depth_consistency", "depth_occlusion"):
-        source_directory = source / directory
+        source_directory = evidence_source / directory
         if not source_directory.is_dir():
             continue
         source_path = source_directory / frame_name
@@ -142,13 +202,21 @@ def propagate_depth_evidence(
             raise ValueError(f"Invalid {directory} evidence: {source_path}")
         artifact = artifact.copy()
         if directory in {"depth_confidence", "depth_consistency"}:
-            artifact[rejected_mask] = 0
+            artifact[rejected_mask | ~output_valid_mask] = 0
+        if directory == "depth_consistency":
+            output_consistent_valid_ratio = min(
+                1.0,
+                float(
+                    np.count_nonzero(artifact.astype(np.float32) > 0.0)
+                    / max(1, int(np.count_nonzero(output_valid_mask)))
+                ),
+            )
         destination = output / directory / frame_name
         if not cv2.imwrite(str(destination), artifact):
             raise RuntimeError(f"Failed to write propagated evidence: {destination}")
         propagated.append(directory)
 
-    metadata_directory = source / "depth_metadata"
+    metadata_directory = evidence_source / "depth_metadata"
     left_right_verified = False
     if metadata_directory.is_dir():
         source_metadata_path = metadata_directory / f"{frame_index:08d}.json"
@@ -165,17 +233,28 @@ def propagate_depth_evidence(
             raise ValueError(
                 f"Depth metadata timestamp mismatch for frame {frame_index}"
             )
-        left_right_verified = bool(metadata.get("left_right_verified", False))
+        if int(metadata.get("frame_idx", -1)) != frame_index:
+            raise ValueError(f"Depth metadata index mismatch for frame {frame_index}")
+        left_right_verified = bool(
+            metadata.get("left_right_verified", False)
+            and metadata.get("confidence_mode") == "left-right"
+            and "depth_confidence" in propagated
+            and "depth_consistency" in propagated
+            and "depth_occlusion" in propagated
+        )
         metadata.update(
             {
                 "frame_idx": frame_index,
                 "sensor_time_ns": sensor_time_ns,
                 "valid_ratio": output_valid_ratio,
+                "left_right_verified": left_right_verified,
                 "temporal_filter": {
                     "method": "multi_neighbor_reprojection_consistency",
                     "rejected_valid_ratio": rejected_valid_ratio,
                     "source_metadata_sha256": sha256_file(source_metadata_path),
+                    "depth_evidence_dataset": str(evidence_source),
                     "output_depth_sha256": sha256_file(output_depth_path),
+                    "output_consistent_valid_ratio": output_consistent_valid_ratio,
                 },
             }
         )
@@ -265,12 +344,38 @@ def main() -> None:
         raise ValueError("--min-judged-neighbors must be positive")
 
     source = args.dataset.resolve()
+    evidence_source = (
+        args.depth_evidence_dataset.resolve()
+        if args.depth_evidence_dataset is not None
+        else source
+    )
+    if args.depth_evidence_dataset is not None:
+        for directory in DEPTH_EVIDENCE_DIRECTORIES:
+            if not (evidence_source / directory).is_dir():
+                raise FileNotFoundError(
+                    f"Explicit depth evidence dataset is missing {directory}: "
+                    f"{evidence_source / directory}"
+                )
     output = args.output.resolve()
     depths = sorted_depths(source / "depth")
     poses = load_poses(source / "pose" / "poses.txt")
     if len(depths) != len(poses):
         raise ValueError("Depth and pose counts must agree")
     metadata, frames = load_time_contract(source, len(poses))
+    validate_evidence_alignment(source, evidence_source)
+    if args.depth_evidence_dataset is not None:
+        for frame in frames:
+            frame_index = int(frame["idx"])
+            for directory in DEPTH_EVIDENCE_DIRECTORIES:
+                suffix = ".json" if directory == "depth_metadata" else ".png"
+                evidence_path = (
+                    evidence_source / directory / f"{frame_index:08d}{suffix}"
+                )
+                if not evidence_path.is_file():
+                    raise FileNotFoundError(
+                        f"Incomplete {directory} evidence for frame {frame_index}: "
+                        f"{evidence_path}"
+                    )
     camera = json.loads((source / "camera_info.json").read_text())
     width = max(1, int(round(float(camera["width"]) * args.filter_scale)))
     height = max(1, int(round(float(camera["height"]) * args.filter_scale)))
@@ -292,7 +397,7 @@ def main() -> None:
             )
         return depth_m
 
-    prepare_output(source, output, args.overwrite)
+    prepare_output(source, evidence_source, output, args.overwrite)
     input_valid_ratios = []
     output_valid_ratios = []
     rejected_ratios = []
@@ -359,12 +464,13 @@ def main() -> None:
         output_valid_ratios.append(float((filtered > 0).mean()))
         rejected_ratios.append(float(rejected / max(int(valid_before.sum()), 1)))
         evidence = propagate_depth_evidence(
-            source,
+            evidence_source,
             output,
             frame_index=int(frames[index]["idx"]),
             sensor_time_ns=int(frames[index]["sensor_time_ns"]),
             frame_name=depth_path.name,
             rejected_mask=reject_full,
+            output_valid_mask=filtered > 0,
             output_depth_path=output_depth_path,
             output_valid_ratio=output_valid_ratios[-1],
             rejected_valid_ratio=rejected_ratios[-1],
@@ -412,6 +518,7 @@ def main() -> None:
         "rgb_frames_preserved": True,
         "poses_preserved": True,
         "depth_evidence": {
+            "source_dataset": str(evidence_source),
             "propagated_directories": sorted(propagated_evidence_directories),
             "left_right_verified_frames": left_right_verified_frames,
             "coverage": left_right_verified_frames / max(1, len(depths)),

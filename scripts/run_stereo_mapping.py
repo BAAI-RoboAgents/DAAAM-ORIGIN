@@ -399,6 +399,69 @@ def trajectory_ready(dataset: Path, report_name: str) -> bool:
     return prepared_ready(dataset) and report_ready(dataset / report_name)
 
 
+def filtered_ready(
+    dataset: Path,
+    *,
+    require_left_right: bool,
+    evidence_source: Path | None = None,
+) -> bool:
+    report_path = dataset / "temporal_depth_filter_report.json"
+    if not trajectory_ready(dataset, report_path.name):
+        return False
+    if not require_left_right:
+        return True
+    try:
+        report = json.loads(report_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    evidence = report.get("depth_evidence", {})
+    required = {
+        "depth_confidence",
+        "depth_consistency",
+        "depth_metadata",
+        "depth_occlusion",
+    }
+    if (
+        float(evidence.get("coverage", 0.0)) != 1.0
+        or not required.issubset(evidence.get("propagated_directories", []))
+        or int(evidence.get("left_right_verified_frames", 0))
+        != load_frame_count(dataset)
+    ):
+        return False
+    if evidence_source is not None:
+        recorded_source = evidence.get("source_dataset")
+        if (
+            recorded_source is None
+            or Path(recorded_source).resolve() != evidence_source.resolve()
+        ):
+            return False
+    frame_count = load_frame_count(dataset)
+    if not all((dataset / directory).is_dir() for directory in required):
+        return False
+    if not all(
+        len(list((dataset / directory).iterdir())) == frame_count
+        for directory in required
+    ):
+        return False
+    frames = json.loads((dataset / "tick_index.json").read_text()).get("frames", [])
+    for frame in frames:
+        frame_index = int(frame["idx"])
+        metadata_path = dataset / "depth_metadata" / f"{frame_index:08d}.json"
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        if (
+            int(metadata.get("frame_idx", -1)) != frame_index
+            or int(metadata.get("sensor_time_ns", -1))
+            != int(frame["sensor_time_ns"])
+            or metadata.get("confidence_mode") != "left-right"
+            or not metadata.get("left_right_verified", False)
+        ):
+            return False
+    return True
+
+
 def map_ready(output: Path) -> bool:
     return any(output.glob("out_*/**/dsg_with_mesh.json")) and any(
         output.glob("out_*/**/mesh.ply")
@@ -898,6 +961,8 @@ def main() -> None:
         str(FILTER_TEMPORAL_DEPTH),
         "--dataset",
         str(optimized),
+        "--depth-evidence-dataset",
+        str(selected),
         "--output",
         str(final_dataset),
         "--neighbor-offsets",
@@ -916,7 +981,11 @@ def main() -> None:
     result = run_or_resume(
         "filter",
         command,
-        trajectory_ready(final_dataset, "temporal_depth_filter_report.json"),
+        filtered_ready(
+            final_dataset,
+            require_left_right=args.depth_confidence_mode == "left-right",
+            evidence_source=selected,
+        ),
         args,
     )
     manifest["final_dataset"] = str(final_dataset)
