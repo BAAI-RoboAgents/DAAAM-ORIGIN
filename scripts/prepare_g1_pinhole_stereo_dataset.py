@@ -2,6 +2,7 @@
 """Reproject synchronized G1 fisheye stereo into a pinhole RGB-D dataset."""
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -52,6 +53,16 @@ def parse_args():
         help=(
             "Storage order of head_camera orientation values. Auto selects "
             "the interpretation whose optical down axis best matches base -Z."
+        ),
+    )
+    parser.add_argument(
+        "--stereo-calibration-report",
+        type=Path,
+        help=(
+            "Reuse a validated pinhole_preparation_report.json from the same "
+            "unchanged stereo rig. Source intrinsics, distortion, baseline, "
+            "rotation, translation, and current-capture epipolar geometry are "
+            "validated before the report is accepted."
         ),
     )
     parser.add_argument("--recommended-max-depth-m", type=float, default=3.0)
@@ -114,6 +125,191 @@ def image_path(src: Path, record, camera: str) -> Path:
     return path.resolve() if path.is_absolute() else (src / path).resolve()
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_fixed_stereo_calibration(
+    report_path: Path,
+    K: np.ndarray,
+    distortion: np.ndarray,
+    baseline: float,
+):
+    report_path = report_path.resolve()
+    try:
+        report = json.loads(report_path.read_text())
+        calibration = report["estimated_stereo_calibration"]
+        report_K = np.asarray(report["source_intrinsics"], dtype=np.float64)
+        report_distortion = np.asarray(
+            report["source_distortion"], dtype=np.float64
+        ).reshape(-1)
+        camera0_R_camera1 = np.asarray(
+            calibration["camera0_R_camera1"], dtype=np.float64
+        )
+        camera0_t_camera1 = np.asarray(
+            calibration["camera0_t_camera1_m"], dtype=np.float64
+        ).reshape(-1)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Invalid fixed stereo calibration report: {report_path}"
+        ) from error
+
+    if report_K.shape != (3, 3) or not np.allclose(
+        report_K, K, rtol=0.0, atol=1.0e-9
+    ):
+        raise ValueError("Fixed stereo calibration source intrinsics do not match")
+    current_distortion = np.asarray(distortion, dtype=np.float64).reshape(-1)
+    if report_distortion.shape != current_distortion.shape or not np.allclose(
+        report_distortion, current_distortion, rtol=0.0, atol=1.0e-12
+    ):
+        raise ValueError("Fixed stereo calibration source distortion does not match")
+    if camera0_R_camera1.shape != (3, 3) or not np.all(
+        np.isfinite(camera0_R_camera1)
+    ):
+        raise ValueError("Fixed stereo calibration rotation must be a finite 3x3 matrix")
+    if camera0_t_camera1.shape != (3,) or not np.all(
+        np.isfinite(camera0_t_camera1)
+    ):
+        raise ValueError("Fixed stereo calibration translation must be a finite 3-vector")
+
+    orthogonality_error = float(
+        np.linalg.norm(camera0_R_camera1.T @ camera0_R_camera1 - np.eye(3))
+    )
+    determinant = float(np.linalg.det(camera0_R_camera1))
+    if orthogonality_error > 1.0e-6 or abs(determinant - 1.0) > 1.0e-6:
+        raise ValueError(
+            "Fixed stereo calibration rotation is not in SO(3): "
+            f"orthogonality_error={orthogonality_error:.3g}, det={determinant:.9g}"
+        )
+
+    translation_norm = float(np.linalg.norm(camera0_t_camera1))
+    baseline_tolerance = max(1.0e-6, baseline * 1.0e-4)
+    if abs(translation_norm - baseline) > baseline_tolerance:
+        raise ValueError(
+            "Fixed stereo calibration baseline does not match the source rig: "
+            f"report={translation_norm:.9g}m, source={baseline:.9g}m"
+        )
+    baseline_direction = camera0_t_camera1 / translation_norm
+    if abs(float(baseline_direction[0])) < 0.9:
+        raise ValueError(
+            "Fixed stereo calibration baseline is not predominantly horizontal: "
+            f"direction={baseline_direction.tolist()}"
+        )
+
+    evidence = {
+        "mode": "fixed_report",
+        "report_path": str(report_path),
+        "report_sha256": sha256_file(report_path),
+        "source_geometry_validation": {
+            "intrinsics_match": True,
+            "distortion_match": True,
+            "source_baseline_m": baseline,
+            "report_translation_norm_m": translation_norm,
+            "baseline_tolerance_m": baseline_tolerance,
+            "rotation_orthogonality_error": orthogonality_error,
+            "rotation_determinant": determinant,
+            "baseline_direction": baseline_direction.tolist(),
+        },
+        "camera0_R_camera1": camera0_R_camera1.tolist(),
+        "camera0_t_camera1_m": camera0_t_camera1.tolist(),
+        "camera0_R_camera1_euler_xyz_deg": Rotation.from_matrix(
+            camera0_R_camera1
+        ).as_euler("xyz", degrees=True).tolist(),
+        "baseline_direction": baseline_direction.tolist(),
+    }
+    return camera0_R_camera1, camera0_t_camera1, evidence
+
+
+def normalized_sampson_residuals(
+    camera0_R_camera1: np.ndarray,
+    camera0_t_camera1: np.ndarray,
+    normalized_left: np.ndarray,
+    normalized_right: np.ndarray,
+) -> np.ndarray:
+    translation = camera0_t_camera1 / np.linalg.norm(camera0_t_camera1)
+    tx = np.array(
+        [
+            [0.0, -translation[2], translation[1]],
+            [translation[2], 0.0, -translation[0]],
+            [-translation[1], translation[0], 0.0],
+        ]
+    )
+    essential = tx @ camera0_R_camera1
+    left_h = np.column_stack((normalized_left, np.ones(len(normalized_left))))
+    right_h = np.column_stack((normalized_right, np.ones(len(normalized_right))))
+    essential_left = (essential @ left_h.T).T
+    essential_t_right = (essential.T @ right_h.T).T
+    numerator = np.sum(right_h * essential_left, axis=1) ** 2
+    denominator = (
+        essential_left[:, 0] ** 2
+        + essential_left[:, 1] ** 2
+        + essential_t_right[:, 0] ** 2
+        + essential_t_right[:, 1] ** 2
+    )
+    return np.sqrt(numerator / np.maximum(denominator, 1.0e-15))
+
+
+def recover_stereo_pose(
+    normalized_left: np.ndarray,
+    normalized_right: np.ndarray,
+    baseline: float,
+):
+    essential, inlier_mask = cv2.findEssentialMat(
+        normalized_left,
+        normalized_right,
+        np.eye(3),
+        method=cv2.RANSAC,
+        prob=0.999,
+        threshold=0.005,
+        maxIters=10000,
+    )
+    if essential is None or inlier_mask is None:
+        raise RuntimeError("Essential-matrix estimation failed")
+    if essential.shape[0] > 3:
+        essential = essential[:3]
+    # recoverPose updates its mask argument in place to retain only points with
+    # positive depth. Preserve the actual RANSAC count before that call.
+    ransac_inliers = int(np.count_nonzero(inlier_mask))
+    ransac_ratio = ransac_inliers / len(normalized_left)
+    pose_inliers, camera0_R_camera1, translation, _ = cv2.recoverPose(
+        essential,
+        normalized_left,
+        normalized_right,
+        np.eye(3),
+        mask=inlier_mask.copy(),
+    )
+    translation = translation.reshape(3)
+    translation /= np.linalg.norm(translation)
+    camera0_t_camera1 = translation * baseline
+    if ransac_ratio < 0.5 or pose_inliers < 1000:
+        raise RuntimeError(
+            "Stereo calibration is underconstrained: "
+            f"RANSAC={ransac_ratio:.3f}, pose_inliers={pose_inliers}"
+        )
+    if abs(translation[0]) < 0.9:
+        raise RuntimeError(
+            "Estimated stereo baseline is not predominantly horizontal: "
+            f"direction={translation.tolist()}"
+        )
+    return camera0_R_camera1, camera0_t_camera1, {
+        "mode": "estimated_from_current_capture",
+        "feature_matches": len(normalized_left),
+        "ransac_inliers": ransac_inliers,
+        "ransac_inlier_ratio": ransac_ratio,
+        "pose_inliers": int(pose_inliers),
+        "camera0_R_camera1": camera0_R_camera1.tolist(),
+        "camera0_t_camera1_m": camera0_t_camera1.tolist(),
+        "camera0_R_camera1_euler_xyz_deg": Rotation.from_matrix(
+            camera0_R_camera1
+        ).as_euler("xyz", degrees=True).tolist(),
+        "baseline_direction": translation.tolist(),
+    }
+
+
 def estimate_stereo_extrinsics(
     src: Path,
     records,
@@ -121,6 +317,7 @@ def estimate_stereo_extrinsics(
     K: np.ndarray,
     distortion: np.ndarray,
     baseline: float,
+    calibration_report: Path | None = None,
     sample_count: int = 24,
 ):
     """Estimate the omitted fisheye stereo rotation and baseline direction."""
@@ -193,54 +390,50 @@ def estimate_stereo_extrinsics(
             f"Too few finite stereo matches: {len(normalized_left)}"
         )
 
-    essential, inlier_mask = cv2.findEssentialMat(
-        normalized_left,
-        normalized_right,
-        np.eye(3),
-        method=cv2.RANSAC,
-        prob=0.999,
-        threshold=0.005,
-        maxIters=10000,
-    )
-    if essential is None:
-        raise RuntimeError("Essential-matrix estimation failed")
-    if essential.shape[0] > 3:
-        essential = essential[:3]
-    pose_inliers, camera0_R_camera1, translation, pose_mask = cv2.recoverPose(
-        essential,
-        normalized_left,
-        normalized_right,
-        np.eye(3),
-        mask=inlier_mask,
-    )
-    translation = translation.reshape(3)
-    translation /= np.linalg.norm(translation)
-    camera0_t_camera1 = translation * baseline
-    ransac_inliers = int(np.count_nonzero(inlier_mask))
-    ransac_ratio = ransac_inliers / len(normalized_left)
-    if ransac_ratio < 0.5 or pose_inliers < 1000:
-        raise RuntimeError(
-            "Stereo calibration is underconstrained: "
-            f"RANSAC={ransac_ratio:.3f}, pose_inliers={pose_inliers}"
+    if calibration_report is not None:
+        camera0_R_camera1, camera0_t_camera1, evidence = (
+            load_fixed_stereo_calibration(
+                calibration_report, K, distortion, baseline
+            )
         )
-    if abs(translation[0]) < 0.9:
-        raise RuntimeError(
-            "Estimated stereo baseline is not predominantly horizontal: "
-            f"direction={translation.tolist()}"
+        residuals = normalized_sampson_residuals(
+            camera0_R_camera1,
+            camera0_t_camera1,
+            normalized_left,
+            normalized_right,
         )
-    return camera0_R_camera1, camera0_t_camera1, {
-        "sampled_pairs": len(sample_indices),
-        "feature_matches": len(normalized_left),
-        "ransac_inliers": ransac_inliers,
-        "ransac_inlier_ratio": ransac_ratio,
-        "pose_inliers": int(pose_inliers),
-        "camera0_R_camera1": camera0_R_camera1.tolist(),
-        "camera0_t_camera1_m": camera0_t_camera1.tolist(),
-        "camera0_R_camera1_euler_xyz_deg": Rotation.from_matrix(
-            camera0_R_camera1
-        ).as_euler("xyz", degrees=True).tolist(),
-        "baseline_direction": translation.tolist(),
-    }
+        epipolar_threshold = 0.005
+        inlier_ratio = float(np.mean(residuals < epipolar_threshold))
+        median_residual = float(np.median(residuals))
+        p95_residual = float(np.percentile(residuals, 95.0))
+        evidence["current_capture_epipolar_validation"] = {
+            "sampled_pairs": len(sample_indices),
+            "feature_matches": len(normalized_left),
+            "normalized_sampson_threshold": epipolar_threshold,
+            "inlier_ratio": inlier_ratio,
+            "median_residual": median_residual,
+            "p95_residual": p95_residual,
+            "required_inlier_ratio": 0.70,
+            "maximum_median_residual": 0.0025,
+            "maximum_p95_residual": 0.04,
+        }
+        if (
+            inlier_ratio < 0.70
+            or median_residual > 0.0025
+            or p95_residual > 0.04
+        ):
+            raise RuntimeError(
+                "Fixed stereo calibration fails current-capture epipolar validation: "
+                f"inlier_ratio={inlier_ratio:.3f}, median={median_residual:.6f}, "
+                f"p95={p95_residual:.6f}"
+            )
+        return camera0_R_camera1, camera0_t_camera1, evidence
+
+    camera0_R_camera1, camera0_t_camera1, evidence = recover_stereo_pose(
+        normalized_left, normalized_right, baseline
+    )
+    evidence["sampled_pairs"] = len(sample_indices)
+    return camera0_R_camera1, camera0_t_camera1, evidence
 
 
 def camera_quaternion_level_error(aux_records, order: str) -> float:
@@ -405,7 +598,13 @@ def main():
     )
     camera0_R_camera1, camera0_t_camera1, stereo_calibration = (
         estimate_stereo_extrinsics(
-            src, records, matches, K, distortion, baseline
+            src,
+            records,
+            matches,
+            K,
+            distortion,
+            baseline,
+            args.stereo_calibration_report,
         )
     )
     aux_records = load_jsonl(

@@ -83,6 +83,14 @@ def parse_args() -> argparse.Namespace:
     g1.add_argument(
         "--camera-quaternion-order", choices=("auto", "xyzw", "wxyz"), default="auto"
     )
+    g1.add_argument(
+        "--stereo-calibration-report",
+        type=Path,
+        help=(
+            "Validated pinhole preparation report from the same unchanged G1 "
+            "stereo rig; passed through to the preparation stage."
+        ),
+    )
     g1.add_argument("--recommended-max-depth-m", type=float, default=3.0)
 
     selection = parser.add_argument_group("Content-safe keyframe selection")
@@ -521,6 +529,19 @@ def main() -> None:
             "pose_match": "cam0_sensor_time_ns == pose_sensor_time_ns",
             "filtered_frames_retimestamped": False,
         },
+        "g1_preparation": {
+            "stereo_calibration_report": (
+                str(args.stereo_calibration_report.resolve())
+                if args.stereo_calibration_report is not None
+                else None
+            ),
+            "stereo_calibration_report_sha256": (
+                sha256(args.stereo_calibration_report.resolve())
+                if args.stereo_calibration_report is not None
+                and args.stereo_calibration_report.resolve().is_file()
+                else None
+            ),
+        },
     }
 
     def finish(stage: str) -> bool:
@@ -566,6 +587,13 @@ def main() -> None:
         ]
         if args.overwrite:
             command.append("--overwrite")
+        if args.stereo_calibration_report is not None:
+            command.extend(
+                [
+                    "--stereo-calibration-report",
+                    str(args.stereo_calibration_report.resolve()),
+                ]
+            )
         result = run_or_resume(
             "prepare", command, prepared_ready(prepared), args
         )
