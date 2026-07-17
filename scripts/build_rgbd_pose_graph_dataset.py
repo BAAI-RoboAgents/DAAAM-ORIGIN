@@ -28,7 +28,9 @@ def create_intrinsic(
             float(camera[key]) for key in ("fx", "fy", "cx", "cy")
         )
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("Camera metadata must contain pinhole width/height/fx/fy/cx/cy") from error
+        raise ValueError(
+            "Camera metadata must contain pinhole width/height/fx/fy/cx/cy"
+        ) from error
     if source_width <= 0 or source_height <= 0 or fx <= 0.0 or fy <= 0.0:
         raise ValueError("Camera dimensions and focal lengths must be positive")
 
@@ -103,8 +105,21 @@ class DenseCloudCache:
             )
             if len(cloud.points) == 0:
                 raise RuntimeError(f"Dense RGB-D cloud is empty for frame {frame}")
-            self.clouds[frame] = cloud
+            self.clouds[frame] = prepare_dense_cloud(cloud)
         return self.clouds[frame]
+
+
+def prepare_dense_cloud(
+    cloud: o3d.geometry.PointCloud,
+) -> o3d.geometry.PointCloud:
+    """Match the fixed 2 cm cloud contract used by dense loop thresholds."""
+    cloud = cloud.voxel_down_sample(0.02)
+    if len(cloud.points) == 0:
+        raise RuntimeError("Dense RGB-D cloud is empty after 2 cm voxel sampling")
+    cloud.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=0.08, max_nn=30)
+    )
+    return cloud
 
 
 def multiscale_icp(
@@ -120,12 +135,12 @@ def multiscale_icp(
         raise ValueError("Initial ICP transform must be a finite 4x4 matrix")
 
     levels = (
-        (0.12, 0.18, 60),
-        (0.06, 0.09, 40),
-        (0.03, 0.05, 30),
+        (0.08, 0.30),
+        (0.04, 0.16),
+        (0.02, 0.08),
     )
     metrics: list[tuple[float, float]] = []
-    for voxel_size, correspondence_distance, iterations in levels:
+    for voxel_size, correspondence_distance in levels:
         source_level = source.voxel_down_sample(voxel_size)
         target_level = target.voxel_down_sample(voxel_size)
         if len(source_level.points) < 3 or len(target_level.points) < 3:
@@ -133,7 +148,7 @@ def multiscale_icp(
                 f"Too few points for {voxel_size:.3f}m ICP level"
             )
         normal_search = o3d.geometry.KDTreeSearchParamHybrid(
-            radius=voxel_size * 2.5, max_nn=40
+            radius=voxel_size * 3.0, max_nn=30
         )
         source_level.estimate_normals(normal_search)
         target_level.estimate_normals(normal_search)
@@ -144,10 +159,9 @@ def multiscale_icp(
             transform,
             o3d.pipelines.registration.TransformationEstimationPointToPlane(),
             o3d.pipelines.registration.ICPConvergenceCriteria(
-                max_iteration=iterations
+                max_iteration=50
             ),
         )
         transform = result.transformation
         metrics.append((float(result.fitness), float(result.inlier_rmse)))
     return transform, metrics
-

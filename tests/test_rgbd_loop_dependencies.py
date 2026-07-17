@@ -7,6 +7,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -32,6 +34,86 @@ geometry = load_script_module(
 
 
 class RgbdLoopDependencyTests(unittest.TestCase):
+    def test_dense_cloud_and_icp_parameters_match_the_fixed_contract(self):
+        class FakeCloud:
+            def __init__(self, name, calls):
+                self.name = name
+                self.calls = calls
+                self.points = [0, 1, 2]
+
+            def voxel_down_sample(self, voxel_size):
+                self.calls.append((self.name, "voxel", voxel_size))
+                return FakeCloud(f"{self.name}@{voxel_size}", self.calls)
+
+            def estimate_normals(self, search):
+                self.calls.append(
+                    (self.name, "normals", search.radius, search.max_nn)
+                )
+
+        calls = []
+        prepared = geometry.prepare_dense_cloud(FakeCloud("dense", calls))
+        self.assertEqual(
+            calls,
+            [
+                ("dense", "voxel", 0.02),
+                ("dense@0.02", "normals", 0.08, 30),
+            ],
+        )
+        self.assertEqual(prepared.name, "dense@0.02")
+
+        calls.clear()
+        icp_calls = []
+
+        def fake_icp(source, target, threshold, transform, _estimation, criteria):
+            icp_calls.append(
+                {
+                    "source": source.name,
+                    "target": target.name,
+                    "threshold": threshold,
+                    "transform_x": float(transform[0, 3]),
+                    "iterations": criteria.max_iteration,
+                }
+            )
+            next_transform = transform.copy()
+            next_transform[0, 3] += 1.0
+            return SimpleNamespace(
+                transformation=next_transform,
+                fitness=0.9,
+                inlier_rmse=0.01,
+            )
+
+        with mock.patch.object(
+            geometry.o3d.pipelines.registration,
+            "registration_icp",
+            side_effect=fake_icp,
+        ):
+            transform, metrics = geometry.multiscale_icp(
+                FakeCloud("source", calls),
+                FakeCloud("target", calls),
+                np.eye(4),
+            )
+
+        self.assertEqual(
+            [entry[2] for entry in calls if entry[1] == "voxel"],
+            [0.08, 0.08, 0.04, 0.04, 0.02, 0.02],
+        )
+        normals = [entry for entry in calls if entry[1] == "normals"]
+        self.assertEqual(
+            [(entry[2], entry[3]) for entry in normals],
+            [(0.24, 30), (0.24, 30), (0.12, 30), (0.12, 30), (0.06, 30), (0.06, 30)],
+        )
+        self.assertEqual(
+            [entry["threshold"] for entry in icp_calls], [0.30, 0.16, 0.08]
+        )
+        self.assertEqual(
+            [entry["transform_x"] for entry in icp_calls], [0.0, 1.0, 2.0]
+        )
+        self.assertEqual(
+            [entry["iterations"] for entry in icp_calls], [50, 50, 50]
+        )
+        self.assertAlmostEqual(float(transform[0, 3]), 3.0)
+        self.assertEqual(metrics, [(0.9, 0.01)] * 3)
+
     def test_scaled_intrinsic_and_dense_cloud_contract(self):
         camera = {
             "width": 64,
@@ -67,6 +149,7 @@ class RgbdLoopDependencyTests(unittest.TestCase):
             )
             cloud = cache.cloud(0)
             self.assertGreater(len(cloud.points), 700)
+            self.assertTrue(cloud.has_normals())
             self.assertIs(cache.cloud(0), cloud)
 
             transform, metrics = geometry.multiscale_icp(
