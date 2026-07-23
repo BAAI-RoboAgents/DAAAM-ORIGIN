@@ -27,7 +27,17 @@ from daaam.memory import (
 from daaam.pipeline.models import PromptRecord
 from daaam.realtime.contracts import RealtimeEnvelope, SemanticCorrection
 from daaam.realtime.gpu import SharedGpuCoordinator
+from daaam.realtime.masked_geometry import backproject_masked_depth
+from daaam.realtime.semantic_labels import (
+    SEMANTIC_LABEL_DIRECTORY,
+    persist_semantic_label,
+)
 from daaam.tracking.models import Track
+
+
+DEFAULT_LABEL_RUN_CONFIGURATION_SHA256 = hashlib.sha256(
+    b"daaam.realtime.semantic.default-label-run"
+).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -36,13 +46,19 @@ class RealtimeSemanticConfig:
     minimum_observations: int = 5
     prompt_queue_capacity: int = 20
     correction_queue_capacity: int = 50
+    grounding_startup_timeout_s: float = 120.0
     label_cache_frames: int = 32
     propagation_max_frames: int = 2
     propagation_track_capacity: int = 256
     grounding_enabled: bool = True
     automatic_confidence: float = 0.5
+    object_binding_maximum_center_distance_m: float = 0.75
+    object_binding_maximum_aabb_gap_m: float = 0.15
     gpu_lock_path: Path | str | None = None
     gpu_activity_path: Path | str | None = None
+    label_run_configuration_sha256: str = (
+        DEFAULT_LABEL_RUN_CONFIGURATION_SHA256
+    )
 
     def __post_init__(self) -> None:
         if self.segmentation_rate_hz <= 0.0:
@@ -51,6 +67,8 @@ class RealtimeSemanticConfig:
             raise ValueError("minimum semantic observations must be positive")
         if min(self.prompt_queue_capacity, self.correction_queue_capacity) <= 0:
             raise ValueError("semantic queue capacities must be positive")
+        if self.grounding_startup_timeout_s <= 0.0:
+            raise ValueError("grounding startup timeout must be positive")
         if self.label_cache_frames <= 0:
             raise ValueError("label cache size must be positive")
         if self.propagation_max_frames < 0:
@@ -59,6 +77,17 @@ class RealtimeSemanticConfig:
             raise ValueError("propagation track capacity must be positive")
         if not 0.0 <= self.automatic_confidence <= 1.0:
             raise ValueError("automatic semantic confidence must be in [0, 1]")
+        if self.object_binding_maximum_center_distance_m <= 0.0:
+            raise ValueError("object binding center distance must be positive")
+        if self.object_binding_maximum_aabb_gap_m < 0.0:
+            raise ValueError("object binding AABB gap must be non-negative")
+        digest = self.label_run_configuration_sha256
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise ValueError(
+                "semantic label run configuration must be a lowercase SHA-256 digest"
+            )
 
 
 @dataclass
@@ -74,6 +103,20 @@ class _TrackMaskState:
     propagation_steps: int
     confidence: float
     entity_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _PendingPromptCandidate:
+    """Best retained DAM observation for one stable MapMemory entity."""
+
+    entity_id: str
+    semantic_id: int
+    track: Track
+    frame: np.ndarray
+    frame_id: int
+    sensor_time_ns: int
+    map_revision: int
+    quality: tuple[int, int, int]
 
 
 class HydraDsgSemanticSink:
@@ -92,6 +135,7 @@ class HydraDsgSemanticSink:
         self._effective_label_by_entity: dict[str, str] = {}
         self._pending: dict[str, DeliveredSemanticCorrection] = {}
         self._applied: set[str] = set()
+        self._rejected: dict[str, dict[str, Any]] = {}
         self._applied_entities: set[str] = set()
         self._errors: list[str] = []
         self._attached_path: Optional[Path] = None
@@ -101,6 +145,7 @@ class HydraDsgSemanticSink:
         self._verified_artifacts: list[str] = []
         self._verified_entities = 0
         self._verified_operations = 0
+        self._verified_rejected_operations = 0
         self._source_mesh_counts: Optional[tuple[int, int]] = None
         self._lock = threading.RLock()
 
@@ -193,6 +238,18 @@ class HydraDsgSemanticSink:
                 continue
             if stored_entity != entity_id:
                 continue
+            try:
+                object_mesh = node.attributes.mesh()
+                has_object_mesh = bool(
+                    object_mesh is not None and object_mesh.num_vertices() > 0
+                )
+            except (AttributeError, RuntimeError, TypeError):
+                has_object_mesh = False
+            if (
+                not has_object_mesh
+                or metadata.get("mesh_binding_status") != "matched_real_mesh"
+            ):
+                continue
             if requires_parent and not node.has_parent():
                 continue
             return True
@@ -276,6 +333,7 @@ class HydraDsgSemanticSink:
         *,
         verified_entity_ids: Optional[set[str]] = None,
         verified_operation_count: Optional[int] = None,
+        verified_rejected_operation_count: Optional[int] = None,
     ) -> tuple[Any, ...]:
         if self._attached_path is None:
             graph = getattr(self.service, "scene_graph", None)
@@ -291,6 +349,7 @@ class HydraDsgSemanticSink:
         self._verified_artifacts = []
         self._verified_entities = 0
         self._verified_operations = 0
+        self._verified_rejected_operations = 0
         try:
             if manifest_path.is_file():
                 stale_manifest = manifest_path.with_name(
@@ -445,6 +504,11 @@ class HydraDsgSemanticSink:
                 if verified_operation_count is None
                 else int(verified_operation_count)
             )
+            rejected_operation_count = (
+                len(self._rejected)
+                if verified_rejected_operation_count is None
+                else int(verified_rejected_operation_count)
+            )
             manifest = {
                 "schema": "daaam.semantic_dsg_commit.v1",
                 "committed_ns": time.time_ns(),
@@ -452,6 +516,7 @@ class HydraDsgSemanticSink:
                 "object_count": len(next(iter(final_signatures))),
                 "verified_entity_count": len(verified_entities),
                 "verified_operation_count": operation_count,
+                "verified_rejected_operation_count": rejected_operation_count,
             }
             manifest_temporary = manifest_path.with_name(
                 f".{manifest_path.stem}.{token}.tmp{manifest_path.suffix}"
@@ -471,6 +536,7 @@ class HydraDsgSemanticSink:
             ]
             self._verified_entities = len(verified_entities)
             self._verified_operations = operation_count
+            self._verified_rejected_operations = rejected_operation_count
             return reloaded
         finally:
             for temporary in temporary_paths:
@@ -495,8 +561,30 @@ class HydraDsgSemanticSink:
             )
 
         staged: list[tuple[str, int, str, list[str]]] = []
+        rejected: list[tuple[str, int, list[str], dict[str, Any]]] = []
+        # Reserve every registered Hydra semantic ID, including entities that do
+        # not currently have a pending correction. Processing order must never
+        # let a spatial fallback steal their real mesh.
+        semantic_id_owners = dict(self._semantic_id_to_entity)
         try:
-            for entity_id, entity_updates in updates_by_entity.items():
+            def binding_priority(item: tuple[str, list]) -> tuple[int, str]:
+                candidate_entity_id = item[0]
+                candidate_snapshot = self._entity_snapshot_locked(candidate_entity_id)
+                history = (
+                    {}
+                    if candidate_snapshot is None
+                    else dict(candidate_snapshot.get("temporal_history") or {})
+                )
+                return (
+                    -int(history.get("observation_count") or 0),
+                    candidate_entity_id,
+                )
+
+            # Observation count remains a deterministic scheduling preference;
+            # semantic_id_owners enforces identity independently of this order.
+            for entity_id, entity_updates in sorted(
+                updates_by_entity.items(), key=binding_priority
+            ):
                 semantic_id = self._entity_to_semantic_id.get(entity_id)
                 if semantic_id is None:
                     continue
@@ -517,6 +605,19 @@ class HydraDsgSemanticSink:
                 snapshot = self._entity_snapshot_locked(entity_id)
                 ensure_node = getattr(self.service, "ensure_object_node", None)
                 if snapshot is None or not callable(ensure_node):
+                    rejected.append(
+                        (
+                            entity_id,
+                            semantic_id,
+                            operation_ids,
+                            {
+                                "status": "rejected_missing_entity_snapshot",
+                                "entity_id": entity_id,
+                                "semantic_id": semantic_id,
+                                "operation_ids": operation_ids,
+                            },
+                        )
+                    )
                     continue
                 try:
                     ensured = bool(
@@ -526,14 +627,49 @@ class HydraDsgSemanticSink:
                             position_m=snapshot.get("position_m"),
                             dimensions_m=snapshot.get("dimensions_m"),
                             sensor_time_ns=representative.correction.sensor_time_ns,
+                            temporal_history=snapshot.get("temporal_history"),
+                            time_origin_ns=snapshot.get("time_origin_ns"),
+                            allow_unmeshed_fallback=False,
+                            semantic_id_owners=semantic_id_owners,
                         )
                     )
                 except (RuntimeError, ValueError) as error:
                     rendered = repr(error)
                     if not self._errors or self._errors[-1] != rendered:
                         self._errors.append(rendered)
+                    rejected.append(
+                        (
+                            entity_id,
+                            semantic_id,
+                            operation_ids,
+                            {
+                                "status": "rejected_binding_error",
+                                "entity_id": entity_id,
+                                "semantic_id": semantic_id,
+                                "operation_ids": operation_ids,
+                                "error": rendered,
+                            },
+                        )
+                    )
                     continue
                 if not ensured:
+                    binding_events = list(
+                        getattr(self.service, "object_binding_audit", [])[-5:]
+                    )
+                    rejected.append(
+                        (
+                            entity_id,
+                            semantic_id,
+                            operation_ids,
+                            {
+                                "status": "rejected_no_mesh",
+                                "entity_id": entity_id,
+                                "semantic_id": semantic_id,
+                                "operation_ids": operation_ids,
+                                "binding_events": binding_events,
+                            },
+                        )
+                    )
                     continue
 
                 add_correction = getattr(self.service, "add_correction", None)
@@ -578,6 +714,10 @@ class HydraDsgSemanticSink:
                 verified_operation_count=len(
                     self._applied | verified_operation_ids
                 ),
+                verified_rejected_operation_count=(
+                    len(self._rejected)
+                    + sum(len(operation_ids) for _, _, operation_ids, _ in rejected)
+                ),
             )
             for entity_id, semantic_id, effective_label, operation_ids in staged:
                 if not verification_graphs or not all(
@@ -593,6 +733,10 @@ class HydraDsgSemanticSink:
                 self._applied.update(operation_ids)
                 self._applied_entities.add(entity_id)
                 for operation_id in operation_ids:
+                    self._pending.pop(operation_id, None)
+            for _, _, operation_ids, audit in rejected:
+                for operation_id in operation_ids:
+                    self._rejected[operation_id] = dict(audit)
                     self._pending.pop(operation_id, None)
         except Exception as error:  # pragma: no cover - depends on Spark I/O
             rendered = repr(error)
@@ -626,6 +770,7 @@ class HydraDsgSemanticSink:
                 self._persist_and_reload_locked(
                     verified_entity_ids=set(self._applied_entities),
                     verified_operation_count=len(self._applied),
+                    verified_rejected_operation_count=len(self._rejected),
                 )
         return self.stats()
 
@@ -639,6 +784,7 @@ class HydraDsgSemanticSink:
                 self._persist_and_reload_locked(
                     verified_entity_ids=set(self._applied_entities),
                     verified_operation_count=len(self._applied),
+                    verified_rejected_operation_count=len(self._rejected),
                 )
 
     def stats(self) -> dict[str, Any]:
@@ -649,13 +795,27 @@ class HydraDsgSemanticSink:
                 for update in self._pending.values()
             )
             durable_applied = len(self._applied) if commit_valid else 0
+            durable_rejected = len(self._rejected) if commit_valid else 0
+            durable_rejected_no_mesh = (
+                sum(
+                    audit.get("status") == "rejected_no_mesh"
+                    for audit in self._rejected.values()
+                )
+                if commit_valid
+                else 0
+            )
             durable_pending = len(self._pending) + (
-                0 if commit_valid else len(self._applied)
+                0 if commit_valid else len(self._applied) + len(self._rejected)
             )
             return {
                 "mapped_entities": len(self._entity_to_semantic_id),
                 "applied": durable_applied,
                 "pending": durable_pending,
+                "rejected": durable_rejected,
+                "rejected_no_mesh": durable_rejected_no_mesh,
+                "rejection_audit": (
+                    list(self._rejected.values()) if commit_valid else []
+                ),
                 "unmapped": int(unmapped),
                 "graph_attached": commit_valid,
                 "commit_valid": commit_valid,
@@ -673,6 +833,9 @@ class HydraDsgSemanticSink:
                 ),
                 "verified_operations": (
                     self._verified_operations if commit_valid else 0
+                ),
+                "verified_rejected_operations": (
+                    self._verified_rejected_operations if commit_valid else 0
                 ),
                 "errors": list(self._errors),
             }
@@ -712,13 +875,24 @@ class RealtimeSemanticAdapter:
 
             grounding_service = GroundingService(pipeline_config.workers)
         if dsg_sink is None:
-            from daaam.scene_graph.services import SceneGraphService
+            from daaam.scene_graph.services import (
+                ObjectBindingPolicy,
+                SceneGraphService,
+            )
 
             scene_service = SceneGraphService(
                 Path(pipeline_config.semantic_config_path),
                 Path(pipeline_config.labelspace_colors_path),
                 defer_dsg_processing=False,
                 enable_background_objects=False,
+                object_binding_policy=ObjectBindingPolicy(
+                    maximum_center_distance_m=(
+                        config.object_binding_maximum_center_distance_m
+                    ),
+                    maximum_aabb_gap_m=(
+                        config.object_binding_maximum_aabb_gap_m
+                    ),
+                ),
             )
             dsg_sink = HydraDsgSemanticSink(
                 scene_service,
@@ -752,6 +926,11 @@ class RealtimeSemanticAdapter:
         self._context_by_semantic_id: dict[int, tuple[int, int]] = {}
         self._observations_by_entity: dict[str, int] = {}
         self._prompted_entity_revisions: set[tuple[str, int]] = set()
+        self._eligible_prompt_entities: set[str] = set()
+        self._submitted_prompt_entities: set[str] = set()
+        self._pending_prompts: OrderedDict[str, _PendingPromptCandidate] = (
+            OrderedDict()
+        )
         self._next_semantic_id = 1
         self._label_cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self._propagation_audit: OrderedDict[int, dict[str, Any]] = OrderedDict()
@@ -772,6 +951,8 @@ class RealtimeSemanticAdapter:
             "entity_semantic_merges": 0,
             "entity_semantic_reassignments": 0,
             "label_frames_cached": 0,
+            "label_frames_persisted": 0,
+            "label_persistence_failures": 0,
             "propagation_frames": 0,
             "propagation_frames_with_labels": 0,
             "propagation_instances": 0,
@@ -783,6 +964,17 @@ class RealtimeSemanticAdapter:
             "propagation_overlap_pixels": 0,
             "prompts_submitted": 0,
             "prompt_queue_full": 0,
+            "prompt_entities_submitted": 0,
+            "prompt_entities_deferred": 0,
+            "prompt_candidates_replaced": 0,
+            "prompt_candidates_retained": 0,
+            "prompt_catchup_records_submitted": 0,
+            "prompt_catchup_entities_submitted": 0,
+            "prompt_pending_high_water": 0,
+            "prompt_catchup_complete": False,
+            "dam_startup_wait_ms": 0.0,
+            "dam_ready_before_first_frame": not config.grounding_enabled,
+            "dam_startup_health": None,
             "corrections_received": 0,
             "corrections_submitted": 0,
             "corrections_skipped": 0,
@@ -793,13 +985,58 @@ class RealtimeSemanticAdapter:
             "tracking_service_ms": [],
         }
 
+    def _wait_for_grounding_ready(self) -> None:
+        if self.grounding_service is None:
+            raise RuntimeError("grounding service is required in DAM mode")
+        started = time.monotonic()
+        deadline = started + self.config.grounding_startup_timeout_s
+        latest_health: dict[str, Any] = {}
+        try:
+            while True:
+                latest_health = self.grounding_service.get_worker_health()
+                workers = list(latest_health.get("workers") or [])
+                failures = [
+                    worker
+                    for worker in workers
+                    if worker.get("error")
+                    or (
+                        not worker.get("is_alive", False)
+                        and worker.get("exitcode") is not None
+                    )
+                ]
+                if failures:
+                    raise RuntimeError(
+                        "DAM worker failed before readiness: "
+                        + ", ".join(
+                            f"{worker.get('name')}: "
+                            f"{worker.get('error') or worker.get('exitcode')}"
+                            for worker in failures
+                        )
+                    )
+                if bool(latest_health.get("all_ready")) and workers:
+                    with self._lock:
+                        self._stats["dam_ready_before_first_frame"] = True
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise TimeoutError(
+                        "DAM workers did not become ready before the semantic "
+                        f"startup deadline ({self.config.grounding_startup_timeout_s:.1f}s)"
+                    )
+                time.sleep(min(0.05, remaining))
+        finally:
+            with self._lock:
+                self._stats["dam_startup_wait_ms"] = (
+                    time.monotonic() - started
+                ) * 1000.0
+                self._stats["dam_startup_health"] = latest_health
+
     def start(self) -> None:
         if self._started:
             return
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            self.gpu_coordinator.touch_activity()
-            with self.gpu_coordinator.lease():
+            with self.gpu_coordinator.active_lease():
                 self.segmentation_service.warmup()
                 self.tracking_service.warmup()
             self._processor_start_attempted = True
@@ -826,6 +1063,7 @@ class RealtimeSemanticAdapter:
                 )
                 self._correction_thread_start_attempted = True
                 self._correction_thread.start()
+                self._wait_for_grounding_ready()
             self._started = True
         except BaseException:
             # Startup is transactional. Cleanup failures remain auditable but
@@ -1076,6 +1314,7 @@ class RealtimeSemanticAdapter:
 
     def _cache_label_frame(
         self,
+        frame_index: int,
         sensor_time_ns: int,
         map_revision: int,
         label_image: np.ndarray,
@@ -1085,12 +1324,27 @@ class RealtimeSemanticAdapter:
         tracks: list[dict[str, Any]],
     ) -> None:
         audit = {
+            "frame_index": frame_index,
             "sensor_time_ns": sensor_time_ns,
             "map_revision": map_revision,
             "mode": "segmentation" if segmentation_due else "propagation",
             "overlap_pixels": int(overlap_pixels),
             "tracks": tracks,
         }
+        try:
+            persist_semantic_label(
+                self.output_dir / SEMANTIC_LABEL_DIRECTORY,
+                frame_index,
+                label_image,
+                sensor_time_ns=sensor_time_ns,
+                run_configuration_sha256=(
+                    self.config.label_run_configuration_sha256
+                ),
+            )
+        except BaseException:
+            with self._lock:
+                self._stats["label_persistence_failures"] += 1
+            raise
         with self._lock:
             self._label_cache[sensor_time_ns] = label_image.copy()
             self._label_cache.move_to_end(sensor_time_ns)
@@ -1104,16 +1358,21 @@ class RealtimeSemanticAdapter:
                 self._propagation_audit.popitem(last=False)
                 self._stats["propagation_audit_evictions"] += 1
             self._stats["label_frames_cached"] += 1
+            self._stats["label_frames_persisted"] += 1
             self._stats["propagation_overlap_pixels"] += overlap_pixels
 
     def handle(self, envelope: RealtimeEnvelope) -> None:
         source, rgb, depth = self._source_payload(envelope)
         sensor_time_ns = envelope.key.sensor_time_ns
-        self.gpu_coordinator.touch_activity()
+        with self._lock:
+            first_frame = self._stats["frames"] == 0
+            ready = bool(self._stats["dam_ready_before_first_frame"])
+        if self.config.grounding_enabled and first_frame and not ready:
+            raise RuntimeError("DAM was not ready before the first semantic frame")
         segmentation_due = self._segmentation_due(sensor_time_ns)
         detections = np.empty((0, 6), dtype=np.float32)
         masks: list[np.ndarray] = []
-        with self.gpu_coordinator.lease():
+        with self.gpu_coordinator.active_lease():
             if segmentation_due:
                 started = time.perf_counter()
                 try:
@@ -1190,34 +1449,24 @@ class RealtimeSemanticAdapter:
             if not depth_valid:
                 continue
             median_depth = float(np.median(valid_depth))
-            ys, xs = np.nonzero(mask)
-            if not len(xs):
-                continue
-            u = float(np.median(xs))
-            v = float(np.median(ys))
             intrinsics = np.asarray(source.intrinsics, dtype=np.float64)
-            fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-            cx, cy = intrinsics[0, 2], intrinsics[1, 2]
-            camera_point = np.asarray(
-                [
-                    (u - cx) * median_depth / fx,
-                    (v - cy) * median_depth / fy,
-                    median_depth,
-                ]
-            )
-            world_point = (
-                np.asarray(source.world_T_camera, dtype=np.float64)
-                @ np.r_[camera_point, 1.0]
-            )[:3]
-            width_m = max(0.05, (xs.max() - xs.min() + 1) * median_depth / fx)
-            height_m = max(0.05, (ys.max() - ys.min() + 1) * median_depth / fy)
+            try:
+                geometry = backproject_masked_depth(
+                    mask,
+                    depth,
+                    intrinsics,
+                    source.world_T_camera,
+                    maximum_points=20_000,
+                )
+            except ValueError:
+                continue
             entity_id, _ = self.memory.observe_entity(
                 self.session_id,
                 f"botsort:{track_id}",
-                world_point,
+                geometry.position_m,
                 sensor_time_ns=sensor_time_ns,
                 semantic_label="unknown",
-                dimensions_m=np.asarray([width_m, 0.2, height_m]),
+                dimensions_m=geometry.dimensions_m,
                 confidence=state.confidence,
             )
             provisional_semantic_id = semantic_id
@@ -1254,6 +1503,7 @@ class RealtimeSemanticAdapter:
                 self._stats["tracked_instances"] += 1
 
         self._cache_label_frame(
+            int(getattr(source, "frame_index", -1)),
             sensor_time_ns,
             envelope.key.map_revision,
             label_image,
@@ -1270,6 +1520,160 @@ class RealtimeSemanticAdapter:
                 prompt_tracks,
                 object_labels,
                 entity_ids,
+            )
+
+    def _prompt_record(
+        self,
+        candidates: list[_PendingPromptCandidate],
+    ) -> PromptRecord:
+        if not candidates:
+            raise ValueError("cannot build an empty DAM prompt")
+        ordered = sorted(candidates, key=lambda candidate: candidate.entity_id)
+        first = ordered[0]
+        if any(
+            candidate.sensor_time_ns != first.sensor_time_ns
+            or candidate.map_revision != first.map_revision
+            or candidate.frame_id != first.frame_id
+            or candidate.frame is not first.frame
+            for candidate in ordered[1:]
+        ):
+            raise ValueError("DAM prompt candidates must share one source frame")
+        entities = {candidate.track.id: candidate.entity_id for candidate in ordered}
+        request_material = "|".join(
+            [
+                self.session_id,
+                str(first.sensor_time_ns),
+                str(first.map_revision),
+                *(entities[key] for key in sorted(entities)),
+            ]
+        )
+        return PromptRecord(
+            frame=first.frame,
+            tracks=[candidate.track for candidate in ordered],
+            object_labels={
+                candidate.track.id: candidate.semantic_id for candidate in ordered
+            },
+            frame_id=first.frame_id,
+            timestamp=first.sensor_time_ns / 1.0e9,
+            sensor_time_ns=first.sensor_time_ns,
+            map_revision=first.map_revision,
+            request_id=hashlib.sha256(request_material.encode()).hexdigest(),
+            entity_ids=entities,
+        )
+
+    def _record_prompt_submission(
+        self,
+        candidates: list[_PendingPromptCandidate],
+        *,
+        catchup: bool,
+    ) -> None:
+        with self._lock:
+            self._prompted_entity_revisions.update(
+                (candidate.entity_id, candidate.map_revision)
+                for candidate in candidates
+            )
+            self._submitted_prompt_entities.update(
+                candidate.entity_id for candidate in candidates
+            )
+            self._stats["prompts_submitted"] += 1
+            self._stats["prompt_entities_submitted"] = len(
+                self._submitted_prompt_entities
+            )
+            if catchup:
+                self._stats["prompt_catchup_records_submitted"] += 1
+                self._stats["prompt_catchup_entities_submitted"] += len(
+                    candidates
+                )
+
+    def _submit_prompt_candidates(
+        self,
+        candidates: list[_PendingPromptCandidate],
+        *,
+        catchup: bool,
+        timeout_s: Optional[float] = None,
+    ) -> bool:
+        record = self._prompt_record(candidates)
+        try:
+            if timeout_s is None:
+                self.query_queue.put_nowait(record)
+            else:
+                self.query_queue.put(record, timeout=timeout_s)
+        except queue.Full:
+            return False
+        self._record_prompt_submission(candidates, catchup=catchup)
+        return True
+
+    def _pending_prompt_groups(self) -> list[list[_PendingPromptCandidate]]:
+        groups: OrderedDict[
+            tuple[int, int, int, int], list[_PendingPromptCandidate]
+        ] = OrderedDict()
+        with self._lock:
+            candidates = list(self._pending_prompts.values())
+        for candidate in candidates:
+            key = (
+                candidate.sensor_time_ns,
+                candidate.map_revision,
+                candidate.frame_id,
+                id(candidate.frame),
+            )
+            groups.setdefault(key, []).append(candidate)
+        return list(groups.values())
+
+    def _flush_pending_prompts(
+        self,
+        *,
+        deadline: Optional[float] = None,
+    ) -> bool:
+        """Submit retained entity candidates, blocking only during final drain."""
+
+        blocking = deadline is not None
+        while True:
+            groups = self._pending_prompt_groups()
+            if not groups:
+                if blocking:
+                    with self._lock:
+                        self._stats["prompt_catchup_complete"] = True
+                return True
+            made_progress = False
+            for candidates in groups:
+                timeout_s = None
+                if blocking:
+                    timeout_s = deadline - time.monotonic()
+                    if timeout_s <= 0.0:
+                        return False
+                if not self._submit_prompt_candidates(
+                    candidates,
+                    catchup=True,
+                    timeout_s=timeout_s,
+                ):
+                    return False
+                made_progress = True
+                with self._lock:
+                    for candidate in candidates:
+                        if self._pending_prompts.get(candidate.entity_id) is candidate:
+                            self._pending_prompts.pop(candidate.entity_id, None)
+            if not blocking or not made_progress:
+                with self._lock:
+                    return not self._pending_prompts
+
+    def _retain_pending_candidate(
+        self,
+        candidate: _PendingPromptCandidate,
+    ) -> None:
+        with self._lock:
+            existing = self._pending_prompts.get(candidate.entity_id)
+            if existing is None:
+                self._pending_prompts[candidate.entity_id] = candidate
+                self._stats["prompt_entities_deferred"] += 1
+            elif candidate.quality > existing.quality:
+                self._pending_prompts[candidate.entity_id] = candidate
+                self._pending_prompts.move_to_end(candidate.entity_id)
+                self._stats["prompt_candidates_replaced"] += 1
+            else:
+                self._stats["prompt_candidates_retained"] += 1
+            self._stats["prompt_pending_high_water"] = max(
+                self._stats["prompt_pending_high_water"],
+                len(self._pending_prompts),
             )
 
     def _enqueue_prompt(
@@ -1294,48 +1698,43 @@ class RealtimeSemanticAdapter:
         ]
         if not selected:
             return
-        selected_track_ids = {track.id for track in selected}
-        selected_labels = {
-            track_id: semantic_id
-            for track_id, semantic_id in object_labels.items()
-            if track_id in selected_track_ids
-        }
-        selected_entities = {
-            track_id: entity_id
-            for track_id, entity_id in entity_ids.items()
-            if track_id in selected_track_ids
-        }
-        request_material = "|".join(
-            [
-                self.session_id,
-                str(sensor_time_ns),
-                str(map_revision),
-                *(selected_entities[key] for key in sorted(selected_entities)),
-            ]
-        )
-        request_id = hashlib.sha256(request_material.encode()).hexdigest()
-        record = PromptRecord(
-            frame=rgb.copy(),
-            tracks=selected,
-            object_labels=selected_labels,
-            frame_id=frame_id,
-            timestamp=sensor_time_ns / 1.0e9,
-            sensor_time_ns=sensor_time_ns,
-            map_revision=map_revision,
-            request_id=request_id,
-            entity_ids=selected_entities,
-        )
-        try:
-            self.query_queue.put_nowait(record)
-        except queue.Full:
+        self._flush_pending_prompts()
+        frame_snapshot = rgb.copy()
+        candidates: list[_PendingPromptCandidate] = []
+        for track in selected:
+            entity_id = entity_ids[track.id]
             with self._lock:
-                self._stats["prompt_queue_full"] += 1
+                self._eligible_prompt_entities.add(entity_id)
+                already_submitted = (
+                    entity_id,
+                    map_revision,
+                ) in self._prompted_entity_revisions
+            if already_submitted:
+                continue
+            candidate = _PendingPromptCandidate(
+                entity_id=entity_id,
+                semantic_id=object_labels[track.id],
+                track=track,
+                frame=frame_snapshot,
+                frame_id=frame_id,
+                sensor_time_ns=sensor_time_ns,
+                map_revision=map_revision,
+                quality=(map_revision, int(track.region_area), sensor_time_ns),
+            )
+            with self._lock:
+                pending = entity_id in self._pending_prompts
+            if pending:
+                self._retain_pending_candidate(candidate)
+            else:
+                candidates.append(candidate)
+        if not candidates:
             return
-        self._prompted_entity_revisions.update(
-            (entity_id, map_revision) for entity_id in selected_entities.values()
-        )
+        if self._submit_prompt_candidates(candidates, catchup=False):
+            return
         with self._lock:
-            self._stats["prompts_submitted"] += 1
+            self._stats["prompt_queue_full"] += 1
+        for candidate in candidates:
+            self._retain_pending_candidate(candidate)
 
     def label_image_for(self, sensor_time_ns: int) -> Optional[np.ndarray]:
         with self._lock:
@@ -1458,9 +1857,24 @@ class RealtimeSemanticAdapter:
             ]
             active_track_ids = list(self._track_mask_states)
             cached_sensor_times_ns = list(self._label_cache)
+            eligible_prompt_entities = sorted(self._eligible_prompt_entities)
+            submitted_prompt_entities = sorted(self._submitted_prompt_entities)
+            pending_prompt_entities = list(self._pending_prompts)
         values["latency"] = {
             "segmentation_ms": self._latency(segmentation_ms),
             "tracking_ms": self._latency(tracking_ms),
+        }
+        values["label_persistence"] = {
+            "schema": "daaam.semantic_label_frames.v1",
+            "directory": str(
+                self.output_dir / SEMANTIC_LABEL_DIRECTORY
+            ),
+            "format": "png_uint16",
+            "run_configuration_sha256": (
+                self.config.label_run_configuration_sha256
+            ),
+            "frames_persisted": int(values["label_frames_persisted"]),
+            "failures": int(values["label_persistence_failures"]),
         }
         values["propagation"] = {
             "maximum_frames": self.config.propagation_max_frames,
@@ -1470,6 +1884,34 @@ class RealtimeSemanticAdapter:
             "history_capacity": self.config.label_cache_frames,
             "cached_sensor_times_ns": cached_sensor_times_ns,
             "recent_audit": recent_audit,
+        }
+        values["startup"] = {
+            "grounding_required": self.config.grounding_enabled,
+            "timeout_s": self.config.grounding_startup_timeout_s,
+            "wait_ms": values["dam_startup_wait_ms"],
+            "ready_before_first_frame": values["dam_ready_before_first_frame"],
+            "worker_health": values["dam_startup_health"],
+        }
+        values["prompt_catchup"] = {
+            "eligible_entities": len(eligible_prompt_entities),
+            "submitted_entities": len(submitted_prompt_entities),
+            "pending_entities": len(pending_prompt_entities),
+            "unsubmitted_entities": len(
+                set(eligible_prompt_entities) - set(submitted_prompt_entities)
+            ),
+            "pending_entity_ids": pending_prompt_entities,
+            "pending_high_water": values["prompt_pending_high_water"],
+            "deferred_entities": values["prompt_entities_deferred"],
+            "candidate_replacements": values["prompt_candidates_replaced"],
+            "candidate_retentions": values["prompt_candidates_retained"],
+            "catchup_records_submitted": values[
+                "prompt_catchup_records_submitted"
+            ],
+            "catchup_entities_submitted": values[
+                "prompt_catchup_entities_submitted"
+            ],
+            "complete": bool(values["prompt_catchup_complete"])
+            and not pending_prompt_entities,
         }
         values["memory"] = self.processor.stats()
         values["dsg"] = self.dsg_sink.stats()
@@ -1484,6 +1926,26 @@ class RealtimeSemanticAdapter:
         cleanup_errors: list[BaseException] = []
         grounding_shutdown: Optional[dict[str, Any]] = None
         grounding_stop_succeeded = False
+        if (
+            drain
+            and self._grounding_start_attempted
+            and self.grounding_service is not None
+        ):
+            remaining = max(0.0, deadline - time.monotonic())
+            shutdown_reserve_s = min(30.0, max(0.5, remaining * 0.2))
+            catchup_deadline = max(
+                time.monotonic(), deadline - shutdown_reserve_s
+            )
+            try:
+                if not self._flush_pending_prompts(deadline=catchup_deadline):
+                    with self._lock:
+                        pending_entities = list(self._pending_prompts)
+                    raise TimeoutError(
+                        "DAM prompt catch-up did not submit every retained entity: "
+                        + ", ".join(pending_entities)
+                    )
+            except BaseException as error:
+                cleanup_errors.append(error)
         if self._grounding_start_attempted and self.grounding_service is not None:
             try:
                 remaining = deadline - time.monotonic()

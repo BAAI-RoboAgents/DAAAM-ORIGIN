@@ -1,15 +1,11 @@
-from typing import Optional, Dict, List, Any, Callable, Tuple, Union
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Any, Callable, Mapping
 import threading
 import queue
-import json
 import yaml
 import time
-import pandas as pd
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-import numpy as np
-import time
-from tqdm import tqdm
 import numpy as np
 
 from spark_dsg import (
@@ -37,10 +33,27 @@ from daaam.pipeline.models import (
 )
 
 
+@dataclass(frozen=True)
+class ObjectBindingPolicy:
+	"""Auditable gates for binding MapMemory entities to Hydra objects."""
+
+	maximum_center_distance_m: float = 0.75
+	maximum_aabb_gap_m: float = 0.15
+	audit_capacity: int = 1000
+
+	def __post_init__(self) -> None:
+		if self.maximum_center_distance_m <= 0.0:
+			raise ValueError("object binding center-distance threshold must be positive")
+		if self.maximum_aabb_gap_m < 0.0:
+			raise ValueError("object binding AABB-gap threshold cannot be negative")
+		if self.audit_capacity < 1:
+			raise ValueError("object binding audit capacity must be positive")
+
+
 class SceneGraphService:
 	"""Service for handling scene graph corrections and updates."""
 
-	def __init__(self, semantic_config_path: Path, labelspace_colors_path: Optional[Path] = None, logger: Optional[PipelineLogger] = None, defer_dsg_processing: bool = False, enable_background_objects: bool = True):
+	def __init__(self, semantic_config_path: Path, labelspace_colors_path: Optional[Path] = None, logger: Optional[PipelineLogger] = None, defer_dsg_processing: bool = False, enable_background_objects: bool = True, object_binding_policy: ObjectBindingPolicy = ObjectBindingPolicy()):
 		self.logger = logger or get_default_logger()
 		self.scene_graph = DynamicSceneGraph()
 		self.scene_graph_is_set = False
@@ -53,6 +66,8 @@ class SceneGraphService:
 		self.applied_correction_ids: set[int] = set()
 		self.correction_application_events = 0
 		self.correction_lock = threading.Lock()
+		self.object_binding_policy = object_binding_policy
+		self.object_binding_audit: List[Dict[str, Any]] = []
 
 		# CRITICAL: Lock for thread-safe scene graph access
 		# The DynamicSceneGraph C++ object is NOT thread-safe by default
@@ -209,6 +224,180 @@ class SceneGraphService:
 			else:
 				self.logger.debug(f"Added correction for semantic_id {correction.semantic_id} to corrections dict")
 
+	@staticmethod
+	def _node_has_object_mesh(node: Any) -> bool:
+		try:
+			mesh = node.attributes.mesh()
+			return bool(mesh is not None and mesh.num_vertices() > 0)
+		except (AttributeError, RuntimeError, TypeError):
+			return False
+
+	@staticmethod
+	def _node_dimensions(node: Any) -> Optional[np.ndarray]:
+		try:
+			dimensions = np.asarray(
+				node.attributes.bounding_box.dimensions,
+				dtype=np.float64,
+			)
+		except (AttributeError, TypeError, ValueError):
+			return None
+		if (
+			dimensions.shape != (3,)
+			or not np.all(np.isfinite(dimensions))
+			or np.any(dimensions <= 0.0)
+		):
+			return None
+		return dimensions
+
+	def _binding_evidence(
+		self,
+		*,
+		node: Any,
+		semantic_id: int,
+		position: np.ndarray,
+		dimensions: np.ndarray,
+	) -> Dict[str, Any]:
+		node_position = np.asarray(node.attributes.position, dtype=np.float64)
+		center_distance = float(np.linalg.norm(node_position - position))
+		node_dimensions = self._node_dimensions(node)
+		aabb_gap = float("inf")
+		aabb_iou = 0.0
+		if node_dimensions is not None:
+			separation = np.maximum(
+				np.abs(node_position - position)
+				- 0.5 * (node_dimensions + dimensions),
+				0.0,
+			)
+			aabb_gap = float(np.linalg.norm(separation))
+			intersection_dimensions = np.maximum(
+				np.minimum(
+					node_position + 0.5 * node_dimensions,
+					position + 0.5 * dimensions,
+				)
+				- np.maximum(
+					node_position - 0.5 * node_dimensions,
+					position - 0.5 * dimensions,
+				),
+				0.0,
+			)
+			intersection = float(np.prod(intersection_dimensions))
+			union = float(np.prod(node_dimensions) + np.prod(dimensions) - intersection)
+			if union > 0.0:
+				aabb_iou = intersection / union
+
+		policy = self.object_binding_policy
+		accepted_by = []
+		if center_distance <= policy.maximum_center_distance_m:
+			accepted_by.append("center_distance")
+		if aabb_gap <= policy.maximum_aabb_gap_m:
+			accepted_by.append("aabb_gap")
+		return {
+			"node_id": str(node.id),
+			"node_id_value": int(node.id.value),
+			"node_has_mesh": self._node_has_object_mesh(node),
+			"semantic_id_match": int(node.attributes.semantic_label) == int(semantic_id),
+			"center_distance_m": center_distance,
+			"aabb_gap_m": None if not np.isfinite(aabb_gap) else aabb_gap,
+			"aabb_iou": aabb_iou,
+			"accepted": bool(accepted_by),
+			"accepted_by": accepted_by,
+			"thresholds": {
+				"maximum_center_distance_m": policy.maximum_center_distance_m,
+				"maximum_aabb_gap_m": policy.maximum_aabb_gap_m,
+			},
+		}
+
+	def _record_object_binding_event(self, event: Mapping[str, Any]) -> None:
+		self.object_binding_audit.append(dict(event))
+		overflow = len(self.object_binding_audit) - self.object_binding_policy.audit_capacity
+		if overflow > 0:
+			del self.object_binding_audit[:overflow]
+
+	@staticmethod
+	def _standard_temporal_history(
+		*,
+		temporal_history: Optional[Mapping[str, Any]],
+		sensor_time_ns: int,
+		time_origin_ns: Optional[int],
+	) -> Dict[str, Any]:
+		source = dict(temporal_history or {})
+		origin = time_origin_ns
+		if origin is None and source.get("time_origin_ns") is not None:
+			origin = int(source["time_origin_ns"])
+
+		first_ns = source.get("first_observed_ns")
+		last_ns = source.get("last_observed_ns")
+		if first_ns is None and origin is not None and source.get("first_observed") is not None:
+			first_ns = origin + int(round(float(source["first_observed"]) * 1.0e9))
+		if last_ns is None and origin is not None and source.get("last_observed") is not None:
+			last_ns = origin + int(round(float(source["last_observed"]) * 1.0e9))
+		if first_ns is None:
+			first_ns = int(sensor_time_ns)
+		if last_ns is None:
+			last_ns = int(sensor_time_ns)
+		first_ns = int(first_ns)
+		last_ns = int(last_ns)
+		if first_ns > last_ns:
+			raise ValueError("temporal history starts after it ends")
+
+		result: Dict[str, Any] = {
+			"schema": "daaam.temporal_history.v1",
+			"time_origin_ns": origin,
+			"time_reference": "seconds_from_time_origin_ns",
+			"observation_count": int(source.get("observation_count") or 1),
+			"first_observed_ns": first_ns,
+			"last_observed_ns": last_ns,
+		}
+		if origin is not None:
+			result["first_observed"] = (first_ns - origin) / 1.0e9
+			result["last_observed"] = (last_ns - origin) / 1.0e9
+		for key in ("frame_ids", "timestamps", "timestamps_ns"):
+			if source.get(key) is not None:
+				result[key] = source[key]
+		return result
+
+	def _set_entity_binding(
+		self,
+		*,
+		node: Any,
+		semantic_id: int,
+		entity_id: str,
+		sensor_time_ns: int,
+		binding_source: str,
+		binding_status: str,
+		evidence: Optional[Mapping[str, Any]],
+		temporal_history: Optional[Mapping[str, Any]],
+		time_origin_ns: Optional[int],
+	) -> None:
+		history = self._standard_temporal_history(
+			temporal_history=temporal_history,
+			sensor_time_ns=sensor_time_ns,
+			time_origin_ns=time_origin_ns,
+		)
+		metadata = dict(node.attributes.metadata.get() or {})
+		metadata.update(
+			{
+				"entity_id": entity_id,
+				"entity_binding_source": binding_source,
+				"mesh_binding_status": binding_status,
+				"has_object_mesh": self._node_has_object_mesh(node),
+				"first_observed_ns": history["first_observed_ns"],
+				"last_observed_ns": history["last_observed_ns"],
+				"temporal_history": history,
+			}
+		)
+		if history.get("time_origin_ns") is not None:
+			metadata["time_origin_ns"] = history["time_origin_ns"]
+		if evidence is not None:
+			metadata["entity_binding"] = dict(evidence)
+		metadata["geometry_source"] = (
+			"hydra_object_mesh" if self._node_has_object_mesh(node) else "map_memory"
+		)
+		node.attributes.metadata.set(metadata)
+		node.attributes.semantic_label = int(semantic_id)
+		node.attributes.is_active = True
+		node.attributes.last_update_time_ns = int(sensor_time_ns)
+
 	def ensure_object_node(
 		self,
 		*,
@@ -217,14 +406,45 @@ class SceneGraphService:
 		position_m: Any,
 		dimensions_m: Any,
 		sensor_time_ns: int,
+		temporal_history: Optional[Mapping[str, Any]] = None,
+		time_origin_ns: Optional[int] = None,
+		allow_unmeshed_fallback: bool = False,
+		semantic_id_owners: Optional[Mapping[int, str]] = None,
 	) -> bool:
-		"""Ensure a correction-addressable object exists using MapMemory geometry.
+		"""Bind an entity to real Hydra geometry before creating a fallback node.
 
-		Hydra can legitimately finish a short run without promoting any object
-		voxels. In that case the semantic sidecar still has mask/depth-derived,
-		world-frame geometry in MapMemory. Materializing that audited entity makes
-		the correction visible in the final DSG instead of acknowledging a no-op.
+		A fallback is explicitly marked as unmeshed and is used only when no real
+		object mesh passes the configured spatial gates. Existing fallback nodes are
+		migrated to a credible mesh and removed, preventing duplicate representations.
+		When an owner map is supplied, it must contain the current request and reserves
+		each known Hydra semantic ID from cross-entity spatial fallback claims.
 		"""
+		normalized_owners: Dict[int, str] = {}
+		if semantic_id_owners is not None:
+			for owner_semantic_id, owner_entity_id in semantic_id_owners.items():
+				try:
+					normalized_semantic_id = int(owner_semantic_id)
+				except (TypeError, ValueError) as error:
+					raise ValueError("semantic ID owner mapping is invalid") from error
+				normalized_entity_id = str(owner_entity_id or "").strip()
+				if normalized_semantic_id <= 0 or not normalized_entity_id:
+					raise ValueError("semantic ID owner mapping is invalid")
+				existing_owner = normalized_owners.get(normalized_semantic_id)
+				if (
+					existing_owner is not None
+					and existing_owner != normalized_entity_id
+				):
+					raise ValueError(
+						f"semantic ID {normalized_semantic_id} has conflicting owners"
+					)
+				normalized_owners[normalized_semantic_id] = normalized_entity_id
+			request_owner = normalized_owners.get(int(semantic_id))
+			if request_owner != entity_id:
+				raise ValueError(
+					f"semantic_id {semantic_id} owner mapping names "
+					f"{request_owner!r}, not {entity_id!r}"
+				)
+
 		if not self.scene_graph_is_set:
 			return False
 		position = dimensions = None
@@ -281,9 +501,10 @@ class SceneGraphService:
 					node.attributes.metadata.set(metadata)
 				return inserted
 
+			all_nodes = list(object_layer.nodes)
 			matching_nodes = [
 				node
-				for node in object_layer.nodes
+				for node in all_nodes
 				if int(node.attributes.semantic_label) == int(semantic_id)
 			]
 			bindings = {
@@ -297,39 +518,243 @@ class SceneGraphService:
 					f"semantic_id {semantic_id} is already bound to "
 					f"{sorted(conflicts)}"
 				)
-			if entity_id in bindings:
-				bound_node = next(
+			bound_nodes = [
+				node
+				for node in all_nodes
+				if str(
+					(node.attributes.metadata.get() or {}).get("entity_id", "")
+				).strip()
+				== entity_id
+			]
+			bound_mesh_nodes = [node for node in bound_nodes if self._node_has_object_mesh(node)]
+			if bound_mesh_nodes:
+				bound_node = bound_mesh_nodes[0]
+				self._set_entity_binding(
+					node=bound_node,
+					semantic_id=semantic_id,
+					entity_id=entity_id,
+					sensor_time_ns=sensor_time_ns,
+					binding_source="existing_entity_id",
+					binding_status="matched_real_mesh",
+					evidence=None,
+					temporal_history=temporal_history,
+					time_origin_ns=time_origin_ns,
+				)
+				return attach_to_nearest_place(bound_node)
+
+			# Search every unbound real Hydra object. Semantic-ID agreement is a
+			# deterministic preference, but all candidates must pass a spatial gate.
+			mesh_candidates = []
+			evaluated_mesh_candidates = []
+			if geometry_is_valid:
+				for candidate in all_nodes:
+					if not self._node_has_object_mesh(candidate):
+						continue
+					candidate_binding = str(
+						(candidate.attributes.metadata.get() or {}).get("entity_id", "")
+					).strip()
+					if candidate_binding and candidate_binding != entity_id:
+						self._record_object_binding_event(
+							{
+								"entity_id": entity_id,
+								"semantic_id": int(semantic_id),
+								"sensor_time_ns": int(sensor_time_ns),
+								"status": "rejected_entity_conflict",
+								"node_id": str(candidate.id),
+								"conflicting_entity_id": candidate_binding,
+							}
+						)
+						continue
+					evidence = self._binding_evidence(
+						node=candidate,
+						semantic_id=semantic_id,
+						position=position,
+						dimensions=dimensions,
+					)
+					candidate_semantic_id = int(
+						candidate.attributes.semantic_label
+					)
+					evidence["candidate_semantic_id"] = candidate_semantic_id
+					reserved_entity_id = normalized_owners.get(
+						candidate_semantic_id
+					)
+					if evidence["accepted"] and reserved_entity_id is not None and (
+						reserved_entity_id != entity_id
+						or candidate_semantic_id != int(semantic_id)
+					):
+						self._record_object_binding_event(
+							{
+								"entity_id": entity_id,
+								"semantic_id": int(semantic_id),
+								"sensor_time_ns": int(sensor_time_ns),
+								"status": "rejected_reserved_semantic_owner",
+								"reserved_entity_id": reserved_entity_id,
+								**evidence,
+							}
+						)
+						continue
+					evaluated_mesh_candidates.append(evidence)
+					if evidence["accepted"]:
+						mesh_candidates.append((candidate, evidence))
+			mesh_candidates.sort(
+				key=lambda item: (
+					not item[1]["semantic_id_match"],
+					float("inf") if item[1]["aabb_gap_m"] is None else item[1]["aabb_gap_m"],
+					-item[1]["aabb_iou"],
+					item[1]["center_distance_m"],
+					item[1]["node_id_value"],
+				)
+			)
+			if mesh_candidates:
+				node, evidence = mesh_candidates[0]
+				self._set_entity_binding(
+					node=node,
+					semantic_id=semantic_id,
+					entity_id=entity_id,
+					sensor_time_ns=sensor_time_ns,
+					binding_source=(
+						"semantic_id_spatial_mesh"
+						if evidence["semantic_id_match"]
+						else "spatial_mesh"
+					),
+					binding_status="matched_real_mesh",
+					evidence=evidence,
+					temporal_history=temporal_history,
+					time_origin_ns=time_origin_ns,
+				)
+				attached = attach_to_nearest_place(node)
+				if not attached:
+					return False
+				replaced_node_ids = []
+				for old_node in bound_nodes:
+					if old_node.id == node.id or self._node_has_object_mesh(old_node):
+						continue
+					replaced_node_ids.append(str(old_node.id))
+					self.scene_graph.remove_node(old_node.id)
+				event = {
+					"entity_id": entity_id,
+					"semantic_id": int(semantic_id),
+					"sensor_time_ns": int(sensor_time_ns),
+					"status": "matched_real_mesh",
+					"replaced_unmeshed_nodes": replaced_node_ids,
+					**evidence,
+				}
+				self._record_object_binding_event(event)
+				return True
+
+			if bound_nodes:
+				# Strict/authoritative mode removes stale semantic-only nodes.
+				# MapMemory retains the DAM result; the DSG records only real mesh
+				# bindings, with rejection kept in the audit stream.
+				if not allow_unmeshed_fallback:
+					removed_node_ids = []
+					for bound_node in bound_nodes:
+						if self._node_has_object_mesh(bound_node):
+							continue
+						removed_node_ids.append(str(bound_node.id))
+						self.scene_graph.remove_node(bound_node.id)
+					nearest = min(
+						evaluated_mesh_candidates,
+						key=lambda evidence: (
+							float("inf")
+							if evidence["aabb_gap_m"] is None
+							else evidence["aabb_gap_m"],
+							evidence["center_distance_m"],
+						),
+						default=None,
+					)
+					event = {
+						"entity_id": entity_id,
+						"semantic_id": int(semantic_id),
+						"sensor_time_ns": int(sensor_time_ns),
+						"status": "rejected_no_mesh",
+						"removed_unmeshed_nodes": removed_node_ids,
+					}
+					if nearest is not None:
+						event["nearest_rejected_candidate"] = nearest
+					self._record_object_binding_event(event)
+					return False
+
+				# Explicit legacy/debug opt-in retains the unmeshed MapMemory node.
+				bound_node = bound_nodes[0]
+				self._set_entity_binding(
+					node=bound_node,
+					semantic_id=semantic_id,
+					entity_id=entity_id,
+					sensor_time_ns=sensor_time_ns,
+					binding_source="existing_unmeshed_fallback",
+					binding_status="unmatched_no_real_mesh",
+					evidence=None,
+					temporal_history=temporal_history,
+					time_origin_ns=time_origin_ns,
+				)
+				self._record_object_binding_event(
+					{
+						"entity_id": entity_id,
+						"semantic_id": int(semantic_id),
+						"sensor_time_ns": int(sensor_time_ns),
+						"status": "unmatched_no_real_mesh",
+						"node_id": str(bound_node.id),
+					}
+				)
+				return attach_to_nearest_place(bound_node)
+
+			if allow_unmeshed_fallback and matching_nodes and geometry_is_valid:
+				unbound_matching_nodes = [
 					node
 					for node in matching_nodes
-					if str(
+					if not str(
 						(node.attributes.metadata.get() or {}).get("entity_id", "")
 					).strip()
-					== entity_id
-				)
-				bound_node.attributes.is_active = True
-				return attach_to_nearest_place(bound_node)
-			if matching_nodes:
-				if not geometry_is_valid:
-					return False
-				node = min(
-					matching_nodes,
-					key=lambda candidate: float(
-						np.linalg.norm(
-							np.asarray(candidate.attributes.position) - position
-						)
-					),
-				)
-				metadata = dict(node.attributes.metadata.get() or {})
-				metadata["entity_id"] = entity_id
-				metadata["entity_binding_source"] = "semantic_id_map_memory"
-				metadata["first_observed_ns"] = int(sensor_time_ns)
-				metadata["last_observed_ns"] = int(sensor_time_ns)
-				node.attributes.metadata.set(metadata)
-				node.attributes.is_active = True
-				node.attributes.last_update_time_ns = int(sensor_time_ns)
-				return attach_to_nearest_place(node)
+				]
+				ranked = [
+					(
+						node,
+						self._binding_evidence(
+							node=node,
+							semantic_id=semantic_id,
+							position=position,
+							dimensions=dimensions,
+						),
+					)
+					for node in unbound_matching_nodes
+				]
+				ranked = [item for item in ranked if item[1]["accepted"]]
+				ranked.sort(key=lambda item: (item[1]["center_distance_m"], item[1]["node_id_value"]))
+				if ranked:
+					node, evidence = ranked[0]
+					self._set_entity_binding(
+						node=node,
+						semantic_id=semantic_id,
+						entity_id=entity_id,
+						sensor_time_ns=sensor_time_ns,
+						binding_source="semantic_id_spatial_unmeshed",
+						binding_status="unmatched_no_real_mesh",
+						evidence=evidence,
+						temporal_history=temporal_history,
+						time_origin_ns=time_origin_ns,
+					)
+					self._record_object_binding_event(
+						{
+							"entity_id": entity_id,
+							"semantic_id": int(semantic_id),
+							"sensor_time_ns": int(sensor_time_ns),
+							"status": "unmatched_no_real_mesh",
+							**evidence,
+						}
+					)
+					return attach_to_nearest_place(node)
 
-			if not geometry_is_valid:
+			if not geometry_is_valid or not allow_unmeshed_fallback:
+				self._record_object_binding_event(
+					{
+						"entity_id": entity_id,
+						"semantic_id": int(semantic_id),
+						"sensor_time_ns": int(sensor_time_ns),
+						"status": "rejected_no_mesh",
+						"geometry_is_valid": geometry_is_valid,
+					}
+				)
 				return False
 
 			node_index = int(semantic_id)
@@ -346,16 +771,29 @@ class SceneGraphService:
 			attributes.bounding_box.type = BoundingBoxType.AABB
 			attributes.bounding_box.world_P_center = position
 			attributes.bounding_box.dimensions = dimensions
-			attributes.metadata.set(
-				{
-					"entity_id": entity_id,
-					"geometry_source": "map_memory",
-					"first_observed_ns": int(sensor_time_ns),
-					"last_observed_ns": int(sensor_time_ns),
-				}
+			self._set_entity_binding(
+				node=type("PendingNode", (), {"attributes": attributes})(),
+				semantic_id=semantic_id,
+				entity_id=entity_id,
+				sensor_time_ns=sensor_time_ns,
+				binding_source="map_memory_fallback",
+				binding_status="unmatched_no_real_mesh",
+				evidence=None,
+				temporal_history=temporal_history,
+				time_origin_ns=time_origin_ns,
 			)
 			if not self.scene_graph.add_node(DsgLayers.OBJECTS, node_id, attributes):
 				return False
+			self._record_object_binding_event(
+				{
+					"entity_id": entity_id,
+					"semantic_id": int(semantic_id),
+					"sensor_time_ns": int(sensor_time_ns),
+					"status": "unmatched_no_real_mesh",
+					"node_id": str(node_id),
+					"materialized_fallback": True,
+				}
+			)
 			return attach_to_nearest_place(self.scene_graph.get_node(node_id))
 
 	def apply_corrections(self) -> None:
@@ -408,17 +846,35 @@ class SceneGraphService:
 
 						metadata_dict = dict(node.attributes.metadata.get() or {})
 						metadata_dict["description"] = semantic_label
-						
-						# Add temporal history if available
-						if hasattr(correction, 'frame_ids') and correction.frame_ids:
-							temporal_data = {
+
+						# MapMemory-populated history on the node is authoritative. Legacy
+						# corrections can still supply a richer interval when present.
+						correction_has_history = bool(
+							getattr(correction, "frame_ids", None)
+							or getattr(correction, "timestamps", None)
+							or getattr(correction, "first_observed", None) is not None
+							or getattr(correction, "last_observed", None) is not None
+						)
+						if correction_has_history:
+							temporal_source = {
 								"frame_ids": correction.frame_ids,
 								"timestamps": correction.timestamps,
 								"observation_count": correction.observation_count,
 								"first_observed": correction.first_observed,
-								"last_observed": correction.last_observed
+								"last_observed": correction.last_observed,
 							}
+							temporal_data = self._standard_temporal_history(
+								temporal_history=temporal_source,
+								sensor_time_ns=int(
+									correction.sensor_time_ns
+									or round(float(correction.timestamp) * 1.0e9)
+								),
+								time_origin_ns=metadata_dict.get("time_origin_ns"),
+							)
 							metadata_dict["temporal_history"] = temporal_data
+							metadata_dict["first_observed_ns"] = temporal_data["first_observed_ns"]
+							metadata_dict["last_observed_ns"] = temporal_data["last_observed_ns"]
+						if embedding is not None:
 							metadata_dict["sentence_embedding_feature"] = embedding
 						
 						# Add CLIP feature if available
@@ -558,9 +1014,11 @@ class SceneGraphService:
 				"scene_graph_set": self.scene_graph_is_set,
 				"async_enabled": self._enable_async,
 				"keyframe_annotations_count": len(self.keyframe_annotations),
-				"background_objects_count": len(self.background_objects),
-				"tracked_3d_positions": len(self.object_3d_positions)
-			}
+					"background_objects_count": len(self.background_objects),
+					"tracked_3d_positions": len(self.object_3d_positions),
+					"object_binding_events": len(self.object_binding_audit),
+					"object_binding_recent": list(self.object_binding_audit[-10:]),
+				}
 			if self._enable_async and self.dsg_update_queue:
 				stats["async_queue_size"] = self.dsg_update_queue.qsize()
 			return stats

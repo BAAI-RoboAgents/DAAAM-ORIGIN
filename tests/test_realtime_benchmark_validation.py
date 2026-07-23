@@ -234,6 +234,32 @@ def test_clean_1_hz_run_is_authoritative(tmp_path):
     assert verdict["expected_rate_hz"] == 1.0
 
 
+def test_fast_precomputed_depth_profile_does_not_require_scale(tmp_path):
+    run = write_run(tmp_path / "fast-depth", 1.0)
+    manifest_path = run / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    depth = manifest["models"]["foundation_stereo"]
+    depth["scale"] = None
+    depth["precomputed_provenance"] = {
+        "backend": "fast-foundation-stereo",
+        "report_sha256": "fast-report-sha",
+        "processed": 20,
+        "failed": 0,
+    }
+    manifest_path.write_text(json.dumps(manifest))
+
+    verdict = validate_realtime_run(run, expected_rate_hz=1.0)
+
+    assert verdict["passed"]
+    profile = next(
+        item
+        for item in verdict["checks"]
+        if item["code"] == "depth.resolved_profile"
+    )
+    assert profile["passed"]
+    assert profile["detail"]["backend"] == "fast-foundation-stereo"
+
+
 def test_1_hz_authority_rejects_wrong_rate_or_slow_map_cycle(tmp_path):
     wrong_rate = write_run(tmp_path / "wrong-rate", 2.0)
     rate_verdict = validate_realtime_run(wrong_rate, expected_rate_hz=1.0)

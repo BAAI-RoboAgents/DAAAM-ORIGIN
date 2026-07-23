@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, replace
 from datetime import datetime
+import hashlib
 import json
 import math
 import os
@@ -17,6 +18,7 @@ import sys
 import threading
 import time
 from typing import Callable, Optional
+import uuid
 
 import cv2
 import numpy as np
@@ -44,7 +46,7 @@ from daaam.mapping.fusion import isolate_static_depth  # noqa: E402
 from daaam.mapping.motion import MotionConfig, estimate_motion_masks  # noqa: E402
 from daaam.mapping.paths import PathObservation, PathRepository  # noqa: E402
 from daaam.mapping.submaps import SubmapManager  # noqa: E402
-from daaam.memory import MapMemory  # noqa: E402
+from daaam.memory import MapMemory, MapMemoryConfig  # noqa: E402
 from daaam.quality import QualityGateConfig, QualityGateRunner  # noqa: E402
 from daaam.realtime.checkpoint import RealtimeCheckpoint  # noqa: E402
 from daaam.realtime.contracts import (  # noqa: E402
@@ -59,7 +61,12 @@ from daaam.realtime.manifest import (  # noqa: E402
     write_run_manifest,
 )
 from daaam.realtime.scheduler import MultiRateScheduler, StageSpec  # noqa: E402
-from daaam.realtime.gpu import SharedGpuCoordinator  # noqa: E402
+from daaam.realtime.semantic_labels import (  # noqa: E402
+    SEMANTIC_LABEL_DIRECTORY,
+    load_semantic_label,
+    semantic_label_path,
+    validate_semantic_label_binding,
+)
 from daaam.slam.backend import PoseBackendConfig, PoseInputValidator  # noqa: E402
 
 
@@ -268,6 +275,34 @@ def parse_args():
     )
     parser.add_argument("--semantic-queue-capacity", type=int, default=2)
     parser.add_argument("--semantic-minimum-observations", type=int, default=5)
+    parser.add_argument(
+        "--entity-merge-distance-m",
+        type=float,
+        default=0.50,
+        help=(
+            "Maximum 3D distance for MapMemory to merge a new local track into "
+            "an existing same-label entity (default: 0.50 m)."
+        ),
+    )
+    parser.add_argument(
+        "--object-binding-maximum-center-distance-m",
+        type=float,
+        default=0.75,
+        help=(
+            "Maximum center distance for binding a semantic entity to a Hydra "
+            "object mesh (default: 0.75 m)."
+        ),
+    )
+    parser.add_argument(
+        "--object-binding-maximum-aabb-gap-m",
+        type=float,
+        default=0.15,
+        help=(
+            "Maximum AABB gap for binding a semantic entity to a Hydra object "
+            "mesh (default: 0.15 m)."
+        ),
+    )
+    parser.add_argument("--semantic-startup-timeout-s", type=float, default=120.0)
     parser.add_argument("--semantic-drain-timeout-s", type=float, default=60.0)
     parser.add_argument(
         "--gpu-sharing-mode",
@@ -424,7 +459,11 @@ def build_frames(
 def load_precomputed_depth_provenance(dataset: Path) -> Optional[dict]:
     """Resolve the report that produced a precomputed metric-depth dataset."""
 
-    for name in ("foundation_stereo_run.json", "foundation_stereo_nominal_run.json"):
+    for name in (
+        "fast_foundation_stereo_run.json",
+        "foundation_stereo_run.json",
+        "foundation_stereo_nominal_run.json",
+    ):
         path = dataset / name
         if not path.is_file():
             continue
@@ -432,28 +471,51 @@ def load_precomputed_depth_provenance(dataset: Path) -> Optional[dict]:
             report = json.loads(path.read_text())
         except json.JSONDecodeError as error:
             raise ValueError(f"Invalid precomputed depth report: {path}") from error
+        settings = report.get("settings", {})
+        artifacts = report.get("artifacts", {})
+        is_fast = name == "fast_foundation_stereo_run.json"
         profile_value = report.get("profile")
         if isinstance(profile_value, dict):
             profile_name = profile_value.get("name")
         else:
             profile_name = profile_value
-        checkpoint_value = report.get("checkpoint")
+        if is_fast and profile_name is None:
+            iterations = settings.get("iterations")
+            profile_name = (
+                f"fast-i{iterations}-fullres" if iterations is not None else "fast"
+            )
+        checkpoint_value = (
+            artifacts.get("checkpoint") if is_fast else report.get("checkpoint")
+        )
         checkpoint_path = (
             Path(checkpoint_value).expanduser().resolve() if checkpoint_value else None
         )
         return {
+            "backend": "fast-foundation-stereo" if is_fast else "foundation-stereo",
             "report": str(path.resolve()),
             "report_sha256": sha256_file(path),
             "profile": profile_name,
-            "valid_iters": report.get("valid_iters"),
-            "scale": report.get("scale"),
-            "precision": report.get("precision"),
-            "confidence_mode": report.get("confidence_mode"),
+            "valid_iters": (
+                settings.get("iterations") if is_fast else report.get("valid_iters")
+            ),
+            "scale": None if is_fast else report.get("scale"),
+            "precision": (
+                settings.get("precision") if is_fast else report.get("precision")
+            ),
+            "confidence_mode": (
+                settings.get("confidence_mode")
+                if is_fast
+                else report.get("confidence_mode")
+            ),
             "checkpoint": str(checkpoint_path) if checkpoint_path is not None else None,
             "checkpoint_sha256": (
-                sha256_file(checkpoint_path)
-                if checkpoint_path is not None and checkpoint_path.is_file()
-                else None
+                artifacts.get("checkpoint_sha256")
+                if is_fast
+                else (
+                    sha256_file(checkpoint_path)
+                    if checkpoint_path is not None and checkpoint_path.is_file()
+                    else None
+                )
             ),
             "processed": report.get("processed"),
             "failed": report.get("failed"),
@@ -550,10 +612,12 @@ class ReplayEngine:
         submap_frames: int,
         checkpoint_interval_frames: int,
         write_fusion_products: bool,
+        time_origin_ns: int,
+        entity_merge_distance_m: float = 0.50,
         depth_worker: Optional[SubprocessDepthBackend] = None,
         stereo_fx: Optional[float] = None,
         stereo_baseline_m: Optional[float] = None,
-        maximum_depth_m: float = 20.0,
+        maximum_depth_m: float = 5.0,
         depth_confidence_mode: str = "left-right",
         depth_lr_interval: int = 3,
         static_map_backend: Optional[HydraStaticMapBackend] = None,
@@ -640,8 +704,17 @@ class ReplayEngine:
         self.dynamic_ratios = []
         self.contamination_rates = []
         self.frames_by_stage = {stage: 0 for stage in STAGES}
-        self.memory = MapMemory(run_dir / "map_memory.sqlite3")
+        self.memory = MapMemory(
+            run_dir / "map_memory.sqlite3",
+            config=MapMemoryConfig(
+                entity_merge_distance_m=entity_merge_distance_m,
+            ),
+        )
         try:
+            self.memory.set_time_origin_ns(
+                time_origin_ns,
+                source="dataset_time_contract",
+            )
             self.memory.create_session("replay", time.time_ns(), canonical=True)
         except sqlite3.IntegrityError:
             pass
@@ -1425,6 +1498,323 @@ def rebuild_static_map_prefix(
     return rebuilt
 
 
+def validate_semantic_label_coverage(
+    frames: list[ReplayFrame],
+    completed_indices: set[int],
+    semantic_label_dir: Path,
+    run_configuration_sha256: str,
+) -> tuple[list[ReplayFrame], dict[int, dict[str, object]]]:
+    """Preflight exact-frame labels before a resume or Hydra postpass."""
+
+    selected = [
+        frame for frame in frames if frame.frame_index in completed_indices
+    ]
+    selected_indices = {frame.frame_index for frame in selected}
+    undefined = sorted(completed_indices - selected_indices)
+    if undefined:
+        raise ValueError(
+            "Hydra semantic postpass has committed indices without source frames: "
+            + ", ".join(str(value) for value in undefined[:20])
+        )
+    failures: list[str] = []
+    bindings: dict[int, dict[str, object]] = {}
+    for frame in selected:
+        try:
+            bindings[frame.frame_index] = validate_semantic_label_binding(
+                semantic_label_dir,
+                frame.frame_index,
+                sensor_time_ns=frame.sensor_time_ns,
+                run_configuration_sha256=run_configuration_sha256,
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            failures.append(f"{frame.frame_index}: {error}")
+    if failures:
+        raise RuntimeError(
+            "Hydra semantic postpass requires 100% exact-frame label coverage "
+            f"with current-run bindings; invalid {len(failures)}/{len(selected)} "
+            "frames: "
+            + "; ".join(failures[:20])
+        )
+    return selected, bindings
+
+
+def rebuild_static_map_with_semantics(
+    backend: HydraStaticMapBackend,
+    run_dir: Path,
+    frames: list[ReplayFrame],
+    completed_indices: set[int],
+    semantic_label_dir: Path,
+    run_configuration_sha256: str,
+) -> dict[str, object]:
+    """Replay every committed frame with its exact persisted semantic labels.
+
+    Coverage and current-run bindings are checked before Hydra receives the
+    first frame. This makes a missing, stale, or corrupted asynchronous label a
+    hard, auditable failure instead of silently fusing semantic ID zero.
+    """
+
+    selected, bindings = validate_semantic_label_coverage(
+        frames,
+        completed_indices,
+        semantic_label_dir,
+        run_configuration_sha256,
+    )
+
+    label_manifest_digest = hashlib.sha256()
+    nonzero_frames = 0
+    nonzero_pixels = 0
+    unique_labels: set[int] = set()
+    for frame in selected:
+        rgb_bgr = cv2.imread(str(frame.rgb_path), cv2.IMREAD_COLOR)
+        static_path = (
+            run_dir / "static_depth" / f"{frame.frame_index:08d}.png"
+        )
+        static_raw = cv2.imread(str(static_path), cv2.IMREAD_UNCHANGED)
+        if rgb_bgr is None:
+            raise FileNotFoundError(
+                f"Hydra semantic postpass RGB frame is missing: {frame.rgb_path}"
+            )
+        if static_raw is None:
+            raise FileNotFoundError(
+                "Hydra semantic postpass requires committed static depth for frame "
+                f"{frame.frame_index}: {static_path}"
+            )
+        labels = load_semantic_label(
+            semantic_label_dir, frame.frame_index
+        )
+        if static_raw.shape != rgb_bgr.shape[:2] or labels.shape != static_raw.shape:
+            raise ValueError(
+                "Hydra semantic postpass RGB/depth/label dimensions differ for "
+                f"frame {frame.frame_index}"
+            )
+        label_path = semantic_label_path(
+            semantic_label_dir, frame.frame_index
+        )
+        label_sha256 = sha256_file(label_path)
+        binding = bindings[frame.frame_index]
+        label_manifest_digest.update(
+            (
+                f"{frame.frame_index}:{frame.sensor_time_ns}:{label_sha256}:"
+                f"{binding['metadata_sha256']}\n"
+            ).encode("ascii")
+        )
+        frame_nonzero = int(np.count_nonzero(labels))
+        nonzero_frames += int(frame_nonzero > 0)
+        nonzero_pixels += frame_nonzero
+        unique_labels.update(int(value) for value in np.unique(labels))
+        backend.integrate(
+            sensor_time_ns=frame.sensor_time_ns,
+            rgb_image=cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB),
+            static_depth_m=static_raw.astype(np.float32) / 1000.0,
+            world_T_camera=frame.world_T_camera,
+            semantic_labels=labels,
+        )
+
+    expected = len(selected)
+    return {
+        "schema": "daaam.hydra_semantic_postpass.v1",
+        "status": "complete",
+        "frames_expected": expected,
+        "frames_replayed": expected,
+        "frames_with_labels": expected,
+        "label_coverage": 1.0 if expected else 0.0,
+        "missing_frame_indices": [],
+        "nonzero_label_frames": nonzero_frames,
+        "nonzero_label_pixels": nonzero_pixels,
+        "unique_semantic_labels": sorted(unique_labels),
+        "label_manifest_sha256": label_manifest_digest.hexdigest(),
+        "label_run_configuration_sha256": run_configuration_sha256,
+        "semantic_label_directory": str(semantic_label_dir.resolve()),
+    }
+
+
+def rebuild_and_promote_semantic_hydra(
+    live_backend: HydraStaticMapBackend,
+    run_dir: Path,
+    frames: list[ReplayFrame],
+    completed_indices: set[int],
+    semantic_label_dir: Path,
+    run_configuration_sha256: str,
+) -> tuple[HydraStaticMapBackend, dict[str, object]]:
+    """Replace live Hydra state with an isolated-process semantic postpass."""
+
+    if not frames:
+        raise ValueError("Hydra semantic postpass requires at least one frame")
+    selected, _ = validate_semantic_label_coverage(
+        frames,
+        completed_indices,
+        semantic_label_dir,
+        run_configuration_sha256,
+    )
+    if not selected:
+        raise ValueError("Hydra semantic postpass has no committed frames")
+    final_output_dir = live_backend.output_dir
+    temporary_output_dir = final_output_dir.with_name(
+        f".{final_output_dir.name}.semantic-postpass.tmp"
+    )
+    if temporary_output_dir.exists():
+        shutil.rmtree(temporary_output_dir)
+
+    live_stats = live_backend.stats()
+    sidecar_dir = run_dir / "semantic_sidecar"
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    plan_path = sidecar_dir / "hydra_semantic_postpass_plan.json"
+    child_report_path = sidecar_dir / "hydra_semantic_postpass_child.json"
+    child_report_path.unlink(missing_ok=True)
+    plan = {
+        "schema": "daaam.hydra_semantic_postpass_plan.v1",
+        "run_dir": str(run_dir.resolve()),
+        "output_dir": str(temporary_output_dir.resolve()),
+        "semantic_label_dir": str(semantic_label_dir.resolve()),
+        "label_run_configuration_sha256": run_configuration_sha256,
+        "hydra_config_path": str(live_backend.hydra_config_path),
+        "labelspace_path": (
+            None
+            if live_backend.labelspace_path is None
+            else str(live_backend.labelspace_path)
+        ),
+        "labelspace_colors": (
+            None
+            if live_backend.labelspace_colors is None
+            else str(live_backend.labelspace_colors)
+        ),
+        "maximum_depth_m": live_backend.maximum_depth_m,
+        "frames": [
+            {
+                "frame_index": frame.frame_index,
+                "sensor_time_ns": frame.sensor_time_ns,
+                "rgb_path": str(frame.rgb_path.resolve()),
+                "world_T_camera": frame.world_T_camera.tolist(),
+                "intrinsics": frame.intrinsics.tolist(),
+            }
+            for frame in selected
+        ],
+    }
+    plan_temporary = plan_path.with_name(f".{plan_path.name}.tmp")
+    plan_temporary.write_text(json.dumps(plan, indent=2, allow_nan=False) + "\n")
+    plan_temporary.replace(plan_path)
+
+    stdout_path = sidecar_dir / "hydra_semantic_postpass.stdout.log"
+    stderr_path = sidecar_dir / "hydra_semantic_postpass.stderr.log"
+    command = [
+        sys.executable,
+        str(REPOSITORY_ROOT / "scripts" / "run_hydra_semantic_postpass.py"),
+        "--plan",
+        str(plan_path),
+        "--report",
+        str(child_report_path),
+    ]
+    expected = len(selected)
+    # The floor catches startup deadlocks promptly on smoke runs; the per-frame
+    # allowance gives a 1098-frame authoritative replay more than 45 minutes.
+    postpass_timeout_s = max(300.0, expected * 2.5)
+    backup_output_dir = final_output_dir.with_name(
+        f".{final_output_dir.name}.pre-semantic-postpass.{uuid.uuid4().hex}.bak"
+    )
+    backup_created = False
+    replacement_installed = False
+    try:
+        live_backend.close(finalize=False)
+        try:
+            with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
+                result = subprocess.run(
+                    command,
+                    stdout=stdout,
+                    stderr=stderr,
+                    check=False,
+                    timeout=postpass_timeout_s,
+                )
+        except subprocess.TimeoutExpired as error:
+            stderr_tail = (
+                stderr_path.read_text(errors="replace")[-4000:]
+                if stderr_path.is_file()
+                else ""
+            )
+            raise RuntimeError(
+                "isolated Hydra semantic postpass exceeded its timeout "
+                f"({postpass_timeout_s:.1f}s): {stderr_tail}"
+            ) from error
+        if result.returncode != 0:
+            stderr_tail = stderr_path.read_text(errors="replace")[-4000:]
+            raise RuntimeError(
+                "isolated Hydra semantic postpass failed with exit code "
+                f"{result.returncode}: {stderr_tail}"
+            )
+        if not child_report_path.is_file():
+            raise RuntimeError("isolated Hydra semantic postpass produced no report")
+        report = json.loads(child_report_path.read_text())
+        if (
+            report.get("status") != "complete"
+            or int(report.get("frames_expected", -1)) != expected
+            or int(report.get("frames_replayed", -1)) != expected
+            or int(report.get("frames_with_labels", -1)) != expected
+            or float(report.get("label_coverage", 0.0)) != 1.0
+            or report.get("missing_frame_indices")
+            or report.get("label_run_configuration_sha256")
+            != run_configuration_sha256
+        ):
+            raise RuntimeError(
+                "isolated Hydra semantic postpass failed its coverage contract"
+            )
+        required_outputs = (
+            temporary_output_dir / "backend" / "mesh.ply",
+            temporary_output_dir / "backend" / "dsg.json",
+        )
+        missing_outputs = [
+            str(path) for path in required_outputs if not path.is_file()
+        ]
+        if missing_outputs:
+            raise RuntimeError(
+                "isolated Hydra semantic postpass output is incomplete: "
+                + ", ".join(missing_outputs)
+            )
+
+        if final_output_dir.exists():
+            final_output_dir.replace(backup_output_dir)
+            backup_created = True
+        try:
+            temporary_output_dir.replace(final_output_dir)
+            replacement_installed = True
+            adopted_backend = HydraStaticMapBackend(
+                live_backend.hydra_config_path,
+                final_output_dir,
+                labelspace_path=live_backend.labelspace_path,
+                labelspace_colors=live_backend.labelspace_colors,
+                maximum_depth_m=live_backend.maximum_depth_m,
+            )
+            adopted_backend.adopt_finalized_output(report.get("backend_stats"))
+        except BaseException:
+            if replacement_installed and final_output_dir.exists():
+                shutil.rmtree(final_output_dir)
+                replacement_installed = False
+            if backup_created and backup_output_dir.exists():
+                backup_output_dir.replace(final_output_dir)
+                backup_created = False
+            raise
+
+        if backup_created:
+            shutil.rmtree(backup_output_dir)
+            backup_created = False
+        report.update(
+            {
+                "output_dir": str(final_output_dir),
+                "live_geometry_frames_discarded": int(
+                    live_stats.get("frames_processed", 0)
+                ),
+                "postpass_promoted": True,
+                "postpass_timeout_seconds": postpass_timeout_s,
+                "plan": str(plan_path),
+                "plan_sha256": sha256_file(plan_path),
+                "stdout_log": str(stdout_path),
+                "stderr_log": str(stderr_path),
+            }
+        )
+        return adopted_backend, report
+    finally:
+        if temporary_output_dir.exists():
+            shutil.rmtree(temporary_output_dir)
+
+
 def add_semantic_runtime_metrics(
     scheduler_report: dict,
     semantic_stats: dict,
@@ -1468,6 +1858,47 @@ def add_semantic_runtime_metrics(
         }
 
 
+def evaluate_dam_runtime_gate(semantic_stats: dict) -> dict:
+    """Build a non-bypassable audit gate for DAM startup and final catch-up."""
+
+    startup = semantic_stats.get("startup") or {}
+    catchup = semantic_stats.get("prompt_catchup") or {}
+    grounding = semantic_stats.get("grounding_workers") or {}
+    shutdown = grounding.get("shutdown") or {}
+    workers = grounding.get("workers") or []
+    checks = {
+        "ready_before_first_frame": bool(
+            startup.get("ready_before_first_frame")
+        ),
+        "prompt_catchup_complete": bool(catchup.get("complete"))
+        and int(catchup.get("pending_entities", 0)) == 0
+        and int(catchup.get("unsubmitted_entities", 0)) == 0,
+        "grounding_fifo_drained": bool(grounding.get("all_ready"))
+        and bool(workers)
+        and bool(shutdown.get("drain_requested"))
+        and bool(shutdown.get("drain_complete"))
+        and bool(shutdown.get("correction_tail_enqueued"))
+        and not bool(shutdown.get("timed_out"))
+        and not bool(shutdown.get("forced_termination"))
+        and not shutdown.get("error")
+        and all(
+            bool(worker.get("drained"))
+            and not bool(worker.get("is_alive"))
+            and worker.get("exitcode") == 0
+            and not bool(worker.get("timed_out"))
+            and not bool(worker.get("forced_termination"))
+            for worker in workers
+        ),
+    }
+    failures = [name for name, passed in checks.items() if not passed]
+    return {
+        "schema": "daaam.dam_runtime_gate.v1",
+        "passed": not failures,
+        "checks": checks,
+        "failures": failures,
+    }
+
+
 def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
     args = parse_args()
     requested_stop_after = args.stop_after
@@ -1487,11 +1918,21 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         or args.semantic_frontend_rate_hz <= 0
         or args.semantic_queue_capacity <= 0
         or args.semantic_minimum_observations <= 0
+        or args.semantic_startup_timeout_s <= 0
         or args.semantic_drain_timeout_s <= 0
         or args.dam_minimum_gpu_idle_s < 0
     ):
         raise ValueError(
-            "Semantic rates, queues, observations, and drain timeout must be positive"
+            "Semantic rates, queues, observations, and timeouts must be positive"
+        )
+    if (
+        args.entity_merge_distance_m <= 0
+        or args.object_binding_maximum_center_distance_m <= 0
+        or args.object_binding_maximum_aabb_gap_m < 0
+    ):
+        raise ValueError(
+            "Entity merge and object-binding center distances must be positive; "
+            "the object-binding AABB gap must be non-negative"
         )
     if args.semantic_mode != "disabled" and not args.semantic_config.is_file():
         raise ValueError("Real semantic mode requires a valid --semantic-config")
@@ -1504,6 +1945,15 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             raise ValueError("Hydra static map backend requires a valid config path")
     if args.semantic_mode == "dam" and args.static_map_backend != "hydra":
         raise ValueError("DAM mode requires the Hydra backend for durable DSG ACKs")
+    if (
+        args.semantic_mode != "disabled"
+        and args.static_map_backend == "hydra"
+        and args.no_write_fusion_products
+    ):
+        raise ValueError(
+            "Hydra semantic postpass requires persisted static fusion products; "
+            "remove --no-write-fusion-products"
+        )
     dataset = args.dataset.resolve()
     precomputed_depth_provenance = (
         load_precomputed_depth_provenance(dataset)
@@ -1592,18 +2042,6 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         if args.gpu_sharing_mode == "staggered"
         else None
     )
-    gpu_coordinator = SharedGpuCoordinator(
-        lock_path=gpu_lock_path,
-        activity_path=gpu_activity_path,
-    )
-    gpu_activity_heartbeat_interval_s = (
-        min(0.25, args.dam_minimum_gpu_idle_s / 3.0)
-        if args.semantic_mode == "dam"
-        and gpu_activity_path is not None
-        and args.dam_minimum_gpu_idle_s > 0.0
-        else None
-    )
-
     configuration = {
         "stop_after": args.stop_after,
         "requested_stop_after": requested_stop_after,
@@ -1624,6 +2062,9 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         "motion_analysis_width": args.motion_analysis_width,
         "submap_frames": args.submap_frames,
         "checkpoint_interval_frames": args.checkpoint_interval_frames,
+        "map_memory": {
+            "entity_merge_distance_m": args.entity_merge_distance_m,
+        },
         "static_map_backend": args.static_map_backend,
         "hydra_config_path": (
             str(args.hydra_config_path.resolve())
@@ -1635,6 +2076,26 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             if args.hydra_config_path is not None
             else None
         ),
+        "hydra_labelspace_path": (
+            str(args.hydra_labelspace_path.resolve())
+            if args.hydra_labelspace_path is not None
+            else None
+        ),
+        "hydra_labelspace_sha256": (
+            sha256_file(args.hydra_labelspace_path)
+            if args.hydra_labelspace_path is not None
+            else None
+        ),
+        "hydra_labelspace_colors": (
+            str(args.hydra_labelspace_colors.resolve())
+            if args.hydra_labelspace_colors is not None
+            else None
+        ),
+        "hydra_labelspace_colors_sha256": (
+            sha256_file(args.hydra_labelspace_colors)
+            if args.hydra_labelspace_colors is not None
+            else None
+        ),
         "semantic": {
             "mode": args.semantic_mode,
             "config": str(args.semantic_config.resolve()),
@@ -1643,6 +2104,15 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             "frontend_rate_hz": args.semantic_frontend_rate_hz,
             "queue_capacity": args.semantic_queue_capacity,
             "minimum_observations": args.semantic_minimum_observations,
+            "object_binding_policy": {
+                "maximum_center_distance_m": (
+                    args.object_binding_maximum_center_distance_m
+                ),
+                "maximum_aabb_gap_m": (
+                    args.object_binding_maximum_aabb_gap_m
+                ),
+            },
+            "startup_timeout_s": args.semantic_startup_timeout_s,
             "drain_timeout_s": args.semantic_drain_timeout_s,
         },
         "gpu_coordination": {
@@ -1652,7 +2122,8 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
                 str(gpu_activity_path) if gpu_activity_path is not None else None
             ),
             "dam_minimum_idle_s": args.dam_minimum_gpu_idle_s,
-            "activity_heartbeat_interval_s": gpu_activity_heartbeat_interval_s,
+            "activity_scope": "gpu_lease",
+            "activity_heartbeat_interval_s": 0.25,
         },
         "quality_config": str(args.quality_config.resolve()),
         "quality_config_sha256": sha256_file(args.quality_config),
@@ -1730,6 +2201,61 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             "semantic_frontend": semantic_model_provenance,
         },
     )
+    semantic_implementation_paths = (
+        Path("scripts/run_realtime_mapping.py"),
+        Path("scripts/run_hydra_semantic_postpass.py"),
+        Path("src/daaam/realtime/semantic.py"),
+        Path("src/daaam/realtime/semantic_labels.py"),
+        Path("src/daaam/segmentation/interfaces.py"),
+        Path("src/daaam/segmentation/services.py"),
+        Path("src/daaam/tracking/interfaces.py"),
+        Path("src/daaam/tracking/models.py"),
+        Path("src/daaam/tracking/services.py"),
+        Path("src/daaam/grounding/services.py"),
+        Path("src/daaam/grounding/workers/dam_grounding.py"),
+    )
+    semantic_implementation = {
+        str(relative_path): sha256_file(REPOSITORY_ROOT / relative_path)
+        for relative_path in semantic_implementation_paths
+    }
+    semantic_implementation_sha256 = hashlib.sha256(
+        json.dumps(
+            semantic_implementation,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    label_run_binding = {
+        "schema": "daaam.semantic_label_run_binding.v1",
+        "repository_git_sha": manifest["repository"]["git_sha"],
+        "implementation_sha256": semantic_implementation_sha256,
+        "implementation_files": semantic_implementation,
+        "dataset": json.loads(json.dumps(manifest["dataset"])),
+        "configuration": json.loads(json.dumps(configuration)),
+        "models": json.loads(json.dumps(manifest["models"])),
+        "time_contract": json.loads(json.dumps(time_contract)),
+    }
+    label_run_configuration_sha256 = hashlib.sha256(
+        json.dumps(
+            label_run_binding,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    configuration["semantic"]["label_run_configuration_sha256"] = (
+        label_run_configuration_sha256
+    )
+    configuration["semantic"]["implementation_sha256"] = (
+        semantic_implementation_sha256
+    )
+    manifest["configuration"]["semantic"][
+        "label_run_configuration_sha256"
+    ] = label_run_configuration_sha256
+    manifest["configuration"]["semantic"]["implementation_sha256"] = (
+        semantic_implementation_sha256
+    )
+    manifest["semantic_label_run_binding"] = label_run_binding
     write_run_manifest(run_dir / "run_manifest.json", manifest)
     if args.dry_run:
         plan = {
@@ -1770,6 +2296,18 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             raise FileNotFoundError("--resume requested but checkpoint is missing")
         checkpoint_state = checkpoint.state
     start_index = terminal_prefix(checkpoint, len(frames)) if args.resume else 0
+    if (
+        args.resume
+        and args.semantic_mode != "disabled"
+        and args.static_map_backend == "hydra"
+        and checkpoint.completed_indices
+    ):
+        validate_semantic_label_coverage(
+            frames,
+            checkpoint.completed_indices,
+            run_dir / "semantic_sidecar" / SEMANTIC_LABEL_DIRECTORY,
+            label_run_configuration_sha256,
+        )
     depth_worker = None
     static_map_backend = None
     depth_backend_startup_seconds = 0.0
@@ -1823,7 +2361,7 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             hydra_output_dir,
             labelspace_path=args.hydra_labelspace_path,
             labelspace_colors=args.hydra_labelspace_colors,
-            maximum_depth_m=float(metadata.get("recommended_max_depth_m", 20.0)),
+            maximum_depth_m=float(metadata.get("recommended_max_depth_m", 5.0)),
         )
         resources.static_map_backend = static_map_backend
         static_map_backend.initialize(
@@ -1842,10 +2380,12 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         submap_frames=args.submap_frames,
         checkpoint_interval_frames=args.checkpoint_interval_frames,
         write_fusion_products=not args.no_write_fusion_products,
+        time_origin_ns=int(time_contract["time_origin_ns"]),
+        entity_merge_distance_m=args.entity_merge_distance_m,
         depth_worker=depth_worker,
         stereo_fx=float(metadata.get("fx", frames[0].intrinsics[0, 0])),
         stereo_baseline_m=float(metadata["baseline"]),
-        maximum_depth_m=float(metadata.get("recommended_max_depth_m", 20.0)),
+        maximum_depth_m=float(metadata.get("recommended_max_depth_m", 5.0)),
         depth_confidence_mode=args.depth_confidence_mode,
         depth_lr_interval=args.depth_lr_interval,
         static_map_backend=static_map_backend,
@@ -1893,7 +2433,6 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         pipeline_config.workers.dam_grounding_config.gpu_minimum_idle_s = (
             args.dam_minimum_gpu_idle_s
         )
-        gpu_coordinator.touch_activity()
         semantic_started = time.monotonic()
         semantic_adapter = RealtimeSemanticAdapter(
             pipeline_config,
@@ -1905,20 +2444,26 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
                 minimum_observations=args.semantic_minimum_observations,
                 prompt_queue_capacity=max(2, args.semantic_queue_capacity * 10),
                 correction_queue_capacity=max(10, args.semantic_queue_capacity * 20),
+                grounding_startup_timeout_s=args.semantic_startup_timeout_s,
                 grounding_enabled=args.semantic_mode == "dam",
+                object_binding_maximum_center_distance_m=(
+                    args.object_binding_maximum_center_distance_m
+                ),
+                object_binding_maximum_aabb_gap_m=(
+                    args.object_binding_maximum_aabb_gap_m
+                ),
                 gpu_lock_path=gpu_lock_path,
                 gpu_activity_path=gpu_activity_path,
+                label_run_configuration_sha256=(
+                    label_run_configuration_sha256
+                ),
             ),
         )
         resources.semantic_adapter = semantic_adapter
-        if gpu_activity_heartbeat_interval_s is not None:
-            resources.gpu_activity_heartbeat = (
-                gpu_coordinator.start_activity_heartbeat(
-                    interval_s=gpu_activity_heartbeat_interval_s,
-                )
-            )
         semantic_adapter.start()
-        engine.semantic_label_provider = semantic_adapter.label_image_for
+        # Hydra's live geometry pass must never race the asynchronous semantic
+        # branch. Exact labels are fused deterministically in the final postpass.
+        engine.semantic_label_provider = None
         semantic_startup_seconds = time.monotonic() - semantic_started
 
     injector = FaultInjector(
@@ -1989,7 +2534,6 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
     dispatched = 0
     replay_sleep_seconds = 0.0
     for frame in source_frames:
-        gpu_coordinator.touch_activity()
         if not args.no_throttle and previous_source_time is not None:
             capture_delta_s = (frame.sensor_time_ns - previous_source_time) / 1e9
             scaled_delay = capture_delta_s * nominal_hz / args.rate_hz
@@ -2023,12 +2567,33 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
     if resources.gpu_activity_heartbeat is not None:
         resources.gpu_activity_heartbeat.stop()
         resources.gpu_activity_heartbeat = None
+    semantic_postpass = None
     if "global" in enabled_stages:
         engine.finalize_paths()
-        engine.finalize_static_map()
+        if semantic_adapter is not None and static_map_backend is not None:
+            static_map_backend, semantic_postpass = (
+                rebuild_and_promote_semantic_hydra(
+                    static_map_backend,
+                    run_dir,
+                    frames,
+                    checkpoint.completed_indices,
+                    run_dir
+                    / "semantic_sidecar"
+                    / SEMANTIC_LABEL_DIRECTORY,
+                    label_run_configuration_sha256,
+                )
+            )
+            engine.static_map_backend = static_map_backend
+            resources.static_map_backend = static_map_backend
+            (run_dir / "hydra_semantic_postpass.json").write_text(
+                json.dumps(semantic_postpass, indent=2, allow_nan=False) + "\n"
+            )
+        else:
+            engine.finalize_static_map()
     else:
         engine.flush_checkpoint()
     semantic_stats = None
+    dam_runtime_gate = None
     if semantic_adapter is not None:
         if static_map_backend is not None:
             semantic_adapter.attach_hydra_dsg(
@@ -2038,6 +2603,9 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             timeout_s=args.semantic_drain_timeout_s,
             drain=True,
         )
+        if args.semantic_mode == "dam":
+            dam_runtime_gate = evaluate_dam_runtime_gate(semantic_stats)
+            semantic_stats["runtime_gate"] = dam_runtime_gate
         resources.semantic_adapter = None
         add_semantic_runtime_metrics(scheduler_report, semantic_stats)
         scheduler_report["semantic_sidecar"] = semantic_stats
@@ -2060,6 +2628,8 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
     )
     context = engine.quality_context(scheduler_report, map_metrics=map_metrics)
     context["time"] = time_contract
+    if semantic_postpass is not None:
+        context["semantic_postpass"] = semantic_postpass
     if args.semantic_mode == "dam":
         assert semantic_stats is not None
         corrections = semantic_stats.get("memory", {}).get("corrections", {})
@@ -2068,6 +2638,8 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             "required": True,
             "submitted": int(semantic_stats.get("corrections_submitted", 0)),
             "prompts_submitted": int(semantic_stats.get("prompts_submitted", 0)),
+            "prompt_catchup": semantic_stats.get("prompt_catchup", {}),
+            "runtime_gate": dam_runtime_gate,
             "dsg": semantic_stats.get("dsg", {}),
             "grounding_workers": semantic_stats.get("grounding_workers", {}),
         }
@@ -2094,7 +2666,14 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             "drain_timeout"
             if not idle
             else (
-                "stage_error" if scheduler_report.get("handler_errors") else "complete"
+                "stage_error"
+                if scheduler_report.get("handler_errors")
+                else (
+                    "semantic_runtime_failure"
+                    if dam_runtime_gate is not None
+                    and not dam_runtime_gate["passed"]
+                    else "complete"
+                )
             )
         ),
         "dataset": str(dataset),
@@ -2124,6 +2703,8 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         "semantic_mode": args.semantic_mode,
         "semantic_startup_seconds": semantic_startup_seconds,
         "semantic_stats": semantic_stats,
+        "semantic_postpass": semantic_postpass,
+        "dam_runtime_gate": dam_runtime_gate,
         "left_right_verified_frames": engine.left_right_verified_frames,
         "depth_frames_evaluated": engine.depth_frames_evaluated,
         "left_right_coverage": (
@@ -2138,8 +2719,16 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             "sleep_seconds": replay_sleep_seconds,
             "absolute_timestamps_preserved": True,
         },
-        "quality_passed": quality["passed"],
-        "hard_quality_failures": quality["hard_failures"],
+        "quality_passed": quality["passed"]
+        and (
+            dam_runtime_gate is None or bool(dam_runtime_gate["passed"])
+        ),
+        "hard_quality_failures": int(quality["hard_failures"])
+        + (
+            0
+            if dam_runtime_gate is None or dam_runtime_gate["passed"]
+            else len(dam_runtime_gate["failures"])
+        ),
     }
     cleanup_errors = cleanup_realtime_resources(resources)
     if cleanup_errors:
@@ -2152,6 +2741,8 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
     print(json.dumps(report, indent=2, allow_nan=False))
     if not idle:
         raise SystemExit(3)
+    if dam_runtime_gate is not None and not dam_runtime_gate["passed"]:
+        raise SystemExit(4)
     if not quality["passed"] and not args.quality_report_only:
         raise SystemExit(2)
 

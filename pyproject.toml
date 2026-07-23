@@ -22,9 +22,26 @@ classifiers = [
 requires-python = ">=3.12"
 dynamic = ["version"]
 
+[project.optional-dependencies]
+dashboard = [
+    "fastapi>=0.115,<1",
+    "numpy>=1.26,<3",
+    "opencv-python>=4.10,<5",
+    "uvicorn>=0.30,<1",
+]
+query-ui = [
+    "fastapi>=0.115,<1",
+    "matplotlib>=3.9,<4",
+    "numpy>=1.26,<3",
+    "uvicorn>=0.30,<1",
+]
+
 [project.urls]
 Source = "https://github.com/MIT-SPARK/DAAAM"
 Tracker = "https://github.com/MIT-SPARK/DAAAM/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+daaam = ["query_static/*.css", "query_static/*.html", "query_static/*.js"]

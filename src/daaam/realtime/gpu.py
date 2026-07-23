@@ -129,6 +129,37 @@ class SharedGpuCoordinator:
     ) -> GpuActivityHeartbeat:
         return GpuActivityHeartbeat(self, interval_s=interval_s).start()
 
+    @contextmanager
+    def active_lease(
+        self,
+        stop_event: Optional[StopEvent] = None,
+        *,
+        heartbeat_interval_s: float = 0.25,
+    ) -> Iterator[None]:
+        """Hold the GPU lock and mark activity only while GPU work is running.
+
+        The final touch is important for background clients with a minimum-idle
+        requirement: their quiet period starts when foreground GPU work ends,
+        rather than when a frame was dispatched or a long-lived service started.
+        """
+
+        if heartbeat_interval_s <= 0.0:
+            raise ValueError("GPU activity heartbeat interval must be positive")
+        with self.lease(stop_event):
+            if self.activity_path is None:
+                yield
+                return
+            heartbeat = self.start_activity_heartbeat(
+                interval_s=heartbeat_interval_s
+            )
+            try:
+                yield
+            finally:
+                try:
+                    heartbeat.stop()
+                finally:
+                    self.touch_activity()
+
     @staticmethod
     def _cancelled(stop_event: Optional[StopEvent]) -> bool:
         return bool(stop_event is not None and stop_event.is_set())

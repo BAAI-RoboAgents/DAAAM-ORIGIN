@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Attach DAAAM descriptions and sentence embeddings to a Hydra ZED DSG."""
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
@@ -11,6 +13,7 @@ import torch
 import yaml
 
 from daaam.utils.embedding import SentenceEmbeddingHandler
+from daaam.semantic_query import DEFAULT_SENTENCE_MODEL
 
 
 UNKNOWN_LABELS = {"", "unknown", "none", "null"}
@@ -67,6 +70,7 @@ def attach_query_metadata(
     scene_graph: sdsg.DynamicSceneGraph,
     descriptions: Mapping[int, Mapping[str, Any]],
     embeddings: Mapping[int, Any],
+    model_name: str = DEFAULT_SENTENCE_MODEL,
 ) -> int:
     """Attach text metadata to object nodes and the graph-level feature table."""
     features: Dict[str, Dict[str, Any]] = {
@@ -89,8 +93,58 @@ def attach_query_metadata(
     scene_features = dict(scene_metadata.get("features", {}))
     scene_features.update(features)
     scene_metadata["features"] = scene_features
+    dimension = len(next(iter(embeddings.values())))
+    scene_metadata["query_embedding"] = {
+        "schema_version": 1,
+        "model": model_name,
+        "dimension": dimension,
+        "normalized": True,
+    }
     scene_graph.metadata.set(scene_metadata)
     return updated
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_query_manifest(
+    output_path: Path,
+    source_path: Path,
+    *,
+    model_name: str,
+    embedding_dimension: int,
+    queryable_objects: int,
+) -> Path:
+    """Write the checksum-bound embedding contract consumed by query services."""
+    manifest_path = output_path.with_suffix(".manifest.json")
+    manifest = {
+        "schema_version": 1,
+        "dsg_file": output_path.name,
+        "dsg_sha256": sha256(output_path),
+        "queryable_objects": queryable_objects,
+        "embedding": {
+            "field": "attributes.metadata.sentence_embedding_feature",
+            "model": model_name,
+            "dimension": embedding_dimension,
+            "normalized": True,
+        },
+        "source": {
+            "dsg_file": str(source_path),
+            "dsg_sha256": sha256(source_path),
+        },
+    }
+    temporary_path = manifest_path.with_name(f".{manifest_path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(manifest_path)
+    return manifest_path
 
 
 @click.command()
@@ -115,7 +169,7 @@ def attach_query_metadata(
 )
 @click.option(
     "--sentence-model-name",
-    default="sentence-transformers/sentence-t5-large",
+    default=DEFAULT_SENTENCE_MODEL,
     show_default=True,
     envvar="DAAAM_QUERY_SENTENCE_EMBEDDING_MODEL_NAME",
 )
@@ -151,7 +205,9 @@ def main(
         descriptions = build_description_map(yaml.safe_load(stream) or {})
     embeddings = compute_sentence_embeddings(descriptions, sentence_model_name)
     scene_graph = sdsg.DynamicSceneGraph.load(str(dsg_path))
-    updated = attach_query_metadata(scene_graph, descriptions, embeddings)
+    updated = attach_query_metadata(
+        scene_graph, descriptions, embeddings, sentence_model_name
+    )
     object_count = scene_graph.get_layer(sdsg.DsgLayers.OBJECTS).num_nodes()
     if updated == 0:
         raise ValueError("No Hydra object nodes matched DAAAM descriptions")
@@ -159,10 +215,20 @@ def main(
         raise ValueError(
             f"Only {updated}/{object_count} object nodes matched DAAAM descriptions"
         )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     scene_graph.save(str(output_path))
+    embedding_dimension = len(next(iter(embeddings.values())))
+    manifest_path = write_query_manifest(
+        output_path,
+        dsg_path,
+        model_name=sentence_model_name,
+        embedding_dimension=embedding_dimension,
+        queryable_objects=updated,
+    )
     click.echo(
         f"Saved {output_path}: {updated}/{object_count} object nodes, "
-        f"{len(descriptions)} descriptions, {len(next(iter(embeddings.values())))}D embeddings"
+        f"{len(descriptions)} descriptions, {embedding_dimension}D embeddings; "
+        f"manifest={manifest_path}"
     )
 
 

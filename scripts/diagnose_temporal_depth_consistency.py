@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         help="Sampling interval in source pixels.",
     )
     parser.add_argument("--min-depth-m", type=float, default=0.25)
-    parser.add_argument("--max-depth-m", type=float, default=3.0)
+    parser.add_argument("--max-depth-m", type=float, default=5.0)
     parser.add_argument(
         "--absolute-tolerance-m",
         type=float,

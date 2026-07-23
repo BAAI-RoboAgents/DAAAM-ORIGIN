@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#f3f6fa" />
+    <meta
+      name="description"
+      content="DAAAM 语义地图构建流程控制台：配置、启动并观察各处理模块与质量门状态。"
+    />
+    <title>DAAAM · 语义地图构建控制台</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#dag-viewport">跳到流程画布</a>
+
+    <div class="app-shell" id="app">
+      <header class="run-bar">
+        <div class="brand-cluster">
+          <button
+            class="icon-button mobile-only"
+            id="open-left-panel"
+            type="button"
+            aria-label="打开流程与运行列表"
+            aria-controls="left-panel"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
+          </button>
+          <div class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span><span></span>
+          </div>
+          <div class="brand-copy">
+            <div class="brand-title">DAAAM</div>
+            <div class="brand-subtitle">语义地图构建控制台</div>
+          </div>
+        </div>
+
+        <div class="run-overview" aria-live="polite">
+          <div class="run-identity">
+            <span class="eyebrow">当前任务</span>
+            <div class="run-name-row">
+              <strong id="active-workflow-name">正在载入流程…</strong>
+              <span class="status-pill status-idle" id="global-status">
+                <span class="status-dot"></span>
+                <span id="global-status-label">待机</span>
+              </span>
+            </div>
+          </div>
+          <div class="top-metrics" aria-label="运行概览">
+            <div class="top-metric">
+              <span>运行编号</span>
+              <strong id="header-run-id">—</strong>
+            </div>
+            <div class="top-metric">
+              <span>完成进度</span>
+              <strong id="header-progress">—</strong>
+            </div>
+            <div class="top-metric">
+              <span>已用时间</span>
+              <strong id="header-elapsed">00:00</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="run-actions">
+          <button class="button button-secondary" id="preview-button" type="button">
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="m8 9-4 3 4 3M16 9l4 3-4 3M14 5l-4 14" />
+            </svg>
+            <span>命令预览</span>
+          </button>
+          <button class="button button-primary" id="start-button" type="button" disabled>
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="m9 7 8 5-8 5Z" />
+            </svg>
+            <span>启动构建</span>
+          </button>
+          <button class="button button-danger is-hidden" id="stop-button" type="button">
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <rect x="7" y="7" width="10" height="10" rx="1" />
+            </svg>
+            <span>停止</span>
+          </button>
+          <button
+            class="icon-button details-toggle"
+            id="open-right-panel"
+            type="button"
+            aria-label="打开模块详情"
+            aria-controls="right-panel"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 11v6M12 7.5v.5" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <main class="workspace-grid">
+        <aside class="left-panel panel" id="left-panel" aria-label="流程和运行选择">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">Workspace</span>
+              <h2>构建工作区</h2>
+            </div>
+            <button class="icon-button panel-close" id="close-left-panel" type="button" aria-label="关闭侧栏">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17" /></svg>
+            </button>
+          </div>
+
+          <div class="rail-scroll">
+            <section class="rail-section workflow-section">
+              <label class="field-label" for="workflow-select">构建流程</label>
+              <div class="select-wrap">
+                <select id="workflow-select" disabled>
+                  <option>正在载入…</option>
+                </select>
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m8 10 4 4 4-4" /></svg>
+              </div>
+              <p class="muted-copy" id="workflow-description">正在读取服务端流程定义。</p>
+              <div class="workflow-stats">
+                <span><b id="workflow-node-count">0</b> 个模块</span>
+                <span><b id="workflow-edge-count">0</b> 条依赖</span>
+              </div>
+            </section>
+
+            <section class="rail-section">
+              <div class="section-title-row">
+                <h3>运行记录</h3>
+                <button class="text-button" id="refresh-runs-button" type="button">刷新</button>
+              </div>
+              <div class="run-list" id="run-list" role="listbox" aria-label="历史运行">
+                <div class="skeleton-stack" aria-hidden="true">
+                  <span></span><span></span><span></span>
+                </div>
+              </div>
+            </section>
+
+            <section class="rail-section">
+              <div class="section-title-row">
+                <h3>参数方案</h3>
+                <span class="count-chip" id="preset-count">0</span>
+              </div>
+              <div class="preset-list" id="preset-list">
+                <p class="empty-compact">当前流程没有预设方案。</p>
+              </div>
+            </section>
+
+            <section class="rail-section progress-reminder-section">
+              <div class="section-title-row">
+                <h3>进度提醒</h3>
+                <span class="reminder-indicator" id="progress-reminder-indicator" aria-hidden="true"></span>
+              </div>
+              <div class="reminder-setting-row">
+                <label for="progress-reminder-select">首次提醒</label>
+                <div class="select-wrap reminder-select-wrap">
+                  <select id="progress-reminder-select">
+                    <option value="0">关闭</option>
+                    <option value="5">5 分钟</option>
+                    <option value="10">10 分钟</option>
+                    <option value="20">20 分钟</option>
+                    <option value="30">30 分钟</option>
+                    <option value="60">60 分钟</option>
+                  </select>
+                  <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m8 10 4 4 4-4" /></svg>
+                </div>
+              </div>
+              <p class="muted-copy reminder-copy" id="progress-reminder-copy" aria-live="polite">
+                长任务会显示阶段、耗时和完成进度。
+              </p>
+            </section>
+          </div>
+
+          <div class="connection-card" id="connection-card">
+            <span class="connection-indicator" id="connection-indicator"></span>
+            <div>
+              <strong id="connection-title">正在连接服务</strong>
+              <span id="connection-copy">等待工作流清单</span>
+            </div>
+          </div>
+        </aside>
+
+        <section class="canvas-panel panel" aria-label="构建流程图">
+          <header class="canvas-toolbar">
+            <div class="canvas-title">
+              <div class="breadcrumb">
+                <span>语义地图</span>
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6" /></svg>
+                <strong id="canvas-workflow-name">构建流程</strong>
+              </div>
+              <span class="canvas-caption" id="canvas-caption">点击模块可查看职责、输入输出及实时指标</span>
+            </div>
+            <div class="category-filters" id="category-filters" aria-label="模块类别筛选"></div>
+            <div class="canvas-controls" aria-label="画布控制">
+              <button class="icon-button" id="zoom-out-button" type="button" aria-label="缩小">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 12h14" /></svg>
+              </button>
+              <button class="zoom-label" id="zoom-reset-button" type="button" title="重置到 100%">100%</button>
+              <button class="icon-button" id="zoom-in-button" type="button" aria-label="放大">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 12h14M12 5v14" /></svg>
+              </button>
+              <span class="toolbar-divider"></span>
+              <button class="icon-button" id="fit-view-button" type="button" aria-label="适应窗口" title="适应窗口">
+                <svg aria-hidden="true" viewBox="0 0 24 24">
+                  <path d="M9 4H4v5M15 4h5v5M20 15v5h-5M4 15v5h5" />
+                </svg>
+              </button>
+            </div>
+          </header>
+
+          <div
+            class="dag-viewport"
+            id="dag-viewport"
+            tabindex="0"
+            aria-label="可缩放和平移的语义地图构建有向流程图"
+          >
+            <div class="grid-backdrop" aria-hidden="true"></div>
+            <div class="dag-scene" id="dag-scene">
+              <svg class="edge-layer" id="edge-layer" aria-hidden="true"></svg>
+              <div class="node-layer" id="node-layer"></div>
+            </div>
+            <aside
+              class="depth-preview-window is-hidden"
+              id="depth-preview-window"
+              tabindex="0"
+              aria-label="FoundationStereo 彩虹深度图预览"
+            >
+              <header class="depth-preview-header">
+                <div>
+                  <span class="eyebrow">FoundationStereo</span>
+                  <strong>深度估计预览</strong>
+                </div>
+                <div class="depth-preview-header-actions">
+                  <span class="depth-preview-status" id="depth-preview-status">等待产物</span>
+                  <button class="icon-button" id="close-depth-preview" type="button" aria-label="关闭深度预览">
+                    <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17" /></svg>
+                  </button>
+                </div>
+              </header>
+              <div class="depth-preview-canvas">
+                <img id="depth-preview-image" alt="FoundationStereo 彩虹深度估计结果" />
+                <div class="depth-preview-overlay" id="depth-preview-loading">
+                  <div class="loading-orbit depth-loading-orbit" aria-hidden="true"><span></span></div>
+                  <strong>正在读取深度帧</strong>
+                </div>
+                <div class="depth-preview-overlay" id="depth-preview-empty">
+                  <span class="depth-empty-glyph" aria-hidden="true">◫</span>
+                  <strong>等待 FoundationStereo 生成第一帧</strong>
+                  <span>完整写入的深度图会自动显示在这里。</span>
+                </div>
+                <div class="depth-preview-overlay is-hidden" id="depth-preview-error">
+                  <span class="depth-error-glyph" aria-hidden="true">!</span>
+                  <strong>当前深度帧暂时不可用</strong>
+                  <span>预览器会自动重试，也可以浏览其他帧。</span>
+                </div>
+              </div>
+              <div class="depth-preview-readout">
+                <span id="depth-preview-meta">帧 —</span>
+                <span id="depth-preview-valid">有效深度 —</span>
+              </div>
+              <div class="depth-color-legend" aria-label="彩虹深度色条">
+                <span id="depth-legend-minimum">0.25 m</span>
+                <i aria-hidden="true"></i>
+                <span id="depth-legend-maximum">5.00 m</span>
+              </div>
+              <footer class="depth-preview-footer">
+                <button class="icon-button" id="depth-preview-previous" type="button" aria-label="上一张深度图">
+                  <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 6-6 6 6 6" /></svg>
+                </button>
+                <strong id="depth-preview-counter">0 / 0</strong>
+                <button class="icon-button" id="depth-preview-next" type="button" aria-label="下一张深度图">
+                  <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6" /></svg>
+                </button>
+                <label class="check-control depth-follow-control" for="depth-preview-follow">
+                  <input id="depth-preview-follow" type="checkbox" checked />
+                  <span>跟随最新</span>
+                </label>
+              </footer>
+            </aside>
+            <div class="canvas-loading" id="canvas-loading">
+              <div class="loading-orbit" aria-hidden="true"><span></span></div>
+              <strong>正在载入构建流程</strong>
+              <span>读取模块、依赖与参数定义…</span>
+            </div>
+            <div class="canvas-empty is-hidden" id="canvas-empty">
+              <div class="empty-icon" aria-hidden="true">◇</div>
+              <strong>流程中还没有模块</strong>
+              <span>请检查服务端工作流定义。</span>
+            </div>
+            <div class="map-legend" id="map-legend" aria-label="状态图例">
+              <span><i class="legend-dot status-completed"></i>完成</span>
+              <span><i class="legend-dot status-running"></i>运行中</span>
+              <span><i class="legend-dot status-pending"></i>等待</span>
+              <span><i class="legend-dot status-failed"></i>异常</span>
+            </div>
+            <div class="canvas-hint" id="canvas-hint">
+              <span class="mouse-glyph" aria-hidden="true"></span>
+              拖动画布 · 滚轮缩放
+            </div>
+          </div>
+
+          <footer class="canvas-footer">
+            <div class="stage-summary" id="stage-summary" aria-label="阶段执行摘要"></div>
+            <div class="updated-time">最后同步 <time id="last-updated-time">—</time></div>
+          </footer>
+        </section>
+
+        <aside class="right-panel panel" id="right-panel" aria-label="模块详情和运行参数">
+          <header class="details-header">
+            <div class="segmented-tabs" role="tablist" aria-label="详情面板">
+              <button
+                class="tab-button is-active"
+                id="detail-tab"
+                type="button"
+                role="tab"
+                aria-selected="true"
+                aria-controls="detail-tab-panel"
+                data-panel="detail"
+              >
+                模块详情
+              </button>
+              <button
+                class="tab-button"
+                id="parameters-tab"
+                type="button"
+                role="tab"
+                aria-selected="false"
+                aria-controls="parameters-tab-panel"
+                data-panel="parameters"
+              >
+                运行参数
+                <span id="parameter-dirty-dot" class="dirty-dot is-hidden" title="参数已修改"></span>
+              </button>
+            </div>
+            <button class="icon-button panel-close" id="close-right-panel" type="button" aria-label="关闭详情面板">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17" /></svg>
+            </button>
+          </header>
+
+          <div class="details-scroll">
+            <section class="tab-panel" id="detail-tab-panel" role="tabpanel" aria-labelledby="detail-tab">
+              <div id="node-detail-empty" class="detail-empty">
+                <div class="detail-orbit" aria-hidden="true">
+                  <span></span><span></span><span></span>
+                </div>
+                <h2>选择一个流程模块</h2>
+                <p>查看模块职责、数据输入输出、配置提示和本次运行指标。</p>
+              </div>
+              <div id="node-detail-content" class="is-hidden"></div>
+            </section>
+
+            <section
+              class="tab-panel is-hidden"
+              id="parameters-tab-panel"
+              role="tabpanel"
+              aria-labelledby="parameters-tab"
+            >
+              <div class="parameter-intro">
+                <div>
+                  <span class="eyebrow">Configuration</span>
+                  <h2>运行参数</h2>
+                </div>
+                <button class="text-button" id="reset-parameters-button" type="button">恢复方案</button>
+              </div>
+              <p class="muted-copy">参数只在点击“启动构建”后生效；修改时会自动刷新命令预览。</p>
+              <form id="parameter-form" novalidate></form>
+              <div class="no-parameters is-hidden" id="no-parameters">
+                <strong>此流程无需额外参数</strong>
+                <span>可直接预览命令或启动构建。</span>
+              </div>
+            </section>
+          </div>
+
+          <section class="inline-command-card" aria-label="命令预览摘要">
+            <div class="section-title-row">
+              <h3>执行命令</h3>
+              <button class="text-button" id="copy-command-inline" type="button">复制</button>
+            </div>
+            <pre id="inline-command"><code>等待流程定义…</code></pre>
+            <div class="command-warnings is-hidden" id="inline-command-warnings"></div>
+          </section>
+        </aside>
+
+        <section class="bottom-dock panel" id="bottom-dock" aria-label="运行日志与质量门">
+          <header class="dock-header">
+            <div class="dock-title">
+              <span class="terminal-mark" aria-hidden="true">›_</span>
+              <div>
+                <h2>运行控制台</h2>
+                <span id="event-count-label">尚无事件</span>
+              </div>
+            </div>
+            <div class="dock-actions">
+              <label class="check-control" for="autoscroll-checkbox">
+                <input id="autoscroll-checkbox" type="checkbox" checked />
+                <span>自动滚动</span>
+              </label>
+              <button class="text-button" id="clear-logs-button" type="button">清空日志</button>
+              <button class="icon-button" id="collapse-dock-button" type="button" aria-label="折叠运行控制台">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m7 14 5-5 5 5" /></svg>
+              </button>
+            </div>
+          </header>
+          <div class="dock-content">
+            <section class="log-pane" aria-label="实时日志">
+              <div class="pane-heading">
+                <div>
+                  <h3>实时日志</h3>
+                  <span class="live-indicator" id="live-indicator"><i></i>等待运行</span>
+                </div>
+                <div class="log-filters" id="log-filters" aria-label="日志等级筛选">
+                  <button type="button" class="filter-button is-active" data-level="all">全部</button>
+                  <button type="button" class="filter-button" data-level="info">信息</button>
+                  <button type="button" class="filter-button" data-level="warning">警告</button>
+                  <button type="button" class="filter-button" data-level="error">错误</button>
+                </div>
+              </div>
+              <div class="log-stream" id="log-stream" role="log" aria-live="polite">
+                <div class="log-placeholder" id="log-placeholder">
+                  <span class="prompt-sign">$</span>
+                  <span>选择历史运行，或配置参数并启动一次新的构建。</span>
+                </div>
+              </div>
+            </section>
+
+            <section class="quality-pane" aria-label="质量门">
+              <div class="pane-heading">
+                <div>
+                  <h3>质量门</h3>
+                  <span id="quality-summary-label">等待验收数据</span>
+                </div>
+                <div class="quality-score" id="quality-score">—</div>
+              </div>
+              <div class="quality-list" id="quality-list">
+                <div class="quality-placeholder">
+                  <span class="shield-glyph" aria-hidden="true">✓</span>
+                  <div>
+                    <strong>构建完成后自动验收</strong>
+                    <span>几何、语义、队列、时延和产物完整性会显示在这里。</span>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </section>
+      </main>
+
+      <div class="scrim" id="panel-scrim"></div>
+
+      <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+      <dialog class="command-dialog" id="command-dialog">
+        <div class="dialog-shell">
+          <header class="dialog-header">
+            <div>
+              <span class="eyebrow">Dry run</span>
+              <h2>执行命令预览</h2>
+            </div>
+            <button class="icon-button" id="close-command-dialog" type="button" aria-label="关闭命令预览">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17" /></svg>
+            </button>
+          </header>
+          <div class="dialog-body">
+            <p>这是服务端根据当前流程、参数方案与覆盖值生成的最终命令。</p>
+            <pre class="command-preview"><code id="dialog-command">正在生成命令…</code></pre>
+            <div class="command-warnings is-hidden" id="dialog-command-warnings"></div>
+          </div>
+          <footer class="dialog-footer">
+            <span id="preview-status">参数变化后会自动更新</span>
+            <div>
+              <button class="button button-secondary" id="copy-command-dialog" type="button">复制命令</button>
+              <button class="button button-primary" id="start-from-dialog" type="button">确认并启动</button>
+            </div>
+          </footer>
+        </div>
+      </dialog>
+    </div>
+
+    <noscript>
+      <div class="noscript-message">此控制台需要浏览器启用 JavaScript 才能读取流程和运行状态。</div>
+    </noscript>
+  </body>
+</html>

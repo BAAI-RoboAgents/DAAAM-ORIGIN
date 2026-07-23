@@ -3,8 +3,11 @@
 """Static DSG Visualizer - Visualize a Dynamic Scene Graph from JSON using Rerun."""
 
 import argparse
+import colorsys
+import cv2
 import numpy as np
 import rerun as rr
+import rerun.blueprint as rrb
 from pathlib import Path
 import textwrap
 import traceback
@@ -13,6 +16,8 @@ import yaml
 import re
 
 from scipy.spatial.transform import Rotation
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 
 import spark_dsg
 from spark_dsg import (
@@ -22,6 +27,12 @@ from spark_dsg import (
 	SceneGraphNode,
 	LayerView,
 	BoundingBoxType
+)
+from daaam.query_index import QueryIndexError, load_query_index
+from daaam.query_evidence import (
+	QueryEvidenceError,
+	load_query_evidence,
+	sha256_file,
 )
 
 
@@ -52,13 +63,264 @@ LAYER_COLORS = {
 	10: [0, 255, 255],  # Cyan for GT objects
 }
 
+
+def masked_image_card_geometry(alpha, width_m, height_m, center, face_direction, grid_step_px=8):
+	"""Build a camera-facing textured grid only where a FastSAM alpha mask exists."""
+	alpha = np.asarray(alpha, dtype=np.uint8)
+	center = np.asarray(center, dtype=np.float32).reshape(-1)
+	face_direction = np.asarray(face_direction, dtype=np.float32).reshape(-1)
+	if alpha.ndim != 2 or min(alpha.shape) < 2:
+		raise ValueError("image-card alpha mask must be at least 2x2")
+	if center.size != 3 or not np.isfinite(center).all():
+		raise ValueError("image-card center must be a finite 3D point")
+	if face_direction.size != 2 or not np.isfinite(face_direction).all():
+		raise ValueError("image-card face direction must be a finite XY vector")
+	if not np.isfinite(width_m) or not np.isfinite(height_m) or width_m <= 0 or height_m <= 0:
+		raise ValueError("image-card dimensions must be finite and positive")
+	if int(grid_step_px) < 1:
+		raise ValueError("image-card grid step must be positive")
+
+	direction_norm = float(np.linalg.norm(face_direction))
+	if direction_norm < 1.0e-6:
+		face_direction = np.asarray([0.0, -1.0], dtype=np.float32)
+	else:
+		face_direction = face_direction / direction_norm
+	right = np.asarray([face_direction[1], -face_direction[0], 0.0], dtype=np.float32)
+	up = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+	height_px, width_px = alpha.shape
+	x_samples = list(range(0, width_px - 1, int(grid_step_px))) + [width_px - 1]
+	y_samples = list(range(0, height_px - 1, int(grid_step_px))) + [height_px - 1]
+	x_samples = sorted(set(x_samples))
+	y_samples = sorted(set(y_samples))
+	texcoords = []
+	vertices = []
+	for y in y_samples:
+		v = float(y) / float(height_px - 1)
+		for x in x_samples:
+			u = float(x) / float(width_px - 1)
+			vertices.append(
+				center
+				+ right * ((u - 0.5) * float(width_m))
+				+ up * ((0.5 - v) * float(height_m))
+			)
+			texcoords.append([u, v])
+
+	column_count = len(x_samples)
+	faces = []
+	for row in range(len(y_samples) - 1):
+		for column in range(len(x_samples) - 1):
+			x1, x2 = x_samples[column], x_samples[column + 1]
+			y1, y2 = y_samples[row], y_samples[row + 1]
+			coverage = float(np.mean(alpha[y1 : y2 + 1, x1 : x2 + 1] >= 32))
+			if coverage < 0.12:
+				continue
+			a = row * column_count + column
+			b = a + 1
+			c = a + column_count + 1
+			d = a + column_count
+			faces.extend(([a, b, c], [a, c, d], [c, b, a], [d, c, a]))
+	if not faces:
+		raise ValueError("image-card mask produced no textured cells")
+	return (
+		np.asarray(vertices, dtype=np.float32),
+		np.asarray(faces, dtype=np.uint32),
+		np.asarray(texcoords, dtype=np.float32),
+	)
+
+
+def filter_mesh_faces_by_component_area(
+	vertices, faces, *, minimum_area_m2=0.005, weld_tolerance_m=1.0e-4
+):
+	"""Remove small disconnected mesh fragments after tolerance-based welding."""
+	vertex_array = np.asarray(vertices, dtype=np.float64)
+	face_array = np.asarray(faces, dtype=np.int64)
+	if vertex_array.ndim != 2 or vertex_array.shape[1] != 3:
+		raise ValueError("mesh vertices must be Nx3")
+	if face_array.ndim != 2 or face_array.shape[1] != 3:
+		raise ValueError("mesh faces must be Nx3")
+	if minimum_area_m2 < 0.0 or weld_tolerance_m <= 0.0:
+		raise ValueError("mesh component filtering parameters are invalid")
+	if not len(face_array) or minimum_area_m2 == 0.0:
+		return face_array.astype(np.uint32, copy=False), {
+			"components": 0,
+			"removed_faces": 0,
+			"removed_area_m2": 0.0,
+		}
+	quantized = np.rint(vertex_array / float(weld_tolerance_m)).astype(np.int64)
+	_, inverse = np.unique(quantized, axis=0, return_inverse=True)
+	welded_faces = inverse[face_array]
+	valid = (
+		(welded_faces[:, 0] != welded_faces[:, 1])
+		& (welded_faces[:, 1] != welded_faces[:, 2])
+		& (welded_faces[:, 0] != welded_faces[:, 2])
+	)
+	edges = welded_faces[valid]
+	rows = np.concatenate(
+		[edges[:, 0], edges[:, 1], edges[:, 2], edges[:, 1], edges[:, 2], edges[:, 0]]
+	)
+	columns = np.concatenate(
+		[edges[:, 1], edges[:, 2], edges[:, 0], edges[:, 0], edges[:, 1], edges[:, 2]]
+	)
+	vertex_count = int(inverse.max()) + 1
+	graph = coo_matrix(
+		(np.ones(len(rows), dtype=np.uint8), (rows, columns)),
+		shape=(vertex_count, vertex_count),
+	).tocsr()
+	component_count, labels = connected_components(graph, directed=False)
+	triangles = vertex_array[face_array]
+	areas = 0.5 * np.linalg.norm(
+		np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]),
+		axis=1,
+	)
+	component_areas = np.bincount(
+		labels[welded_faces[:, 0]], weights=areas, minlength=component_count
+	)
+	keep = valid & (
+		component_areas[labels[welded_faces[:, 0]]] >= float(minimum_area_m2)
+	)
+	return face_array[keep].astype(np.uint32, copy=False), {
+		"components": int(component_count),
+		"removed_faces": int(np.count_nonzero(~keep)),
+		"removed_area_m2": float(np.sum(areas[~keep])),
+	}
+
+
+def discover_dense_rgbd_map(dsg_path):
+	"""Find the accepted direct RGB-D fusion that produced this DSG's evidence."""
+	dsg_path = Path(dsg_path).expanduser().resolve()
+	manifest_path = dsg_path.with_suffix(".evidence.json")
+	if not manifest_path.is_file():
+		return None
+	try:
+		manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+		source = manifest["source"]
+		pose_path = Path(source["camera_pose_file"]).expanduser().resolve()
+		expected_pose_sha256 = str(source["camera_pose_file_sha256"])
+	except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+		return None
+	try:
+		pose_valid = (
+			pose_path.is_file() and sha256_file(pose_path) == expected_pose_sha256
+		)
+	except OSError:
+		return None
+	if not pose_valid:
+		return None
+	try:
+		run_root = pose_path.parents[2]
+	except IndexError:
+		return None
+	visualization_dir = run_root / "11_dense_rgbd_visualization_candidate"
+	acceptance_path = visualization_dir / "visualization_acceptance.json"
+	try:
+		acceptance = json.loads(acceptance_path.read_text(encoding="utf-8"))
+		artifacts = acceptance["artifacts"]
+		visualization_cloud = visualization_dir / "direct_rgbd_fusion.ply"
+		visualization_report = visualization_dir / "direct_rgbd_fusion_report.json"
+		visualization_valid = (
+			acceptance.get("schema")
+			== "daaam.dense_rgbd_visualization_acceptance.v1"
+			and acceptance.get("accepted") is True
+			and acceptance.get("source_pose_sha256") == expected_pose_sha256
+			and artifacts.get("point_cloud") == visualization_cloud.name
+			and artifacts.get("report") == visualization_report.name
+			and visualization_cloud.is_file()
+			and visualization_report.is_file()
+			and sha256_file(visualization_cloud)
+			== artifacts.get("point_cloud_sha256")
+			and sha256_file(visualization_report) == artifacts.get("report_sha256")
+		)
+	except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+		visualization_valid = False
+	if visualization_valid:
+		return visualization_cloud
+	fusion_dir = run_root / "10_direct_rgbd_fusion"
+	report_path = fusion_dir / "direct_rgbd_fusion_report.json"
+	point_cloud_path = fusion_dir / "direct_rgbd_fusion.ply"
+	try:
+		report = json.loads(report_path.read_text(encoding="utf-8"))
+		mapping_run = json.loads(
+			(run_root / "mapping_run.json").read_text(encoding="utf-8")
+		)
+	except (OSError, TypeError, json.JSONDecodeError):
+		return None
+	accepted = mapping_run.get("direct_rgbd_fusion", {}).get("manually_accepted")
+	if accepted is not True or not point_cloud_path.is_file():
+		return None
+	if Path(str(report.get("ply", ""))).expanduser().resolve() != point_cloud_path:
+		return None
+	return point_cloud_path
+
 class StaticDSGVisualizer:
 	"""Visualizes a static DSG using Rerun."""
 	
-	def __init__(self, dsg_path, gt_dsg_path=None, color_map_path=None, log_object_meshes=False, spawn=True, layer_z_offsets=None, interlayer_edge_subsample=1, object_subsample_grid_size=None, log_regions_separately=False):
+	def __init__(self, dsg_path, gt_dsg_path=None, color_map_path=None, log_object_meshes=True, spawn=True, layer_z_offsets=None, interlayer_edge_subsample=1, object_subsample_grid_size=None, log_regions_separately=False, connect_url=None, save_path=None, main_mesh_opacity=0.90, object_mesh_color_mode="rgb", show_semantic_sidecar=True, object_image_card_scope="none", object_mask_cloud_scope="all", image_card_scale=0.75, image_card_max_height_m=1.0, image_card_grid_step_px=8, mask_cloud_point_radius_m=None, mask_cloud_point_size_ui=1.25, main_mesh_min_component_area_m2=0.005, focused_blueprint=True, show_node_labels=False, dense_map_path=None, enable_dense_map=True, dense_map_point_radius_m=None, dense_map_point_size_ui=1.0):
 		"""Initialize the visualizer."""
 		self.dsg_path = Path(dsg_path)
 		self.log_object_meshes = log_object_meshes
+		if not 0.0 <= float(main_mesh_opacity) <= 1.0:
+			raise ValueError("main_mesh_opacity must be in [0, 1]")
+		if object_mesh_color_mode not in {"semantic", "rgb"}:
+			raise ValueError("object_mesh_color_mode must be semantic or rgb")
+		if object_image_card_scope not in {"none", "mesh-bound", "all"}:
+			raise ValueError("object_image_card_scope must be none, mesh-bound, or all")
+		if object_mask_cloud_scope not in {"none", "mesh-bound", "all"}:
+			raise ValueError("object_mask_cloud_scope must be none, mesh-bound, or all")
+		if not np.isfinite(image_card_scale) or float(image_card_scale) <= 0.0:
+			raise ValueError("image_card_scale must be finite and positive")
+		if not np.isfinite(image_card_max_height_m) or float(image_card_max_height_m) <= 0.0:
+			raise ValueError("image_card_max_height_m must be finite and positive")
+		if int(image_card_grid_step_px) < 1:
+			raise ValueError("image_card_grid_step_px must be positive")
+		if mask_cloud_point_radius_m is not None and (
+			not np.isfinite(mask_cloud_point_radius_m)
+			or float(mask_cloud_point_radius_m) <= 0.0
+		):
+			raise ValueError("mask_cloud_point_radius_m must be finite and positive")
+		if not np.isfinite(mask_cloud_point_size_ui) or float(mask_cloud_point_size_ui) <= 0.0:
+			raise ValueError("mask_cloud_point_size_ui must be finite and positive")
+		if not np.isfinite(main_mesh_min_component_area_m2) or float(main_mesh_min_component_area_m2) < 0.0:
+			raise ValueError("main_mesh_min_component_area_m2 must be finite and non-negative")
+		if dense_map_point_radius_m is not None and (
+			not np.isfinite(dense_map_point_radius_m)
+			or float(dense_map_point_radius_m) <= 0.0
+		):
+			raise ValueError("dense_map_point_radius_m must be finite and positive")
+		if not np.isfinite(dense_map_point_size_ui) or float(dense_map_point_size_ui) <= 0.0:
+			raise ValueError("dense_map_point_size_ui must be finite and positive")
+		self.main_mesh_opacity = float(main_mesh_opacity)
+		self.object_mesh_color_mode = object_mesh_color_mode
+		self.object_image_card_scope = object_image_card_scope
+		self.object_mask_cloud_scope = object_mask_cloud_scope
+		self.image_card_scale = float(image_card_scale)
+		self.image_card_max_height_m = float(image_card_max_height_m)
+		self.image_card_grid_step_px = int(image_card_grid_step_px)
+		self.mask_cloud_point_radius_m = (
+			None
+			if mask_cloud_point_radius_m is None
+			else float(mask_cloud_point_radius_m)
+		)
+		self.mask_cloud_point_size_ui = float(mask_cloud_point_size_ui)
+		self.main_mesh_min_component_area_m2 = float(main_mesh_min_component_area_m2)
+		self.focused_blueprint = bool(focused_blueprint)
+		self.show_node_labels = bool(show_node_labels)
+		self.enable_dense_map = bool(enable_dense_map)
+		self.dense_map_point_radius_m = (
+			None
+			if dense_map_point_radius_m is None
+			else float(dense_map_point_radius_m)
+		)
+		self.dense_map_point_size_ui = float(dense_map_point_size_ui)
+		self.dense_map_path = None
+		if self.enable_dense_map:
+			if dense_map_path is not None:
+				candidate = Path(dense_map_path).expanduser().resolve()
+				if not candidate.is_file():
+					raise FileNotFoundError(f"dense RGB-D map not found: {candidate}")
+				self.dense_map_path = candidate
+			else:
+				self.dense_map_path = discover_dense_rgbd_map(self.dsg_path)
+		self.dense_map_point_count = 0
 		self.color_map = load_color_map(color_map_path)
 		self.object_subsample_grid_size = object_subsample_grid_size  # None = disabled, float = grid size in meters
 		self.log_regions_separately = log_regions_separately  # Log each region to separate entity path
@@ -78,14 +340,31 @@ class StaticDSGVisualizer:
 		# Background objects are now handled as a layer in the scene graph
 		# No need to load background_objects.yaml separately
 
-		# Initialize Rerun
-		rr.init("static_dsg_visualizer", spawn=spawn)
+		# Initialize Rerun. A remote sink is useful when the native viewer cannot
+		# start (for example, when displaying through Rerun's web viewer).
+		rr.init("static_dsg_visualizer", spawn=spawn and not connect_url and not save_path)
+		if save_path:
+			print(f"Saving Rerun recording to {save_path}")
+			rr.save(str(Path(save_path).expanduser().resolve()))
+		if connect_url:
+			print(f"Connecting to Rerun server at {connect_url}")
+			rr.connect_grpc(connect_url)
 		rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
 
 		# Load the DSG
 		print(f"Loading DSG from {self.dsg_path}")
 		self.dsg = DynamicSceneGraph.load(str(self.dsg_path))
 		print(f"DSG loaded successfully")
+		self.semantic_sidecar_records = []
+		self.query_evidence_by_node = {}
+		if show_semantic_sidecar:
+			try:
+				self.semantic_sidecar_records = load_query_index(
+					self.dsg_path, allow_conventional_path=True
+				)
+			except QueryIndexError as error:
+				print(f"Semantic sidecar ignored: {error}")
+		self.object_image_cards = self._load_object_image_cards()
 
 		# Get statistics
 		self._print_dsg_stats()
@@ -113,6 +392,103 @@ class StaticDSGVisualizer:
 
 				if self.gt_dsgs:
 					self._print_gt_dsg_stats()
+
+	def _load_object_image_cards(self):
+		"""Join checksum-validated FastSAM cutouts to DSG/sidecar geometry."""
+		if (
+			self.object_image_card_scope == "none"
+			and self.object_mask_cloud_scope == "none"
+			and not self.semantic_sidecar_records
+		):
+			return []
+		try:
+			evidence_by_node, _ = load_query_evidence(self.dsg_path)
+		except QueryEvidenceError as error:
+			print(f"Object image cards ignored: {error}")
+			return []
+		self.query_evidence_by_node = evidence_by_node
+		if not evidence_by_node:
+			return []
+
+		geometry = {}
+		if self.dsg.has_layer(DsgLayers.OBJECTS):
+			for node in self.dsg.get_layer(DsgLayers.OBJECTS).nodes:
+				attributes = node.attributes
+				try:
+					mesh = attributes.mesh()
+					has_mesh = bool(mesh is not None and mesh.num_vertices() > 4)
+				except (AttributeError, RuntimeError, TypeError):
+					has_mesh = False
+				position = np.asarray(attributes.position, dtype=np.float32).reshape(-1).copy()
+				dimensions = np.asarray(
+					attributes.bounding_box.dimensions, dtype=np.float32
+				).reshape(-1).copy()
+				metadata = {}
+				if hasattr(attributes, "metadata"):
+					try:
+						metadata = dict(attributes.metadata.get() or {})
+					except (AttributeError, RuntimeError, TypeError, ValueError):
+						metadata = {}
+				geometry[str(node.id)] = {
+					"position": position,
+					"dimensions": dimensions,
+					"geometry_status": "mesh_bound" if has_mesh else "spatial_only",
+					"description": str(metadata.get("description", "")).strip(),
+				}
+		for record in self.semantic_sidecar_records:
+			geometry[str(record["record_id"])] = {
+				"position": np.asarray(record.get("position_m", []), dtype=np.float32),
+				"dimensions": np.asarray(record.get("dimensions_m", []), dtype=np.float32),
+				"geometry_status": str(record["geometry_status"]),
+				"description": str(record["description"]),
+			}
+
+		cards = []
+		for node_id, evidence in sorted(evidence_by_node.items()):
+			item = geometry.get(node_id)
+			if item is None or (
+				evidence.cutout_path is None and evidence.point_cloud_path is None
+			):
+				continue
+			card_in_scope = self.object_image_card_scope == "all" or (
+				self.object_image_card_scope == "mesh-bound"
+				and item["geometry_status"] == "mesh_bound"
+			)
+			cloud_in_scope = self.object_mask_cloud_scope == "all" or (
+				self.object_mask_cloud_scope == "mesh-bound"
+				and item["geometry_status"] == "mesh_bound"
+			)
+			if not card_in_scope and not cloud_in_scope:
+				continue
+			position = np.asarray(item["position"], dtype=np.float32).reshape(-1)
+			dimensions = np.asarray(item["dimensions"], dtype=np.float32).reshape(-1)
+			if position.size != 3 or not np.isfinite(position).all():
+				continue
+			if (
+				dimensions.size != 3
+				or not np.isfinite(dimensions).all()
+				or np.any(dimensions <= 0.0)
+			):
+				dimensions = np.asarray([0.4, 0.4, 0.4], dtype=np.float32)
+			cards.append(
+				{
+					"evidence": evidence,
+					"position": position,
+					"dimensions": dimensions,
+					"geometry_status": item["geometry_status"],
+					"description": item["description"],
+				}
+			)
+		return cards
+
+	def _object_overlay_count(self, scope, *, artifact):
+		if scope == "none":
+			return 0
+		return sum(
+			(scope == "all" or card["geometry_status"] == "mesh_bound")
+			and getattr(card["evidence"], artifact) is not None
+			for card in self.object_image_cards
+		)
 	
 	def _print_dsg_stats(self):
 		"""Print statistics about the loaded DSG."""
@@ -134,6 +510,31 @@ class StaticDSGVisualizer:
 		# Count edges
 		all_edges = list(self.dsg.edges)
 		print(f"Total edges: {len(all_edges)}")
+		if self.semantic_sidecar_records:
+			counts = {
+				status: sum(
+					record["geometry_status"] == status
+					for record in self.semantic_sidecar_records
+				)
+				for status in ("spatial_only", "image_only")
+			}
+			print(
+				"Semantic sidecar: "
+				f"{len(self.semantic_sidecar_records)} records "
+				f"(spatial_only={counts['spatial_only']}, "
+				f"image_only={counts['image_only']})"
+			)
+		print(
+			f"Object image cards: "
+			f"{self._object_overlay_count(self.object_image_card_scope, artifact='cutout_path')} "
+			f"(scope={self.object_image_card_scope})"
+		)
+		print(
+			f"Object RGB-D mask clouds: "
+			f"{self._object_overlay_count(self.object_mask_cloud_scope, artifact='point_cloud_path')} "
+			f"(scope={self.object_mask_cloud_scope})"
+		)
+		print(f"Dense RGB-D overview: {self.dense_map_path or 'not available'}")
 		print("=" * 22)
 
 	def _log_visualization_settings(self):
@@ -154,7 +555,45 @@ class StaticDSGVisualizer:
 			print(f"  {layer_name}: {offset:.1f}m")
 		print(f"Inter-layer edge subsampling: 1/{self.interlayer_edge_subsample}")
 		print(f"Log regions separately: {self.log_regions_separately}")
+		print(f"Log object meshes: {self.log_object_meshes}")
+		print(f"Object mesh colors: {self.object_mesh_color_mode}")
+		print(f"Main mesh opacity: {self.main_mesh_opacity:.2f}")
+		print(
+			f"Main mesh minimum component area: "
+			f"{self.main_mesh_min_component_area_m2:.4f}m^2"
+		)
+		print(f"Focused map blueprint: {self.focused_blueprint}")
+		print(f"Node labels: {self.show_node_labels}")
+		print(
+			f"Dense RGB-D overview: {bool(self.dense_map_path)} "
+			f"({self._point_size_description(self.dense_map_point_radius_m, self.dense_map_point_size_ui)})"
+		)
+		print(f"Semantic sidecar overlay: {bool(self.semantic_sidecar_records)}")
+		print(
+			f"FastSAM image cards: "
+			f"{self._object_overlay_count(self.object_image_card_scope, artifact='cutout_path')} "
+			f"(scope={self.object_image_card_scope}, scale={self.image_card_scale:.2f}, "
+			f"max_height={self.image_card_max_height_m:.2f}m)"
+		)
+		print(
+			f"FastSAM RGB-D mask clouds: "
+			f"{self._object_overlay_count(self.object_mask_cloud_scope, artifact='point_cloud_path')} "
+			f"(scope={self.object_mask_cloud_scope}, "
+			f"{self._point_size_description(self.mask_cloud_point_radius_m, self.mask_cloud_point_size_ui)})"
+		)
 		print("=" * 31)
+
+	@staticmethod
+	def _point_size_description(world_radius_m, ui_size):
+		if world_radius_m is None:
+			return f"screen_radius={ui_size:.2f}pt"
+		return f"world_radius={world_radius_m:.3f}m"
+
+	@staticmethod
+	def _rerun_point_radius(world_radius_m, ui_size):
+		if world_radius_m is None:
+			return rr.Radius.ui_points(ui_size)
+		return world_radius_m
 
 	def _get_layer_z_offset(self, layer_id) -> float:
 		"""Get z-offset for a given layer ID (LayerKey, int, or tuple)."""
@@ -473,7 +912,7 @@ class StaticDSGVisualizer:
 							np.array(positions),
 							colors=np.array(colors),
 							labels=labels,
-							show_labels=True,
+							show_labels=self.show_node_labels,
 							radii=0.05
 						)
 					)
@@ -567,9 +1006,27 @@ class StaticDSGVisualizer:
 		# Visualize the main mesh if present
 		if self.dsg.has_mesh():
 			self._log_main_mesh()
+		if self.dense_map_path is not None:
+			self._log_dense_rgbd_map()
 
 		# Visualize all nodes and edges
 		self._log_full_dsg()
+
+		# DAM entities without a real Hydra object mesh stay queryable and are
+		# rendered as explicit lower-confidence boxes instead of invisible nodes.
+		if self.semantic_sidecar_records:
+			self._log_semantic_sidecar()
+
+		# FastSAM foreground textures are rendered on sparse silhouette meshes so
+		# Rerun 0.23 does not turn ignored alpha into a rectangular background.
+		if self._object_overlay_count(
+			self.object_image_card_scope, artifact="cutout_path"
+		):
+			self._log_object_image_cards()
+		if self._object_overlay_count(
+			self.object_mask_cloud_scope, artifact="point_cloud_path"
+		):
+			self._log_object_mask_clouds()
 
 		# Visualize ground truth objects if available
 		if self.gt_dsgs:
@@ -580,7 +1037,124 @@ class StaticDSGVisualizer:
 			region_data = self._collect_region_data()
 			self._log_regions(region_data)
 
+		if self.focused_blueprint:
+			self._send_focused_blueprint()
+
 		print("Visualization complete!")
+
+	def _send_focused_blueprint(self):
+		"""Open focused map tabs while retaining the full DSG for debugging."""
+		map_view = rrb.Spatial3DView(
+			origin="/world",
+			name="Clean Map",
+			contents=[
+				"/world/dsg/mesh",
+				"/world/dsg/nodes/objects_agents_meshes/**",
+				"/world/dsg/object_mask_clouds/mesh_bound/**",
+			],
+			background=[26, 29, 33, 255],
+			line_grid=rrb.archetypes.LineGrid3D(
+				visible=True,
+				spacing=1.0,
+				stroke_width=1.0,
+				color=[130, 140, 150, 55],
+			),
+		)
+		all_objects_view = rrb.Spatial3DView(
+			origin="/world",
+			name="All Recognized Objects",
+			contents=[
+				"/world/dsg/mesh",
+				"/world/dsg/object_mask_clouds/**",
+			],
+			background=[26, 29, 33, 255],
+			line_grid=rrb.archetypes.LineGrid3D(
+				visible=True,
+				spacing=1.0,
+				stroke_width=1.0,
+				color=[130, 140, 150, 55],
+			),
+		)
+		debug_view = rrb.Spatial3DView(
+			origin="/world",
+			name="DSG Debug",
+			contents="/world/dsg/**",
+			background=[26, 29, 33, 255],
+		)
+		views = []
+		if self.dense_map_point_count:
+			views.append(
+				rrb.Spatial3DView(
+					origin="/world",
+					name="Dense RGB-D Overview",
+					contents=[
+						"/world/dense_rgbd_map",
+						"/world/dsg/nodes/objects_agents_meshes/**",
+						"/world/dsg/object_mask_clouds/mesh_bound/**",
+					],
+					background=[26, 29, 33, 255],
+					line_grid=rrb.archetypes.LineGrid3D(
+						visible=True,
+						spacing=1.0,
+						stroke_width=1.0,
+						color=[130, 140, 150, 55],
+					),
+				)
+			)
+		views.extend([map_view, all_objects_view, debug_view])
+		blueprint = rrb.Blueprint(
+			rrb.Tabs(
+				*views,
+				active_tab=0,
+				name="Map Views",
+			),
+			rrb.BlueprintPanel(state="collapsed"),
+			rrb.SelectionPanel(state="collapsed"),
+			rrb.TimePanel(state="collapsed"),
+			auto_views=False,
+			auto_layout=False,
+		)
+		rr.send_blueprint(blueprint)
+
+	def _log_dense_rgbd_map(self):
+		"""Log the accepted offline RGB-D fusion as dense visual context."""
+		try:
+			import open3d as o3d
+
+			cloud = o3d.io.read_point_cloud(str(self.dense_map_path))
+			points = np.asarray(cloud.points, dtype=np.float32)
+			colors = np.asarray(cloud.colors, dtype=np.float32)
+		except (ImportError, RuntimeError, OSError, ValueError) as error:
+			print(f"Dense RGB-D overview ignored: {error}")
+			return
+		valid = points.ndim == 2 and points.shape[1:] == (3,)
+		if not valid or not len(points):
+			print(f"Dense RGB-D overview is empty: {self.dense_map_path}")
+			return
+		finite = np.isfinite(points).all(axis=1)
+		points = points[finite]
+		if colors.shape == (len(finite), 3):
+			colors = colors[finite]
+			colors = np.clip(np.rint(colors * 255.0), 0, 255).astype(np.uint8)
+		else:
+			colors = np.full((len(points), 3), 180, dtype=np.uint8)
+		self.dense_map_point_count = int(len(points))
+		rr.log(
+			"world/dense_rgbd_map",
+			rr.Points3D(
+				points,
+				colors=colors,
+				radii=self._rerun_point_radius(
+					self.dense_map_point_radius_m,
+					self.dense_map_point_size_ui,
+				),
+			),
+			static=True,
+		)
+		print(
+			f"  Logged dense RGB-D overview with {self.dense_map_point_count} "
+			f"points from {self.dense_map_path}"
+		)
 	
 	def _log_main_mesh(self):
 		"""Log the main mesh to Rerun."""
@@ -601,6 +1175,16 @@ class StaticDSGVisualizer:
 			if vertices.shape[0] >= 6:
 				# Colors are in rows 3-5, scale from [0,1] to [0,255]
 				vertex_colors = (vertices[3:6, :].T * 255).astype(np.uint8)
+			else:
+				vertex_colors = np.full(
+					(len(vertex_positions), 3), 180, dtype=np.uint8
+				)
+			alpha = np.full(
+				(len(vertex_colors), 1),
+				int(round(255.0 * self.main_mesh_opacity)),
+				dtype=np.uint8,
+			)
+			vertex_colors = np.concatenate([vertex_colors, alpha], axis=1)
 			
 			# Transpose faces to get Nx3 array
 			triangle_indices = faces.T.astype(np.uint32)
@@ -617,16 +1201,27 @@ class StaticDSGVisualizer:
 			triangle_indices = triangle_indices[valid_face_mask]
 			if len(triangle_indices) != num_original_triangles:
 				print(f"Filtered {num_original_triangles - len(triangle_indices)} invalid triangles")
+			triangle_indices, component_stats = filter_mesh_faces_by_component_area(
+				vertex_positions,
+				triangle_indices,
+				minimum_area_m2=self.main_mesh_min_component_area_m2,
+			)
+			print(
+				"Main mesh component cleanup: "
+				f"removed_faces={component_stats['removed_faces']}, "
+				f"removed_area={component_stats['removed_area_m2']:.3f}m^2, "
+				f"welded_components={component_stats['components']}"
+			)
 			
 			print(f"Logging main mesh: {len(vertex_positions)} vertices, {len(triangle_indices)} faces")
 			
 			rr.log(
 				"world/dsg/mesh",
-				rr.Mesh3D(
-					vertex_positions=vertex_positions,
-					vertex_colors=vertex_colors,
-					triangle_indices=triangle_indices,
-				)
+					rr.Mesh3D(
+						vertex_positions=vertex_positions,
+						vertex_colors=vertex_colors,
+						triangle_indices=triangle_indices,
+					)
 			)
 			
 		except Exception as e:
@@ -710,6 +1305,7 @@ class StaticDSGVisualizer:
 			node_ids = []
 			bboxes = []
 			bbox_colors = []
+			bbox_labels = []
 			
 			for node in nodes:
 				node_attrs = node.attributes
@@ -722,6 +1318,8 @@ class StaticDSGVisualizer:
 				# color
 				if hasattr(node_attrs, 'semantic_label') and node_attrs.semantic_label in self.color_map:
 					colors.append(np.array(self.color_map[node_attrs.semantic_label], dtype=np.uint8))
+				elif is_objects_layer and hasattr(node_attrs, 'semantic_label'):
+					colors.append(self._semantic_color(int(node_attrs.semantic_label)))
 				elif layer_id in LAYER_COLORS:
 					colors.append(np.array(LAYER_COLORS[layer_id], dtype=np.uint8))
 				elif hasattr(node_attrs, 'color'):
@@ -754,6 +1352,7 @@ class StaticDSGVisualizer:
 					node_attrs.bounding_box.type != BoundingBoxType.INVALID):
 					bboxes.append(node_attrs.bounding_box)
 					bbox_colors.append(colors[-1])
+					bbox_labels.append(label)
 				
 				# Handle object meshes
 				if (self.log_object_meshes and
@@ -765,7 +1364,8 @@ class StaticDSGVisualizer:
 							self._log_object_mesh(
 								f"world/dsg/nodes/{layer_name}_meshes/{node.id}",
 								node_attrs,
-								z_offset=z_offset
+								z_offset=z_offset,
+								semantic_color=colors[-1],
 							)
 					except Exception as e:
 						print(f"Failed to log mesh for node {node.id}: {e}")
@@ -776,6 +1376,7 @@ class StaticDSGVisualizer:
 					f"world/dsg/nodes/{layer_name}_bboxes",
 					bboxes,
 					bbox_colors,
+					labels=bbox_labels,
 					z_offset=z_offset
 				)
 			
@@ -789,7 +1390,7 @@ class StaticDSGVisualizer:
 						np.array(positions),
 						colors=np.array(colors) if colors else None,
 						labels=labels if labels else None,
-						show_labels=True,  # Ensure labels are shown
+						show_labels=self.show_node_labels,
 						radii=0.05,  # Set a visible radius for points
 					)
 				)
@@ -1043,7 +1644,14 @@ class StaticDSGVisualizer:
 		# Log the selected interlayer edges
 		self._log_interlayer_edges_list(edges_to_display)
 	
-	def _log_bounding_boxes(self, entity_path, bboxes, colors, z_offset=0.0):
+	@staticmethod
+	def _semantic_color(semantic_label):
+		"""Return a vivid deterministic RGB color when no label CSV is available."""
+		hue = (int(semantic_label) * 0.618033988749895) % 1.0
+		rgb = colorsys.hsv_to_rgb(hue, 0.78, 0.96)
+		return np.asarray([round(channel * 255.0) for channel in rgb], dtype=np.uint8)
+
+	def _log_bounding_boxes(self, entity_path, bboxes, colors, labels=None, z_offset=0.0):
 		"""Log bounding boxes to Rerun."""
 		centers_list = []
 		half_sizes_list = []
@@ -1067,10 +1675,17 @@ class StaticDSGVisualizer:
 					half_sizes=np.array(half_sizes_list),
 					colors=np.array(colors_list),
 					quaternions=np.array(rotations_list),
+					labels=labels,
+					show_labels=self.show_node_labels if labels else None,
+					fill_mode=getattr(
+						rr.components.FillMode,
+						"TransparentFillMajorWireframe",
+						rr.components.FillMode.MajorWireframe,
+					),
 				)
 			)
 	
-	def _log_object_mesh(self, entity_path, node_attr, z_offset=0.0):
+	def _log_object_mesh(self, entity_path, node_attr, z_offset=0.0, semantic_color=None):
 		"""Log individual object meshes from the DSG."""
 		try:
 			pos = node_attr.position
@@ -1088,7 +1703,12 @@ class StaticDSGVisualizer:
 			# Extract positions and colors
 			vertex_positions = pos + vertices[:3, :].T + np.array([0, 0, z_offset])
 			vertex_colors = None
-			if vertices.shape[0] >= 6:
+			if self.object_mesh_color_mode == "semantic" and semantic_color is not None:
+				vertex_colors = np.tile(
+					np.r_[np.asarray(semantic_color, dtype=np.uint8)[:3], 255],
+					(len(vertex_positions), 1),
+				)
+			elif vertices.shape[0] >= 6:
 				vertex_colors = (vertices[3:6, :].T * 255).astype(np.uint8)
 			
 			triangle_indices = faces.T
@@ -1103,6 +1723,227 @@ class StaticDSGVisualizer:
 			)
 		except Exception as e:
 			print(f"Failed to log object mesh: {e}")
+
+	def _log_object_image_cards(self):
+		"""Log FastSAM-masked RGB textures above their associated map objects."""
+		logged = 0
+		connectors = []
+		connector_colors = []
+		for card in self.object_image_cards:
+			evidence = card["evidence"]
+			if evidence.cutout_path is None or self.object_image_card_scope == "none":
+				continue
+			if (
+				self.object_image_card_scope == "mesh-bound"
+				and card["geometry_status"] != "mesh_bound"
+			):
+				continue
+			try:
+				cutout_bgra = cv2.imread(
+					str(evidence.cutout_path), cv2.IMREAD_UNCHANGED
+				)
+				if (
+					cutout_bgra is None
+					or cutout_bgra.ndim != 3
+					or cutout_bgra.shape[2] != 4
+				):
+					raise ValueError("masked cutout is not BGRA")
+				texture = cv2.cvtColor(cutout_bgra, cv2.COLOR_BGRA2RGBA)
+				alpha = texture[:, :, 3]
+				position = np.asarray(card["position"], dtype=np.float32)
+				dimensions = np.asarray(card["dimensions"], dtype=np.float32)
+				physical_scale = max(
+					float(dimensions[2]),
+					min(float(max(dimensions[0], dimensions[1])), 0.8),
+					0.24,
+				)
+				card_height = float(
+					np.clip(
+						physical_scale * self.image_card_scale,
+						0.18,
+						self.image_card_max_height_m,
+					)
+				)
+				aspect = float(texture.shape[1]) / float(texture.shape[0])
+				card_width = card_height * aspect
+				maximum_width = 1.8 * self.image_card_max_height_m
+				if card_width > maximum_width:
+					card_width = maximum_width
+					card_height = card_width / aspect
+				object_top = position.copy()
+				object_top[2] += 0.5 * float(dimensions[2])
+				card_center = object_top.copy()
+				card_center[2] += 0.08 + 0.5 * card_height
+				if evidence.camera_position_m is None:
+					face_direction = -position[:2]
+				else:
+					face_direction = (
+						np.asarray(evidence.camera_position_m, dtype=np.float32)[:2]
+						- position[:2]
+					)
+				vertices, faces, texcoords = masked_image_card_geometry(
+					alpha,
+					card_width,
+					card_height,
+					card_center,
+					face_direction,
+					grid_step_px=self.image_card_grid_step_px,
+				)
+				rr.log(
+					f"world/dsg/object_image_cards/{card['geometry_status']}/{evidence.evidence_id}",
+					rr.Mesh3D(
+						vertex_positions=vertices,
+						triangle_indices=faces,
+						vertex_texcoords=texcoords,
+						albedo_texture=texture,
+					),
+				)
+				connectors.append(np.asarray([object_top, card_center], dtype=np.float32))
+				connector_colors.append(
+					self.color_map.get(
+						int(evidence.semantic_label),
+						self._semantic_color(int(evidence.semantic_label)),
+					)
+				)
+				logged += 1
+			except (OSError, RuntimeError, TypeError, ValueError) as error:
+				print(f"Failed to log image card for {evidence.node_id}: {error}")
+		if connectors:
+			rr.log(
+				"world/dsg/object_image_cards/connectors",
+				rr.LineStrips3D(
+					connectors,
+					colors=np.asarray(connector_colors, dtype=np.uint8)[:, :3],
+					radii=0.008,
+				),
+			)
+		print(f"  Logged {logged} FastSAM masked object image cards")
+
+	def _log_object_mask_clouds(self):
+		"""Log mask pixels at their joint RGB-D world positions without offsets."""
+		logged = 0
+		point_count = 0
+		for card in self.object_image_cards:
+			evidence = card["evidence"]
+			if evidence.point_cloud_path is None or self.object_mask_cloud_scope == "none":
+				continue
+			if (
+				self.object_mask_cloud_scope == "mesh-bound"
+				and card["geometry_status"] != "mesh_bound"
+			):
+				continue
+			try:
+				with np.load(evidence.point_cloud_path, allow_pickle=False) as payload:
+					if set(payload.files) != {"points_world_m", "colors_rgb"}:
+						raise ValueError("point-cloud archive has unexpected arrays")
+					points = np.asarray(payload["points_world_m"], dtype=np.float32)
+					colors = np.asarray(payload["colors_rgb"], dtype=np.uint8)
+				if (
+					points.ndim != 2
+					or points.shape[1] != 3
+					or colors.shape != points.shape
+					or not len(points)
+					or not np.isfinite(points).all()
+					or len(points) != int(evidence.point_count or 0)
+				):
+					raise ValueError("point-cloud archive geometry is invalid")
+				rr.log(
+					f"world/dsg/object_mask_clouds/{card['geometry_status']}/{evidence.evidence_id}",
+					rr.Points3D(
+						points,
+						colors=colors,
+						radii=self._rerun_point_radius(
+							self.mask_cloud_point_radius_m,
+							self.mask_cloud_point_size_ui,
+						),
+					),
+				)
+				logged += 1
+				point_count += len(points)
+			except (OSError, RuntimeError, TypeError, ValueError) as error:
+				print(f"Failed to log RGB-D mask cloud for {evidence.node_id}: {error}")
+		print(
+			f"  Logged {logged} FastSAM RGB-D mask clouds "
+			f"with {point_count} world-aligned points"
+		)
+
+	def _log_semantic_sidecar(self):
+		"""Log DAM-described MapMemory entities that have no real object mesh."""
+
+		positions = []
+		colors = []
+		labels = []
+		box_centers = []
+		box_sizes = []
+		box_colors = []
+		box_labels = []
+		for record in self.semantic_sidecar_records:
+			evidence = self.query_evidence_by_node.get(str(record["record_id"]))
+			position = (
+				list(evidence.geometry_position_m)
+				if evidence is not None and evidence.geometry_position_m is not None
+				else record.get("position_m")
+			)
+			if not isinstance(position, (list, tuple)) or len(position) != 3:
+				continue
+			position_array = np.asarray(position, dtype=np.float32)
+			if not np.isfinite(position_array).all():
+				continue
+			color = self.color_map.get(
+				int(record["semantic_label"]),
+				self._semantic_color(int(record["semantic_label"])),
+			)
+			color = np.asarray(color, dtype=np.uint8)[:3]
+			label = (
+				f"{record['record_id']}: {record['description']} "
+				f"[{record['geometry_status']}]"
+			)
+			positions.append(position_array)
+			colors.append(color)
+			labels.append(label)
+			dimensions = (
+				list(evidence.geometry_dimensions_m)
+				if evidence is not None and evidence.geometry_dimensions_m is not None
+				else record.get("dimensions_m")
+			)
+			if isinstance(dimensions, (list, tuple)) and len(dimensions) == 3:
+				dimensions_array = np.asarray(dimensions, dtype=np.float32)
+				if np.isfinite(dimensions_array).all() and np.all(dimensions_array > 0.0):
+					box_centers.append(position_array)
+					box_sizes.append(dimensions_array)
+					box_colors.append(color)
+					box_labels.append(label)
+		if positions:
+			rr.log(
+				"world/dsg/semantic_memory/spatial_only_centers",
+				rr.Points3D(
+					np.asarray(positions),
+					colors=np.asarray(colors),
+					labels=labels,
+					show_labels=self.show_node_labels,
+					radii=0.08,
+				),
+			)
+		if box_centers:
+			rr.log(
+				"world/dsg/semantic_memory/spatial_only_boxes",
+				rr.Boxes3D(
+					centers=np.asarray(box_centers),
+					sizes=np.asarray(box_sizes),
+					colors=np.asarray(box_colors),
+					labels=box_labels,
+					show_labels=self.show_node_labels,
+					fill_mode=getattr(
+						rr.components.FillMode,
+						"TransparentFillMajorWireframe",
+						rr.components.FillMode.MajorWireframe,
+					),
+				),
+			)
+		print(
+			f"  Logged {len(positions)} semantic sidecar centers and "
+			f"{len(box_centers)} boxes"
+		)
 
 	def _log_gt_objects(self):
 		"""Log ground truth objects from all sequences to Rerun."""
@@ -1171,7 +2012,7 @@ class StaticDSGVisualizer:
 						np.array(positions),
 						colors=np.array(colors, dtype=np.uint8),
 						labels=labels,
-						show_labels=True,
+						show_labels=self.show_node_labels,
 						radii=0.08  # Slightly larger than regular nodes
 					)
 				)
@@ -1224,4 +2065,3 @@ def load_color_map(color_map_path):
 		print(f"Failed to load color map: {e}")
 	
 	return color_map
-

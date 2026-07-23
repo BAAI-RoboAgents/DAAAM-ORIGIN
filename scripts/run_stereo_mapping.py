@@ -77,11 +77,27 @@ def parse_args() -> argparse.Namespace:
     g1 = parser.add_argument_group("G1 fish-eye preparation")
     g1.add_argument("--sequence", default="000000")
     g1.add_argument("--max-delta-ms", type=float, default=10.0)
+    g1.add_argument(
+        "--input-projection-model",
+        choices=("auto", "kannala_brandt", "pinhole_rectified"),
+        default="auto",
+    )
     g1.add_argument("--horizontal-fov-deg", type=float, default=100.0)
     g1.add_argument("--down-fov-deg", type=float, default=28.0)
     g1.add_argument("--rectification-roll-deg", type=float, default=0.0)
     g1.add_argument(
         "--camera-quaternion-order", choices=("auto", "xyzw", "wxyz"), default="auto"
+    )
+    g1.add_argument(
+        "--base-pose-source",
+        choices=("odom", "map"),
+        default="odom",
+        help="Use odom_T_base_link or recorded map_T_base_link for camera poses.",
+    )
+    g1.add_argument(
+        "--calibration-source",
+        type=Path,
+        help="Capture root supplying numeric G1 calibration files.",
     )
     g1.add_argument(
         "--stereo-calibration-report",
@@ -91,7 +107,7 @@ def parse_args() -> argparse.Namespace:
             "stereo rig; passed through to the preparation stage."
         ),
     )
-    g1.add_argument("--recommended-max-depth-m", type=float, default=3.0)
+    g1.add_argument("--recommended-max-depth-m", type=float, default=5.0)
 
     selection = parser.add_argument_group("Content-safe keyframe selection")
     selection.add_argument("--soft-translation-m", type=float, default=0.06)
@@ -120,7 +136,7 @@ def parse_args() -> argparse.Namespace:
         default="left-right",
     )
     depth.add_argument("--depth-torch-compile", action="store_true")
-    depth.add_argument("--max-depth-m", type=float)
+    depth.add_argument("--max-depth-m", type=float, default=5.0)
     depth.add_argument("--swap-stereo", action="store_true")
     depth.add_argument(
         "--accept-foundation-stereo-noncommercial-license",
@@ -137,7 +153,7 @@ def parse_args() -> argparse.Namespace:
             "g1-fisheye run that proceeds beyond nominal depth inference."
         ),
     )
-    geometry.add_argument("--geometry-max-depth-m", type=float, default=3.0)
+    geometry.add_argument("--geometry-max-depth-m", type=float, default=5.0)
     geometry.add_argument("--local-keyframe-distance-m", type=float, default=0.10)
     geometry.add_argument("--local-max-keyframe-gap", type=int, default=8)
     geometry.add_argument("--local-neighbor-span", type=int, default=6)
@@ -146,6 +162,15 @@ def parse_args() -> argparse.Namespace:
     geometry.add_argument("--loop-dense-candidate-count", type=int, default=80)
     geometry.add_argument("--max-loop-gravity-residual-deg", type=float, default=8.0)
     geometry.add_argument("--global-iterations", type=int, default=250)
+    geometry.add_argument(
+        "--preserve-source-trajectory",
+        action="store_true",
+        help=(
+            "Keep the prepared source trajectory unchanged after RGB-D/loop "
+            "diagnostics. Use this when poses are already expressed in an "
+            "authoritative external map frame."
+        ),
+    )
 
     consistency = parser.add_argument_group("Temporal depth and fusion gates")
     consistency.add_argument("--temporal-filter-neighbor-offsets", default="1,2,3")
@@ -188,7 +213,7 @@ def parse_args() -> argparse.Namespace:
     mapping.add_argument("--labelspace-path", type=Path)
     mapping.add_argument("--labelspace-colors", type=Path)
     mapping.add_argument("--depth-lb", type=float, default=0.25)
-    mapping.add_argument("--depth-ub", type=float, default=3.0)
+    mapping.add_argument("--depth-ub", type=float, default=5.0)
     mapping.add_argument("--fps", type=float, default=10.0)
     mapping.add_argument("--target-fps", type=float)
     mapping.add_argument("--query-interval-frames", type=int, default=90)
@@ -338,6 +363,29 @@ def selection_manifest(report_path: Path) -> dict[str, Any]:
 def depth_manifest(report_path: Path) -> dict[str, Any]:
     """Preserve the depth backend inputs when resuming an existing run."""
     report = json.loads(report_path.read_text())
+    if report_path.name == "fast_foundation_stereo_run.json":
+        settings = report.get("settings", {})
+        artifacts = report.get("artifacts", {})
+        iterations = settings.get("iterations")
+        checkpoint = artifacts.get("checkpoint")
+        return {
+            "backend": "fast-foundation-stereo",
+            "root": artifacts.get("repository"),
+            "repository_commit": artifacts.get("repository_commit"),
+            "profile": f"fast-i{iterations}-fullres" if iterations is not None else "fast",
+            "valid_iters": iterations,
+            "precision": settings.get("precision"),
+            "confidence_mode": settings.get("confidence_mode"),
+            "max_depth_m": settings.get("maximum_depth_m"),
+            "checkpoint": checkpoint,
+            "checkpoint_sha256": artifacts.get("checkpoint_sha256"),
+            "config": artifacts.get("config"),
+            "config_sha256": artifacts.get("config_sha256"),
+            "processed": report.get("processed"),
+            "failed": report.get("failed"),
+            "report": str(report_path.resolve()),
+            "report_sha256": sha256(report_path),
+        }
     manifest = {
         key: report[key]
         for key in (
@@ -511,13 +559,15 @@ def load_gate_summary(report_path: Path) -> dict[str, Any]:
     }
 
 
-def load_global_optimization_summary(report_path: Path) -> dict[str, Any]:
+def load_global_optimization_summary(
+    report_path: Path, *, require_verified_loop: bool = True
+) -> dict[str, Any]:
     report = json.loads(report_path.read_text())
     optimization = report.get("optimization", {})
     if optimization.get("success") is False:
         raise RuntimeError(f"Global pose graph did not converge: {report_path}")
     loops = report.get("selected_verified_loops", [])
-    if not loops:
+    if require_verified_loop and not loops:
         raise RuntimeError(f"Global pose graph contains no verified loop: {report_path}")
     return {
         "report": str(report_path),
@@ -637,6 +687,8 @@ def main() -> None:
             args.sequence,
             "--max-delta-ms",
             str(args.max_delta_ms),
+            "--input-projection-model",
+            args.input_projection_model,
             "--horizontal-fov-deg",
             str(args.horizontal_fov_deg),
             "--down-fov-deg",
@@ -645,6 +697,8 @@ def main() -> None:
             str(args.rectification_roll_deg),
             "--camera-quaternion-order",
             args.camera_quaternion_order,
+            "--base-pose-source",
+            args.base_pose_source,
             "--recommended-max-depth-m",
             str(args.recommended_max_depth_m),
         ]
@@ -656,6 +710,10 @@ def main() -> None:
                     "--stereo-calibration-report",
                     str(args.stereo_calibration_report.resolve()),
                 ]
+            )
+        if args.calibration_source is not None:
+            command.extend(
+                ["--calibration-source", str(args.calibration_source.resolve())]
             )
         result = run_or_resume(
             "prepare", command, prepared_ready(prepared), args
@@ -696,7 +754,11 @@ def main() -> None:
     if finish("select"):
         return
 
-    depth_report = selected / "foundation_stereo_run.json"
+    foundation_depth_report = selected / "foundation_stereo_run.json"
+    fast_depth_report = selected / "fast_foundation_stereo_run.json"
+    depth_report = (
+        fast_depth_report if fast_depth_report.is_file() else foundation_depth_report
+    )
     depth_is_ready = depth_ready(selected)
     if args.resume and depth_is_ready:
         result = "resumed"
@@ -767,7 +829,14 @@ def main() -> None:
                 }
             )
     if depth_report.is_file():
-        manifest["foundation_stereo"].update(depth_manifest(depth_report))
+        depth_details = depth_manifest(depth_report)
+        if depth_report.name == "fast_foundation_stereo_run.json":
+            manifest.pop("foundation_stereo", None)
+            manifest["depth_backend"] = "fast-foundation-stereo"
+            manifest["fast_foundation_stereo"] = depth_details
+        else:
+            manifest["depth_backend"] = "foundation-stereo"
+            manifest["foundation_stereo"].update(depth_details)
     record("depth", result)
     if finish("depth"):
         return
@@ -897,11 +966,18 @@ def main() -> None:
         str(args.geometry_max_depth_m),
     ]
     result = run_or_resume("loops", command, report_ready(loop_report), args)
-    manifest["loop_closures"] = (
-        {"report": str(loop_report), "status": "planned"}
-        if args.dry_run
-        else require_verified_loop(loop_report)
-    )
+    if args.dry_run:
+        manifest["loop_closures"] = {"report": str(loop_report), "status": "planned"}
+    elif args.preserve_source_trajectory:
+        loop_details = json.loads(loop_report.read_text())
+        manifest["loop_closures"] = {
+            "report": str(loop_report),
+            "verified_count": int(loop_details.get("verified_count", 0)),
+            "dense_tested_count": int(loop_details.get("dense_tested_count", 0)),
+            "role": "diagnostic_only_authoritative_source_trajectory",
+        }
+    else:
+        manifest["loop_closures"] = require_verified_loop(loop_report)
     record("loops", result)
     if finish("loops"):
         return
@@ -934,7 +1010,7 @@ def main() -> None:
         "--max-loop-gravity-residual-deg",
         str(args.max_loop_gravity_residual_deg),
         "--optimizer-mode",
-        "gravity-se3",
+        "source" if args.preserve_source_trajectory else "gravity-se3",
         "--iterations",
         str(args.global_iterations),
     ]
@@ -951,7 +1027,8 @@ def main() -> None:
     if not args.dry_run:
         validate_time_contract(optimized)
         manifest["global_pose_graph"] = load_global_optimization_summary(
-            optimized / "global_pose_graph_report.json"
+            optimized / "global_pose_graph_report.json",
+            require_verified_loop=not args.preserve_source_trajectory,
         )
     if finish("optimize"):
         return

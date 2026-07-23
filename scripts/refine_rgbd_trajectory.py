@@ -203,6 +203,23 @@ class FrameCache:
         return self.depths[frame_index]
 
 
+def ratio_test_matches(candidates, ratio_test: float):
+    """Keep two-neighbor descriptor matches that pass Lowe's ratio test.
+
+    OpenCV may return fewer than ``k`` neighbors for an individual query
+    descriptor.  Those entries do not provide enough evidence for a ratio
+    test and must be ignored instead of unpacked unconditionally.
+    """
+    matches = []
+    for neighbors in candidates:
+        if len(neighbors) < 2:
+            continue
+        match, alternate = neighbors[:2]
+        if match.distance < ratio_test * alternate.distance:
+            matches.append(match)
+    return matches
+
+
 def estimate_constraint(
     cache: FrameCache,
     first: int,
@@ -221,9 +238,7 @@ def estimate_constraint(
         return None
 
     candidates = cache.matcher.knnMatch(descriptors_first, descriptors_second, k=2)
-    matches = [
-        match for match, alternate in candidates if match.distance < ratio_test * alternate.distance
-    ]
+    matches = ratio_test_matches(candidates, ratio_test)
     if len(matches) < min_inliers:
         return None
 
@@ -389,11 +404,7 @@ def estimate_3d_constraint(
         return None
 
     candidates = cache.matcher.knnMatch(descriptors_first, descriptors_second, k=2)
-    matches = [
-        match
-        for match, alternate in candidates
-        if match.distance < ratio_test * alternate.distance
-    ]
+    matches = ratio_test_matches(candidates, ratio_test)
     if len(matches) < min_inliers:
         return None
     pixels_first = np.float32(
@@ -1553,6 +1564,7 @@ def write_output_dataset(
         "keyframe_selection_report.json",
         "floor_calibration_application.json",
         "foundation_stereo_nominal_run.json",
+        "fast_foundation_stereo_run.json",
     ):
         input_path = source / name
         if input_path.exists():
@@ -1605,7 +1617,7 @@ def main():
     camera_matrix = np.asarray(camera["intrinsics"], dtype=np.float64)
     tick_index = json.loads((dataset / "tick_index.json").read_text())
     max_depth_m = args.max_depth_m or float(
-        tick_index.get("recommended_max_depth_m", 3.0)
+        tick_index.get("recommended_max_depth_m", 5.0)
     )
 
     keyframes = select_keyframes(

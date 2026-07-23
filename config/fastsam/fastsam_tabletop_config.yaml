@@ -1,0 +1,10 @@
+# FastSAM tabletop semantic-mapping profile.
+# Mask-area filtering remains in pipeline_config_tabletop.yaml because it is a
+# DAAAM post-processing parameter, not an Ultralytics/FastSAM inference option.
+fastsam_conf: 0.25
+fastsam_iou: 0.60
+fastsam_retina_masks: true
+
+# The deployed TensorRT engine fixes the inference shape. Keep this unset unless
+# a different engine is built for the requested height/width.
+# fastsam_imgsz: [480, 640]

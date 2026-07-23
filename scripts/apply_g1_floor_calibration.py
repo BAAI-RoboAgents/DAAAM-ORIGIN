@@ -66,6 +66,9 @@ def prepare_output(source: Path, output: Path, overwrite: bool) -> None:
     foundation_report = source / "foundation_stereo_run.json"
     if foundation_report.exists():
         shutil.copy2(foundation_report, output / "foundation_stereo_nominal_run.json")
+    fast_report = source / "fast_foundation_stereo_run.json"
+    if fast_report.exists():
+        shutil.copy2(fast_report, output / fast_report.name)
 
 
 def main() -> None:
@@ -102,7 +105,7 @@ def main() -> None:
     ):
         raise ValueError("Calibration image-frame rotation is invalid")
     max_depth_m = args.max_depth_m or float(
-        tick_index.get("recommended_max_depth_m", 3.0)
+        tick_index.get("recommended_max_depth_m", 5.0)
     )
     if max_depth_m <= 0.0:
         raise ValueError("Maximum depth must be positive")

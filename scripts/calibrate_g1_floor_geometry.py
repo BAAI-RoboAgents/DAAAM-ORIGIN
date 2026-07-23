@@ -28,6 +28,15 @@ def parse_args():
     parser.add_argument("--residual-threshold", type=float, default=0.02)
     parser.add_argument("--max-trials", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help=(
+            "Write the calibration report without changing poses, camera "
+            "metadata, or nominal depth images. Use the report with "
+            "apply_g1_floor_calibration.py to create a separate dataset."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -74,7 +83,7 @@ def main():
     dataset = args.dataset.resolve()
     report_path = dataset / "floor_geometry_calibration.json"
     backup_pose_path = dataset / "pose" / "poses_before_floor_calibration.txt"
-    if report_path.exists() or backup_pose_path.exists():
+    if report_path.exists() or (backup_pose_path.exists() and not args.report_only):
         raise RuntimeError(
             "Dataset is already floor-calibrated; rerun the pinhole preparation "
             "step before calibrating again."
@@ -116,7 +125,7 @@ def main():
     x1 = int(round(args.roi_x_max * width))
     y0 = int(round(args.roi_y_min * height))
     y1 = int(round(args.roi_y_max * height))
-    max_depth = float(tick_index.get("recommended_max_depth_m", 20.0))
+    max_depth = float(tick_index.get("recommended_max_depth_m", 5.0))
 
     design_parts = []
     inverse_depth_parts = []
@@ -199,24 +208,6 @@ def main():
         raise RuntimeError(
             f"Image-frame correction is too large: {correction_angle:.3f} deg"
         )
-    corrected_poses = poses.copy()
-    corrected_poses[:, :3, :3] = poses[:, :3, :3] @ correction_matrix
-
-    backup_pose_path.write_text(pose_path.read_text())
-    pose_path.write_text(
-        "".join(
-            " ".join(f"{value:.12g}" for value in pose.reshape(-1)) + "\n"
-            for pose in corrected_poses
-        )
-    )
-    camera["source_baseline"] = source_baseline
-    camera["baseline"] = effective_baseline
-    camera_path.write_text(json.dumps(camera, indent=2) + "\n")
-    tick_index["source_baseline"] = source_baseline
-    tick_index["baseline"] = effective_baseline
-    tick_index["pose_composition"] += " @ tf_camera_T_image_camera"
-    tick_path.write_text(json.dumps(tick_index, indent=2) + "\n")
-
     report = {
         "dataset": str(dataset),
         "frame_indices": frame_indices,
@@ -237,8 +228,39 @@ def main():
             "xyz", degrees=True
         ).tolist(),
         "correction_angle_deg": correction_angle,
+        "report_only": bool(args.report_only),
     }
     report_path.write_text(json.dumps(report, indent=2) + "\n")
+
+    if args.report_only:
+        print(
+            f"Calibrated floor geometry from {len(frame_indices)} frames (report only)\n"
+            f"  inliers={inlier_ratio:.3f}, floor distance={plane_offset:.3f}m, "
+            f"camera height={camera_height:.3f}m\n"
+            f"  image-frame correction={correction_angle:.3f} deg, "
+            f"depth scale={depth_scale:.6f}\n"
+            f"  report={report_path}\n"
+            "  source poses, metadata, and depth images were not modified"
+        )
+        return
+
+    corrected_poses = poses.copy()
+    corrected_poses[:, :3, :3] = poses[:, :3, :3] @ correction_matrix
+
+    backup_pose_path.write_text(pose_path.read_text())
+    pose_path.write_text(
+        "".join(
+            " ".join(f"{value:.12g}" for value in pose.reshape(-1)) + "\n"
+            for pose in corrected_poses
+        )
+    )
+    camera["source_baseline"] = source_baseline
+    camera["baseline"] = effective_baseline
+    camera_path.write_text(json.dumps(camera, indent=2) + "\n")
+    tick_index["source_baseline"] = source_baseline
+    tick_index["baseline"] = effective_baseline
+    tick_index["pose_composition"] += " @ tf_camera_T_image_camera"
+    tick_path.write_text(json.dumps(tick_index, indent=2) + "\n")
 
     for path in (dataset / "depth").glob("*.png"):
         path.unlink()

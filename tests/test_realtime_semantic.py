@@ -177,17 +177,20 @@ class FakeLifecycleGrounding:
         self.stop_error = stop_error
         self.start_calls = 0
         self.stop_calls = 0
+        self.running = False
 
     def start(self, *_args, **_kwargs):
         self.start_calls += 1
         if self.start_error is not None:
             raise self.start_error
+        self.running = True
 
     def stop(self, *, timeout_s, drain):
         del timeout_s, drain
         self.stop_calls += 1
         if self.stop_error is not None:
             raise self.stop_error
+        self.running = False
         return {
             "drain_requested": False,
             "drain_complete": False,
@@ -196,11 +199,19 @@ class FakeLifecycleGrounding:
 
     def get_worker_health(self):
         return {
-            "running": False,
-            "num_workers": 0,
-            "workers": [],
-            "ready_count": 0,
-            "all_ready": False,
+            "running": self.running,
+            "num_workers": 1,
+            "workers": [
+                {
+                    "name": "GroundingWorker-0",
+                    "is_alive": self.running,
+                    "is_ready": True,
+                    "error": None,
+                    "exitcode": None if self.running else 0,
+                }
+            ],
+            "ready_count": 1,
+            "all_ready": True,
         }
 
 
@@ -211,6 +222,7 @@ class FakeFifoDrainingGrounding(FakeLifecycleGrounding):
 
     def start(self, _query_queue, correction_queue, *_args, **_kwargs):
         self.start_calls += 1
+        self.running = True
         self.correction_queue = correction_queue
 
     def stop(self, *, timeout_s, drain):
@@ -224,6 +236,54 @@ class FakeFifoDrainingGrounding(FakeLifecycleGrounding):
             "drain_requested": drain,
             "drain_complete": drain,
             "drain_token": token if drain else None,
+        }
+
+
+class FakeDelayedReadyGrounding(FakeLifecycleGrounding):
+    def __init__(self, ready_after_health_calls=3):
+        super().__init__()
+        self.ready_after_health_calls = ready_after_health_calls
+        self.health_calls = 0
+
+    def get_worker_health(self):
+        self.health_calls += 1
+        health = super().get_worker_health()
+        ready = self.health_calls >= self.ready_after_health_calls
+        health["workers"][0]["is_ready"] = ready
+        health["ready_count"] = int(ready)
+        health["all_ready"] = ready
+        return health
+
+
+class FakeRecordingDrainingGrounding(FakeLifecycleGrounding):
+    def __init__(self):
+        super().__init__()
+        self.query_queue = None
+        self.correction_queue = None
+        self.records = []
+
+    def start(self, query_queue, correction_queue, *_args, **_kwargs):
+        super().start()
+        self.query_queue = query_queue
+        self.correction_queue = correction_queue
+
+    def stop(self, *, timeout_s, drain):
+        del timeout_s
+        self.stop_calls += 1
+        token = "recording-grounding-drain"
+        if drain:
+            while True:
+                try:
+                    self.records.append(self.query_queue.get_nowait())
+                except queue.Empty:
+                    break
+            self.correction_queue.put(GroundingCorrectionsDrained(token))
+        self.running = False
+        return {
+            "drain_requested": drain,
+            "drain_complete": drain,
+            "drain_token": token if drain else None,
+            "correction_tail_enqueued": drain,
         }
 
 
@@ -246,6 +306,65 @@ def pipeline_config():
         semantic_config_path=str(REPOSITORY_ROOT / "config/labels_pseudo.yaml"),
         labelspace_colors_path=str(REPOSITORY_ROOT / "config/labels_pseudo.csv"),
     )
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        (
+            {"object_binding_maximum_center_distance_m": 0.0},
+            "center distance",
+        ),
+        (
+            {"object_binding_maximum_aabb_gap_m": -0.001},
+            "AABB gap",
+        ),
+    ],
+)
+def test_semantic_config_rejects_invalid_object_binding_thresholds(
+    kwargs,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        RealtimeSemanticConfig(**kwargs)
+
+
+def test_semantic_adapter_forwards_object_binding_policy(monkeypatch, tmp_path):
+    import daaam.scene_graph.services as scene_graph_services
+
+    class RecordingSceneGraphService:
+        def __init__(self, *_args, object_binding_policy, **_kwargs):
+            self.object_binding_policy = object_binding_policy
+
+    monkeypatch.setattr(
+        scene_graph_services,
+        "SceneGraphService",
+        RecordingSceneGraphService,
+    )
+    memory = MapMemory(tmp_path / "memory.sqlite3")
+    memory.create_session("replay", ORIGIN_NS, canonical=True)
+    adapter = RealtimeSemanticAdapter(
+        pipeline_config(),
+        memory,
+        session_id="replay",
+        output_dir=tmp_path / "semantic",
+        config=RealtimeSemanticConfig(
+            grounding_enabled=False,
+            object_binding_maximum_center_distance_m=0.10,
+            object_binding_maximum_aabb_gap_m=0.025,
+        ),
+        segmentation_service=FakeSegmenter(),
+        tracking_service=FakeTracker(),
+    )
+
+    policy = adapter.dsg_sink.service.object_binding_policy
+    assert policy.maximum_center_distance_m == 0.10
+    assert policy.maximum_aabb_gap_m == 0.025
+    adapter.query_queue.close()
+    adapter.correction_queue.close()
+    adapter.query_queue.join_thread()
+    adapter.correction_queue.join_thread()
+    memory.close()
 
 
 def envelope(sensor_time_ns):
@@ -286,6 +405,71 @@ def test_semantic_dam_queues_are_compatible_with_spawn_workers(tmp_path):
     process.join(10.0)
     assert process.exitcode == 0
     assert adapter.correction_queue.get(timeout=1.0) == "spawn-compatible"
+    adapter.query_queue.close()
+    adapter.correction_queue.close()
+    adapter.query_queue.join_thread()
+    adapter.correction_queue.join_thread()
+    memory.close()
+
+
+def test_semantic_start_waits_for_dam_readiness_before_returning(tmp_path):
+    memory = MapMemory(tmp_path / "memory.sqlite3")
+    memory.create_session("replay", ORIGIN_NS, canonical=True)
+    grounding = FakeDelayedReadyGrounding(ready_after_health_calls=3)
+    adapter = RealtimeSemanticAdapter(
+        pipeline_config(),
+        memory,
+        session_id="replay",
+        output_dir=tmp_path / "semantic",
+        config=RealtimeSemanticConfig(
+            grounding_enabled=True,
+            grounding_startup_timeout_s=1.0,
+        ),
+        segmentation_service=FakeSegmenter(),
+        tracking_service=FakeTracker(),
+        grounding_service=grounding,
+        dsg_sink=FakeDsgSink(),
+    )
+
+    try:
+        adapter.start()
+        startup = adapter.stats()["startup"]
+        assert grounding.health_calls >= 3
+        assert startup["ready_before_first_frame"] is True
+        assert startup["wait_ms"] > 0.0
+    finally:
+        adapter.stop(timeout_s=1.0, drain=False)
+        adapter.query_queue.close()
+        adapter.correction_queue.close()
+        adapter.query_queue.join_thread()
+        adapter.correction_queue.join_thread()
+        memory.close()
+
+
+def test_semantic_startup_timeout_is_a_hard_failure(tmp_path):
+    memory = MapMemory(tmp_path / "memory.sqlite3")
+    memory.create_session("replay", ORIGIN_NS, canonical=True)
+    grounding = FakeDelayedReadyGrounding(ready_after_health_calls=10_000)
+    adapter = RealtimeSemanticAdapter(
+        pipeline_config(),
+        memory,
+        session_id="replay",
+        output_dir=tmp_path / "semantic",
+        config=RealtimeSemanticConfig(
+            grounding_enabled=True,
+            grounding_startup_timeout_s=0.02,
+        ),
+        segmentation_service=FakeSegmenter(),
+        tracking_service=FakeTracker(),
+        grounding_service=grounding,
+        dsg_sink=FakeDsgSink(),
+    )
+
+    with pytest.raises(TimeoutError, match="did not become ready"):
+        adapter.start()
+
+    assert adapter.stats()["startup"]["ready_before_first_frame"] is False
+    assert grounding.stop_calls == 1
     adapter.query_queue.close()
     adapter.correction_queue.close()
     adapter.query_queue.join_thread()
@@ -422,6 +606,79 @@ def test_semantic_stop_consumes_corrections_through_fifo_drain_marker(tmp_path):
         memory.close()
 
 
+def test_full_prompt_queue_retains_best_entity_candidate_for_shutdown_catchup(
+    tmp_path,
+):
+    memory = MapMemory(tmp_path / "memory.sqlite3")
+    memory.create_session("replay", ORIGIN_NS, canonical=True)
+    grounding = FakeRecordingDrainingGrounding()
+    adapter = RealtimeSemanticAdapter(
+        pipeline_config(),
+        memory,
+        session_id="replay",
+        output_dir=tmp_path / "semantic",
+        config=RealtimeSemanticConfig(
+            grounding_enabled=True,
+            minimum_observations=1,
+        ),
+        segmentation_service=FakeSegmenter(),
+        tracking_service=FakeTracker(),
+        grounding_service=grounding,
+        dsg_sink=FakeDsgSink(),
+    )
+    adapter.query_queue.close()
+    adapter.query_queue.join_thread()
+    adapter.query_queue = queue.Queue(maxsize=1)
+    entity_id = "stable-entity"
+    adapter._observations_by_entity[entity_id] = 1
+    frame = np.zeros((32, 32, 3), dtype=np.uint8)
+    small_mask = np.zeros((32, 32), dtype=bool)
+    small_mask[2:8, 2:8] = True
+    large_mask = np.zeros((32, 32), dtype=bool)
+    large_mask[2:24, 2:24] = True
+    small_track = Track.from_mask(1, small_mask, np.asarray([2, 2, 8, 8]))
+    large_track = Track.from_mask(1, large_mask, np.asarray([2, 2, 24, 24]))
+
+    try:
+        adapter.start()
+        adapter.query_queue.put_nowait("queue-blocker")
+        adapter._enqueue_prompt(
+            ORIGIN_NS,
+            0,
+            1,
+            frame,
+            [small_track],
+            {1: 7},
+            {1: entity_id},
+        )
+        adapter._enqueue_prompt(
+            ORIGIN_NS + 1,
+            0,
+            2,
+            frame,
+            [large_track],
+            {1: 7},
+            {1: entity_id},
+        )
+        assert adapter.query_queue.get_nowait() == "queue-blocker"
+
+        stats = adapter.stop(timeout_s=2.0, drain=True)
+
+        assert len(grounding.records) == 1
+        assert grounding.records[0].tracks[0].region_area == large_track.region_area
+        assert stats["prompt_queue_full"] == 1
+        assert stats["prompt_catchup"]["candidate_replacements"] == 1
+        assert stats["prompt_catchup"]["pending_entities"] == 0
+        assert stats["prompt_catchup"]["submitted_entities"] == 1
+        assert stats["prompt_catchup"]["complete"] is True
+    finally:
+        if adapter._started:
+            adapter.stop(timeout_s=1.0, drain=False)
+        adapter.correction_queue.close()
+        adapter.correction_queue.join_thread()
+        memory.close()
+
+
 def test_semantic_processor_start_failure_is_still_stopped(tmp_path):
     memory = MapMemory(tmp_path / "memory.sqlite3")
     memory.create_session("replay", ORIGIN_NS, canonical=True)
@@ -494,6 +751,15 @@ def test_semantic_frontend_segments_at_5hz_but_ticks_tracker_every_frame(tmp_pat
     assert audit["tracks"][0]["source_sensor_time_ns"] == segmented_time_ns
     assert audit["tracks"][0]["method"] == "carry_forward"
     assert stats["tracking_calls"] == 2
+    persisted = semantic_module.cv2.imread(
+        str(tmp_path / "semantic" / "label_frames" / "00000000.png"),
+        semantic_module.cv2.IMREAD_UNCHANGED,
+    )
+    assert persisted is not None
+    assert persisted.dtype == np.uint16
+    assert np.array_equal(persisted, propagated)
+    assert stats["label_persistence"]["frames_persisted"] == 2
+    assert stats["label_persistence"]["failures"] == 0
     assert stats["propagation_frames"] == 1
     assert stats["propagation_instances"] == 1
     assert stats["propagation_carry_forwards"] == 1

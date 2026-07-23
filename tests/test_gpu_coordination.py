@@ -108,6 +108,23 @@ def test_activity_heartbeat_stop_interrupts_long_wait_promptly(tmp_path):
     assert not heartbeat.is_running
 
 
+def test_active_lease_heartbeats_only_during_scoped_gpu_work(tmp_path):
+    activity_path = tmp_path / "frontend.activity"
+    coordinator = SharedGpuCoordinator(
+        lock_path=tmp_path / "gpu.lock",
+        activity_path=activity_path,
+    )
+
+    with coordinator.active_lease(heartbeat_interval_s=0.01):
+        entered_mtime_ns = activity_path.stat().st_mtime_ns
+        time.sleep(0.04)
+        assert activity_path.stat().st_mtime_ns > entered_mtime_ns
+
+    completed_mtime_ns = activity_path.stat().st_mtime_ns
+    time.sleep(0.04)
+    assert activity_path.stat().st_mtime_ns == completed_mtime_ns
+
+
 def test_virtual_replay_gaps_are_covered_without_busy_polling():
     class VirtualStopEvent:
         def __init__(self, duration_s):

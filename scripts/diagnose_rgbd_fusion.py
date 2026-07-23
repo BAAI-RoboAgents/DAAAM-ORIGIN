@@ -46,7 +46,7 @@ def parse_args():
     )
     parser.add_argument("--pixel-step", type=int, default=10)
     parser.add_argument("--min-depth-m", type=float, default=0.25)
-    parser.add_argument("--max-depth-m", type=float, default=3.0)
+    parser.add_argument("--max-depth-m", type=float, default=5.0)
     parser.add_argument("--voxel-size-m", type=float, default=0.04)
     parser.add_argument("--render-sample", type=int, default=180000)
     parser.add_argument("--seed", type=int, default=0)

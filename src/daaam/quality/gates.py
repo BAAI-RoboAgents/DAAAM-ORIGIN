@@ -546,6 +546,8 @@ class QualityGateRunner:
         if not isinstance(dsg, Mapping):
             dsg = {}
         dsg_applied = int(dsg.get("applied", 0))
+        dsg_rejected = int(dsg.get("rejected", 0))
+        dsg_rejected_no_mesh = int(dsg.get("rejected_no_mesh", 0))
         dsg_pending = int(dsg.get("pending", 0))
         dsg_unmapped = int(dsg.get("unmapped", 0))
         dsg_errors = list(dsg.get("errors", []))
@@ -599,6 +601,8 @@ class QualityGateRunner:
                 "pending_ratio": pending_ratio,
                 "workers_ready": workers_ready,
                 "dsg_applied": dsg_applied,
+                "dsg_rejected": dsg_rejected,
+                "dsg_rejected_no_mesh": dsg_rejected_no_mesh,
                 "dsg_pending": dsg_pending,
                 "dsg_unmapped": dsg_unmapped,
                 "dsg_graph_attached": dsg_attached,

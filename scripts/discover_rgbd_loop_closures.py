@@ -563,7 +563,7 @@ def main():
     camera_matrix = np.asarray(camera["intrinsics"], dtype=np.float64)
     tick_index = json.loads((dataset / "tick_index.json").read_text())
     max_depth_m = args.max_depth_m or float(
-        tick_index.get("recommended_max_depth_m", 3.0)
+        tick_index.get("recommended_max_depth_m", 5.0)
     )
     keyframes = select_keyframes(
         poses, args.keyframe_distance_m, args.max_keyframe_gap

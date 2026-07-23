@@ -28,7 +28,7 @@ active_window:
     use_full_connectivity: true
     use_3d: true
     grid_size: 0.05
-    max_range: 4.0
+    max_range: 5.0
   tracker:
     type: ExternalTracker
     temporal_window: 10.0

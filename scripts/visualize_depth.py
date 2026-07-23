@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-depth-m",
         type=float,
-        help="Upper visualization range in meters. Defaults to dataset metadata or 3.0m.",
+        help="Upper visualization range in meters. Defaults to dataset metadata or 5.0m.",
     )
     parser.add_argument("--colormap", choices=tuple(COLORMAPS), default="turbo")
     parser.add_argument(
@@ -195,7 +195,7 @@ def main() -> None:
         depth_path = args.depth.resolve()
         rgb_path = args.rgb.resolve() if args.rgb is not None else None
     depth_m, scale = load_depth(depth_path, args.depth_scale)
-    max_depth_m = args.max_depth_m or metadata_max_depth_m or 3.0
+    max_depth_m = args.max_depth_m or metadata_max_depth_m or 5.0
     if max_depth_m <= args.min_depth_m:
         raise ValueError("--max-depth-m must exceed --min-depth-m")
 

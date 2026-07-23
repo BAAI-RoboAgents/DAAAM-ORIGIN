@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--filter-scale", type=float, default=0.5)
     parser.add_argument("--min-depth-m", type=float, default=0.25)
-    parser.add_argument("--max-depth-m", type=float, default=3.0)
+    parser.add_argument("--max-depth-m", type=float, default=5.0)
     parser.add_argument("--absolute-tolerance-m", type=float, default=0.05)
     parser.add_argument("--relative-tolerance", type=float, default=0.04)
     parser.add_argument(
@@ -108,6 +108,7 @@ def prepare_output(
         "floor_calibration_application.json",
         "foundation_stereo_run.json",
         "foundation_stereo_nominal_run.json",
+        "fast_foundation_stereo_run.json",
         "trajectory_refinement.json",
         "global_pose_graph_report.json",
     ):

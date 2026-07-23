@@ -82,6 +82,7 @@ class HydraStaticMapBackend:
         self._origin_time_ns: Optional[int] = None
         self._finalized = False
         self._frames_rejected = 0
+        self._adopted_stats: dict[str, Any] = {}
 
     def initialize(self, width: int, height: int, intrinsics: np.ndarray) -> None:
         camera = np.asarray(intrinsics, dtype=np.float64)
@@ -167,9 +168,34 @@ class HydraStaticMapBackend:
             raise RuntimeError("Hydra failed to save the realtime map")
         self._finalized = True
 
+    def adopt_finalized_output(self, stats: Optional[dict[str, Any]] = None) -> None:
+        """Adopt a map finalized by an isolated Hydra subprocess.
+
+        No Hydra C++ objects are created here.  This is required because the
+        plugin factory used by the Python binding cannot be initialized twice
+        safely in one process.
+        """
+
+        if self._integration is not None:
+            raise RuntimeError("cannot adopt output while Hydra is initialized")
+        required = (
+            self.output_dir / "backend" / "mesh.ply",
+            self.output_dir / "backend" / "dsg.json",
+        )
+        missing = [str(path) for path in required if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(
+                "isolated Hydra postpass output is incomplete: "
+                + ", ".join(missing)
+            )
+        self._adopted_stats = dict(stats or {})
+        self._finalized = True
+
     def stats(self) -> dict:
         values = (
-            {} if self._integration is None else dict(self._integration.get_stats())
+            dict(self._adopted_stats)
+            if self._integration is None
+            else dict(self._integration.get_stats())
         )
         processing_times = values.pop("processing_times", [])
         if processing_times:

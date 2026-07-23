@@ -525,15 +525,41 @@ def validate_realtime_run(
             and bool(semantic_models.get("labelspace_colors", {}).get("sha256")),
             semantic_models,
         )
+    precomputed_depth = foundation.get("precomputed_provenance") or {}
+    precomputed_backend = str(precomputed_depth.get("backend") or "").strip()
+    if precomputed_backend == "fast-foundation-stereo":
+        depth_profile_valid = (
+            foundation.get("valid_iters") is not None
+            and foundation.get("precision") is not None
+            and bool(foundation.get("checkpoint_sha256"))
+            and bool(precomputed_depth.get("report_sha256"))
+            and int(precomputed_depth.get("processed", 0)) > 0
+            and int(precomputed_depth.get("failed", -1)) == 0
+        )
+    else:
+        depth_profile_valid = (
+            foundation.get("valid_iters") is not None
+            and foundation.get("scale") is not None
+            and foundation.get("precision") is not None
+            and bool(foundation.get("checkpoint_sha256"))
+        )
     check(
         "depth.resolved_profile",
-        foundation.get("valid_iters") is not None
-        and foundation.get("scale") is not None
-        and foundation.get("precision") is not None
-        and bool(foundation.get("checkpoint_sha256")),
+        depth_profile_valid,
         {
-            key: foundation.get(key)
-            for key in ("valid_iters", "scale", "precision", "checkpoint_sha256")
+            "backend": precomputed_backend or "foundation-stereo",
+            **{
+                key: foundation.get(key)
+                for key in (
+                    "valid_iters",
+                    "scale",
+                    "precision",
+                    "checkpoint_sha256",
+                )
+            },
+            "precomputed_report_sha256": precomputed_depth.get("report_sha256"),
+            "processed": precomputed_depth.get("processed"),
+            "failed": precomputed_depth.get("failed"),
         },
     )
 

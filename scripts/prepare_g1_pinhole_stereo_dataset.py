@@ -9,13 +9,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 import yaml
+from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
 from build_synchronized_stereo_dataset import (
     camera_timestamps,
     compose_global_camera_poses,
     load_jsonl,
+    map_pose_sample,
     monotonic_matches,
+    odom_pose_sample,
 )
 
 
@@ -29,7 +32,35 @@ def parse_args():
     parser.add_argument("--src", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--sequence", default="000000")
+    parser.add_argument(
+        "--base-pose-source",
+        choices=("odom", "map"),
+        default="odom",
+        help=(
+            "World-frame base pose stream. Use map for recorded map_T_base_link "
+            "poses in state/<sequence>/map_pose.jsonl."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-source",
+        type=Path,
+        help=(
+            "Capture root providing calibrations/<sequence>. This is required "
+            "when the image capture omitted numeric calibration; current-capture "
+            "epipolar geometry is still validated."
+        ),
+    )
     parser.add_argument("--max-delta-ms", type=float, default=10.0)
+    parser.add_argument(
+        "--input-projection-model",
+        choices=("auto", "kannala_brandt", "pinhole_rectified"),
+        default="auto",
+        help=(
+            "Projection model of the stored input pixels. Auto treats zero-"
+            "distortion images under 2d_rect with roi.do_rectify=true as "
+            "already rectified pinhole images, avoiding a second fisheye warp."
+        ),
+    )
     parser.add_argument("--horizontal-fov-deg", type=float, default=100.0)
     parser.add_argument(
         "--down-fov-deg",
@@ -65,7 +96,7 @@ def parse_args():
             "validated before the report is accepted."
         ),
     )
-    parser.add_argument("--recommended-max-depth-m", type=float, default=3.0)
+    parser.add_argument("--recommended-max-depth-m", type=float, default=5.0)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -125,6 +156,92 @@ def image_path(src: Path, record, camera: str) -> Path:
     return path.resolve() if path.is_absolute() else (src / path).resolve()
 
 
+def resolve_input_projection_model(
+    requested_model: str,
+    records,
+    source_calibration: dict,
+    distortion: np.ndarray,
+):
+    """Resolve whether stored pixels are raw fisheye or already rectified.
+
+    ROS camera metadata can retain the physical lens model after the driver has
+    emitted rectified images.  Feeding those pixels through ``cv2.fisheye`` a
+    second time bends straight scene lines even when every D coefficient is
+    zero, because the zero-coefficient fisheye projection is still equidistant.
+    """
+
+    if requested_model not in {"auto", "kannala_brandt", "pinhole_rectified"}:
+        raise ValueError(f"Unsupported input projection model: {requested_model}")
+    image_paths = [
+        str(image.get("path", ""))
+        for record in records
+        for image in record.get("images", [])
+        if image.get("camera") in {"cam0", "cam1"}
+    ]
+    paths_are_rectified = bool(image_paths) and all(
+        "2d_rect" in Path(path).parts for path in image_paths
+    )
+    roi_declares_rectified = bool(
+        source_calibration.get("roi", {}).get("do_rectify", False)
+    )
+    zero_distortion = bool(
+        np.allclose(np.asarray(distortion), 0.0, rtol=0.0, atol=1.0e-12)
+    )
+    if requested_model == "auto":
+        model = (
+            "pinhole_rectified"
+            if paths_are_rectified and roi_declares_rectified and zero_distortion
+            else "kannala_brandt"
+        )
+        source = (
+            "rectified_path_zero_distortion_and_roi"
+            if model == "pinhole_rectified"
+            else "declared_lens_model"
+        )
+    else:
+        model = requested_model
+        source = "explicit_cli"
+    if model == "pinhole_rectified" and not zero_distortion:
+        raise ValueError(
+            "pinhole_rectified input requires zero stored-image distortion; "
+            "non-zero Kannala-Brandt coefficients describe raw fisheye pixels"
+        )
+    return model, {
+        "requested": requested_model,
+        "selected": model,
+        "selection_source": source,
+        "declared_distortion_model": str(
+            source_calibration.get("distortion_model", "")
+        ),
+        "image_paths_are_2d_rect": paths_are_rectified,
+        "roi_do_rectify": roi_declares_rectified,
+        "zero_distortion": zero_distortion,
+    }
+
+
+def filter_matches_to_pose_coverage(
+    matches,
+    left_timestamps: np.ndarray,
+    base_pose_timestamps,
+    camera_pose_timestamps,
+):
+    """Drop image pairs that would require endpoint-clamped world poses."""
+
+    lower_ns = max(min(base_pose_timestamps), min(camera_pose_timestamps))
+    upper_ns = min(max(base_pose_timestamps), max(camera_pose_timestamps))
+    retained = []
+    dropped = []
+    for match in matches:
+        timestamp_ns = int(left_timestamps[match[0]])
+        if lower_ns <= timestamp_ns <= upper_ns:
+            retained.append(match)
+        else:
+            dropped.append(match)
+    if not retained:
+        raise ValueError("No stereo pairs fall inside base/camera pose coverage")
+    return retained, dropped, int(lower_ns), int(upper_ns)
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -138,6 +255,7 @@ def load_fixed_stereo_calibration(
     K: np.ndarray,
     distortion: np.ndarray,
     baseline: float,
+    input_projection_model: str | None = None,
 ):
     report_path = report_path.resolve()
     try:
@@ -167,6 +285,19 @@ def load_fixed_stereo_calibration(
         report_distortion, current_distortion, rtol=0.0, atol=1.0e-12
     ):
         raise ValueError("Fixed stereo calibration source distortion does not match")
+    report_projection_model = report.get(
+        "effective_input_projection_model",
+        report.get("source_projection_model"),
+    )
+    if (
+        input_projection_model is not None
+        and report_projection_model is not None
+        and report_projection_model != input_projection_model
+    ):
+        raise ValueError(
+            "Fixed stereo calibration input projection model does not match: "
+            f"report={report_projection_model!r}, current={input_projection_model!r}"
+        )
     if camera0_R_camera1.shape != (3, 3) or not np.all(
         np.isfinite(camera0_R_camera1)
     ):
@@ -207,6 +338,9 @@ def load_fixed_stereo_calibration(
         "source_geometry_validation": {
             "intrinsics_match": True,
             "distortion_match": True,
+            "input_projection_model_match": (
+                report_projection_model in {None, input_projection_model}
+            ),
             "source_baseline_m": baseline,
             "report_translation_norm_m": translation_norm,
             "baseline_tolerance_m": baseline_tolerance,
@@ -310,6 +444,157 @@ def recover_stereo_pose(
     }
 
 
+def estimate_rectified_right_vertical_warp(
+    pixels_left: np.ndarray,
+    pixels_right: np.ndarray,
+    K: np.ndarray | None = None,
+    camera0_R_camera1: np.ndarray | None = None,
+) -> dict:
+    """Align an already-rectified right image without rotating the left image.
+
+    The capture stores ``2d_rect`` pixels, so the left image defines the image
+    camera used by TF and downstream semantics.  A second stereoRectify call
+    would rotate both views.  Instead, fit only the residual vertical mapping
+    of the right pixels while keeping their x coordinate unchanged.
+    """
+
+    left = np.asarray(pixels_left, dtype=np.float64).reshape(-1, 2)
+    right_source = np.asarray(pixels_right, dtype=np.float64).reshape(-1, 2)
+    if (K is None) != (camera0_R_camera1 is None):
+        raise ValueError("K and camera0_R_camera1 must be provided together")
+    if K is None:
+        source_to_left_orientation = np.eye(3, dtype=np.float64)
+    else:
+        K_array = np.asarray(K, dtype=np.float64).reshape(3, 3)
+        rotation = np.asarray(camera0_R_camera1, dtype=np.float64).reshape(3, 3)
+        # recoverPose returns camera1_R_camera0.  Rotate right-camera rays back
+        # into the left-camera orientation before fitting the small remaining
+        # vertical alignment.  This preserves the left image while retaining
+        # the physically meaningful horizontal disparity in the right view.
+        source_to_left_orientation = (
+            K_array @ rotation.T @ np.linalg.inv(K_array)
+        )
+        source_to_left_orientation /= source_to_left_orientation[2, 2]
+    right = cv2.perspectiveTransform(
+        right_source.reshape(-1, 1, 2), source_to_left_orientation
+    ).reshape(-1, 2)
+    if len(left) != len(right) or len(left) < 1000:
+        raise ValueError("At least 1000 paired pixels are required for rectification")
+    vertical_delta = left[:, 1] - right[:, 1]
+    design = np.column_stack((right[:, 0], right[:, 1], np.ones(len(right))))
+    affine = least_squares(
+        lambda values: design @ values - vertical_delta,
+        np.zeros(3, dtype=np.float64),
+        loss="huber",
+        f_scale=1.5,
+        max_nfev=100,
+    ).x
+    initial = np.array(
+        [affine[0], 1.0 + affine[1], affine[2], 0.0, 0.0],
+        dtype=np.float64,
+    )
+
+    def residuals(values: np.ndarray) -> np.ndarray:
+        denominator = values[3] * right[:, 0] + values[4] * right[:, 1] + 1.0
+        predicted_y = (
+            values[0] * right[:, 0]
+            + values[1] * right[:, 1]
+            + values[2]
+        ) / denominator
+        return predicted_y - left[:, 1]
+
+    result = least_squares(
+        residuals,
+        initial,
+        loss="huber",
+        f_scale=1.5,
+        max_nfev=100,
+    )
+    coefficients = result.x
+    residual = residuals(coefficients)
+    before = np.abs(vertical_delta)
+    after = np.abs(residual)
+    after_median = float(np.median(after))
+    after_p90 = float(np.percentile(after, 90.0))
+    if not result.success or after_median > 0.5 or after_p90 > 2.0:
+        raise RuntimeError(
+            "Right-only vertical stereo rectification is unreliable: "
+            f"success={result.success}, median={after_median:.3f}px, "
+            f"p90={after_p90:.3f}px"
+        )
+    return {
+        "model": "right_y_projective_x_preserving",
+        "coefficients_a_b_c_g_h": coefficients.tolist(),
+        "feature_matches": len(left),
+        "before_absolute_vertical_error_px_percentiles": np.percentile(
+            before, [0, 25, 50, 75, 90, 95, 99, 100]
+        ).tolist(),
+        "after_absolute_vertical_error_px_percentiles": np.percentile(
+            after, [0, 25, 50, 75, 90, 95, 99, 100]
+        ).tolist(),
+        "left_image_rotation_deg": 0.0,
+        "left_image_preserved": True,
+        "right_source_to_left_orientation_homography": (
+            source_to_left_orientation.tolist()
+        ),
+    }
+
+
+def invert_rectified_right_vertical_warp(
+    aligned_x: np.ndarray,
+    aligned_y: np.ndarray,
+    rectification: dict,
+) -> np.ndarray:
+    if rectification.get("model") != "right_y_projective_x_preserving":
+        raise ValueError("Unsupported right-image vertical rectification model")
+    a, b, c, g, h = np.asarray(
+        rectification["coefficients_a_b_c_g_h"], dtype=np.float64
+    )
+    denominator = aligned_y * h - b
+    if np.any(np.abs(denominator) < 1.0e-6):
+        raise RuntimeError("Right-image vertical rectification is singular")
+    return (
+        a * aligned_x + c - aligned_y * (g * aligned_x + 1.0)
+    ) / denominator
+
+
+def invert_rectified_right_remap(
+    aligned_x: np.ndarray,
+    aligned_y: np.ndarray,
+    rectification: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map left-oriented rectified pixels back into the right source image."""
+
+    oriented_y = invert_rectified_right_vertical_warp(
+        aligned_x, aligned_y, rectification
+    )
+    source_to_left_orientation = np.asarray(
+        rectification.get(
+            "right_source_to_left_orientation_homography", np.eye(3)
+        ),
+        dtype=np.float64,
+    ).reshape(3, 3)
+    left_orientation_to_source = np.linalg.inv(source_to_left_orientation)
+    denominator = (
+        left_orientation_to_source[2, 0] * aligned_x
+        + left_orientation_to_source[2, 1] * oriented_y
+        + left_orientation_to_source[2, 2]
+    )
+    if np.any(np.abs(denominator) < 1.0e-8):
+        raise RuntimeError("Right-image orientation homography is singular")
+    source_x = (
+        left_orientation_to_source[0, 0] * aligned_x
+        + left_orientation_to_source[0, 1] * oriented_y
+        + left_orientation_to_source[0, 2]
+    ) / denominator
+    source_y = (
+        left_orientation_to_source[1, 0] * aligned_x
+        + left_orientation_to_source[1, 1] * oriented_y
+        + left_orientation_to_source[1, 2]
+    ) / denominator
+    return source_x.astype(np.float32), source_y.astype(np.float32)
+
+
 def estimate_stereo_extrinsics(
     src: Path,
     records,
@@ -317,10 +602,11 @@ def estimate_stereo_extrinsics(
     K: np.ndarray,
     distortion: np.ndarray,
     baseline: float,
+    input_projection_model: str,
     calibration_report: Path | None = None,
     sample_count: int = 24,
 ):
-    """Estimate the omitted fisheye stereo rotation and baseline direction."""
+    """Estimate the omitted stereo rotation and baseline direction."""
     cv2.setRNGSeed(0)
     sift = cv2.SIFT_create(nfeatures=5000)
     matcher = cv2.BFMatcher()
@@ -371,12 +657,25 @@ def estimate_stereo_extrinsics(
         raise RuntimeError("No stereo features found for calibration")
     pixels_left = np.concatenate(left_points).reshape(-1, 1, 2)
     pixels_right = np.concatenate(right_points).reshape(-1, 1, 2)
-    normalized_left = cv2.fisheye.undistortPoints(
-        pixels_left, K, distortion
-    ).reshape(-1, 2)
-    normalized_right = cv2.fisheye.undistortPoints(
-        pixels_right, K, distortion
-    ).reshape(-1, 2)
+    if input_projection_model == "kannala_brandt":
+        normalized_left = cv2.fisheye.undistortPoints(
+            pixels_left, K, distortion
+        ).reshape(-1, 2)
+        normalized_right = cv2.fisheye.undistortPoints(
+            pixels_right, K, distortion
+        ).reshape(-1, 2)
+    elif input_projection_model == "pinhole_rectified":
+        zero_distortion = np.zeros(5, dtype=np.float64)
+        normalized_left = cv2.undistortPoints(
+            pixels_left, K, zero_distortion
+        ).reshape(-1, 2)
+        normalized_right = cv2.undistortPoints(
+            pixels_right, K, zero_distortion
+        ).reshape(-1, 2)
+    else:
+        raise ValueError(
+            f"Unsupported input projection model: {input_projection_model}"
+        )
     finite = (
         np.all(np.isfinite(normalized_left), axis=1)
         & np.all(np.isfinite(normalized_right), axis=1)
@@ -393,7 +692,11 @@ def estimate_stereo_extrinsics(
     if calibration_report is not None:
         camera0_R_camera1, camera0_t_camera1, evidence = (
             load_fixed_stereo_calibration(
-                calibration_report, K, distortion, baseline
+                calibration_report,
+                K,
+                distortion,
+                baseline,
+                input_projection_model,
             )
         )
         residuals = normalized_sampson_residuals(
@@ -427,12 +730,30 @@ def estimate_stereo_extrinsics(
                 f"inlier_ratio={inlier_ratio:.3f}, median={median_residual:.6f}, "
                 f"p95={p95_residual:.6f}"
             )
+        if input_projection_model == "pinhole_rectified":
+            evidence["right_vertical_rectification"] = (
+                estimate_rectified_right_vertical_warp(
+                    pixels_left,
+                    pixels_right,
+                    K,
+                    camera0_R_camera1,
+                )
+            )
         return camera0_R_camera1, camera0_t_camera1, evidence
 
     camera0_R_camera1, camera0_t_camera1, evidence = recover_stereo_pose(
         normalized_left, normalized_right, baseline
     )
     evidence["sampled_pairs"] = len(sample_indices)
+    if input_projection_model == "pinhole_rectified":
+        evidence["right_vertical_rectification"] = (
+            estimate_rectified_right_vertical_warp(
+                pixels_left,
+                pixels_right,
+                K,
+                camera0_R_camera1,
+            )
+        )
     return camera0_R_camera1, camera0_t_camera1, evidence
 
 
@@ -475,6 +796,8 @@ def build_virtual_camera(
     optical_x_rotation_deg: float,
     camera0_R_camera1: np.ndarray,
     camera0_t_camera1: np.ndarray,
+    input_projection_model: str = "kannala_brandt",
+    right_vertical_rectification: dict | None = None,
 ):
     if not 30.0 <= horizontal_fov_deg < 170.0:
         raise ValueError("--horizontal-fov-deg must be in [30, 170)")
@@ -494,19 +817,35 @@ def build_virtual_camera(
         dtype=np.float64,
     )
 
-    stereo_R_left, stereo_R_right, _, _, _ = cv2.fisheye.stereoRectify(
-        K,
-        distortion,
-        K,
-        distortion,
-        (width, height),
-        camera0_R_camera1,
-        camera0_t_camera1,
-        flags=cv2.CALIB_ZERO_DISPARITY,
-        newImageSize=(width, height),
-        balance=0.0,
-        fov_scale=1.0,
-    )
+    if input_projection_model == "kannala_brandt":
+        stereo_R_left, stereo_R_right, _, _, _ = cv2.fisheye.stereoRectify(
+            K,
+            distortion,
+            K,
+            distortion,
+            (width, height),
+            camera0_R_camera1,
+            camera0_t_camera1,
+            flags=cv2.CALIB_ZERO_DISPARITY,
+            newImageSize=(width, height),
+            balance=0.0,
+            fov_scale=1.0,
+        )
+    elif input_projection_model == "pinhole_rectified":
+        if right_vertical_rectification is None:
+            raise ValueError(
+                "pinhole_rectified input requires right-only vertical "
+                "rectification evidence"
+            )
+        # The stored left pixels already define the rectified image camera.
+        # Preserve that camera exactly; only the right image receives the
+        # residual vertical correction estimated from current-capture matches.
+        stereo_R_left = np.eye(3, dtype=np.float64)
+        stereo_R_right = np.eye(3, dtype=np.float64)
+    else:
+        raise ValueError(
+            f"Unsupported input projection model: {input_projection_model}"
+        )
     # Apply a common rotation about the rectified optical X axis. It keeps the
     # virtual baseline horizontal while selecting the useful forward/floor view.
     level_rotation = Rotation.from_euler(
@@ -514,17 +853,36 @@ def build_virtual_camera(
     ).as_matrix()
     original_R_virtual_left = level_rotation @ stereo_R_left
     original_R_virtual_right = level_rotation @ stereo_R_right
-    maps = [
-        cv2.fisheye.initUndistortRectifyMap(
-            K,
-            distortion,
-            rotation,
-            virtual_K,
-            (width, height),
-            cv2.CV_32FC1,
+    if input_projection_model == "kannala_brandt":
+        maps = [
+            cv2.fisheye.initUndistortRectifyMap(
+                K,
+                distortion,
+                rotation,
+                virtual_K,
+                (width, height),
+                cv2.CV_32FC1,
+            )
+            for rotation in (original_R_virtual_left, original_R_virtual_right)
+        ]
+    else:
+        maps = [
+            cv2.initUndistortRectifyMap(
+                K,
+                np.zeros(5, dtype=np.float64),
+                rotation,
+                virtual_K,
+                (width, height),
+                cv2.CV_32FC1,
+            )
+            for rotation in (original_R_virtual_left, original_R_virtual_right)
+        ]
+        aligned_x, aligned_y = maps[1]
+        maps[1] = invert_rectified_right_remap(
+            aligned_x,
+            aligned_y,
+            right_vertical_rectification,
         )
-        for rotation in (original_R_virtual_left, original_R_virtual_right)
-    ]
     valid_ratios = []
     for map_x, map_y in maps:
         valid = (
@@ -574,6 +932,11 @@ def main():
     args = parse_args()
     src = args.src.resolve()
     output = args.output.resolve()
+    calibration_source = (
+        args.calibration_source.resolve()
+        if args.calibration_source is not None
+        else src
+    )
 
     manifest = json.loads((src / "manifest.json").read_text())
     layout = manifest.get("layout_version") or manifest.get("layout")
@@ -594,7 +957,15 @@ def main():
         raise ValueError("No synchronized stereo pairs found")
 
     K, distortion, width, height, baseline, source_calibration = load_calibration(
-        src, args.sequence
+        calibration_source, args.sequence
+    )
+    input_projection_model, input_projection_evidence = (
+        resolve_input_projection_model(
+            args.input_projection_model,
+            records,
+            source_calibration,
+            distortion,
+        )
     )
     camera0_R_camera1, camera0_t_camera1, stereo_calibration = (
         estimate_stereo_extrinsics(
@@ -604,6 +975,7 @@ def main():
             K,
             distortion,
             baseline,
+            input_projection_model,
             args.stereo_calibration_report,
         )
     )
@@ -616,6 +988,30 @@ def main():
         )
     )
     optical_x_rotation_deg = args.rectification_roll_deg
+
+    base_pose_path = (
+        src
+        / "state"
+        / args.sequence
+        / ("map_pose.jsonl" if args.base_pose_source == "map" else "odom.jsonl")
+    )
+    base_pose_records = load_jsonl(base_pose_path)
+    base_pose_samples = [
+        (map_pose_sample(record) if args.base_pose_source == "map" else odom_pose_sample(record))
+        for record in base_pose_records
+    ]
+    camera_pose_timestamps = [
+        int(record["poses"]["head_camera"]["timestamp_ns"])
+        for record in aux_records
+    ]
+    matches, pose_coverage_dropped, pose_coverage_start_ns, pose_coverage_end_ns = (
+        filter_matches_to_pose_coverage(
+            matches,
+            left_ts,
+            [sample[0] for sample in base_pose_samples],
+            camera_pose_timestamps,
+        )
+    )
 
     (
         virtual_K,
@@ -635,15 +1031,19 @@ def main():
             optical_x_rotation_deg,
             camera0_R_camera1,
             camera0_t_camera1,
+            input_projection_model,
+            stereo_calibration.get("right_vertical_rectification"),
         )
     )
     prepare_output_directory(output, args.overwrite)
 
     selected_timestamps = left_ts[[left for left, _, _ in matches]]
-    global_poses, odom_clamped, camera_clamped = compose_global_camera_poses(
+    global_poses, base_pose_clamped, camera_clamped = compose_global_camera_poses(
         src,
         selected_timestamps,
         camera_quaternion_order=camera_quaternion_order,
+        base_pose_source=args.base_pose_source,
+        sequence=args.sequence,
     )
     for pose in global_poses:
         pose[:3, :3] = pose[:3, :3] @ original_R_virtual_left.T
@@ -737,10 +1137,11 @@ def main():
         "source_layout": layout,
         "sequence": args.sequence,
         "projection_model": "pinhole",
-        "pose_frame": "odom",
+        "pose_frame": args.base_pose_source,
+        "base_pose_source": args.base_pose_source,
         "camera_quaternion_order": camera_quaternion_order,
         "pose_composition": (
-            "odom_T_base_link @ base_link_T_head_camera "
+            f"{args.base_pose_source}_T_base_link @ base_link_T_head_camera "
             "@ original_camera_T_virtual_camera"
         ),
         "fx": camera_info["fx"],
@@ -758,7 +1159,10 @@ def main():
             "timestamp_definition": "(sensor_time_ns - time_origin_ns) / 1e9",
         },
         "pose_time_alignment": {
-            "method": "interpolate_odom_and_head_camera_at_cam0_sensor_time_ns",
+            "method": (
+                f"interpolate_{args.base_pose_source}_base_and_head_camera_at_"
+                "cam0_sensor_time_ns"
+            ),
             "pose_timestamp_file": "pose/pose_timestamps_ns.txt",
             "pose_row_field": "pose_row",
         },
@@ -776,7 +1180,26 @@ def main():
     virtual_down_z = np.asarray([pose[2, 1] for pose in global_poses])
     report = {
         "source_dataset": str(src),
-        "source_projection_model": source_calibration["distortion_model"],
+        "calibration_source_dataset": str(calibration_source),
+        "base_pose_source": args.base_pose_source,
+        "base_pose_file": str(
+            base_pose_path
+        ),
+        "source_projection_model": input_projection_model,
+        "declared_source_projection_model": source_calibration[
+            "distortion_model"
+        ],
+        "effective_input_projection_model": input_projection_model,
+        "stereo_rectification_policy": (
+            "preserve_left_right_relative_rotation_and_y_alignment"
+            if input_projection_model == "pinhole_rectified"
+            else "opencv_fisheye_stereo_rectify"
+        ),
+        "left_image_orientation_preserved": (
+            input_projection_model == "pinhole_rectified"
+            and abs(optical_x_rotation_deg) < 1.0e-12
+        ),
+        "input_projection_model_evidence": input_projection_evidence,
         "source_intrinsics": K.tolist(),
         "source_distortion": distortion.reshape(-1).tolist(),
         "virtual_projection_model": "pinhole",
@@ -796,7 +1219,19 @@ def main():
         "skipped_cam0": len(skipped_left),
         "skipped_cam1": len(skipped_right),
         "max_matched_delta_ms": max(delta for _, _, delta in matches) / 1.0e6,
-        "odom_interpolation_clamped": odom_clamped,
+        "pose_coverage_start_ns": pose_coverage_start_ns,
+        "pose_coverage_end_ns": pose_coverage_end_ns,
+        "pose_coverage_skipped_pairs": len(pose_coverage_dropped),
+        "pose_coverage_skipped_cam0_indices": [
+            int(left) for left, _, _ in pose_coverage_dropped
+        ],
+        "base_pose_interpolation_clamped": base_pose_clamped,
+        "odom_interpolation_clamped": (
+            base_pose_clamped if args.base_pose_source == "odom" else None
+        ),
+        "map_pose_interpolation_clamped": (
+            base_pose_clamped if args.base_pose_source == "map" else None
+        ),
         "camera_pose_interpolation_clamped": camera_clamped,
         "global_translation_first_m": translations[0].tolist(),
         "global_translation_last_m": translations[-1].tolist(),

@@ -38,6 +38,77 @@ def load_jsonl(path: Path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+def odom_pose_sample(record):
+    """Normalize legacy compact and ROS 2 nav_msgs odometry records."""
+    try:
+        odom = record["odom"]
+        if "timestamp_ns" in odom:
+            timestamp_ns = odom["timestamp_ns"]
+            position = odom["position"]
+            orientation = odom["orientation"]
+        else:
+            timestamp_ns = odom.get("header", {}).get(
+                "timestamp_ns", record["sensor_time_ns"]
+            )
+            pose = odom["pose"]["pose"]
+            position = pose["position"]
+            orientation = pose["orientation"]
+        if isinstance(position, dict):
+            position = [position[axis] for axis in ("x", "y", "z")]
+        if isinstance(orientation, dict):
+            orientation = [orientation[axis] for axis in ("x", "y", "z", "w")]
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            f"Malformed odometry record at tick {record.get('tick')}"
+        ) from error
+
+    position = np.asarray(position, dtype=np.float64)
+    orientation = np.asarray(orientation, dtype=np.float64)
+    if (
+        position.shape != (3,)
+        or orientation.shape != (4,)
+        or not np.isfinite(position).all()
+        or not np.isfinite(orientation).all()
+        or np.linalg.norm(orientation) == 0.0
+    ):
+        raise ValueError(f"Invalid odometry pose at tick {record.get('tick')}")
+    return int(timestamp_ns), position, orientation
+
+
+def map_pose_sample(record):
+    """Read a recorded TF ``map_T_base_link`` sample."""
+
+    try:
+        if record.get("target_frame") != "map" or record.get("source_frame") != "base_link":
+            raise ValueError(
+                "map pose must have target_frame=map and source_frame=base_link"
+            )
+        pose = record["pose"]
+        if pose.get("target_frame") != "map" or pose.get("source_frame") != "base_link":
+            raise ValueError(
+                "nested map pose must have target_frame=map and source_frame=base_link"
+            )
+        timestamp_ns = pose.get("timestamp_ns", record["sensor_time_ns"])
+        position = pose["position"]
+        orientation = pose["orientation_xyzw"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"Malformed map pose record at tick {record.get('tick')}"
+        ) from error
+
+    position = np.asarray(position, dtype=np.float64)
+    orientation = np.asarray(orientation, dtype=np.float64)
+    if (
+        position.shape != (3,)
+        or orientation.shape != (4,)
+        or not np.isfinite(position).all()
+        or not np.isfinite(orientation).all()
+        or np.linalg.norm(orientation) == 0.0
+    ):
+        raise ValueError(f"Invalid map pose at tick {record.get('tick')}")
+    return int(timestamp_ns), position, orientation
+
+
 def camera_timestamps(records, camera):
     values = []
     for record in records:
@@ -100,15 +171,26 @@ def interpolate_poses(timestamps, positions, quaternions, target_timestamps):
 
 
 def compose_global_camera_poses(
-    raw_source: Path, target_timestamps, camera_quaternion_order="xyzw"
+    raw_source: Path,
+    target_timestamps,
+    camera_quaternion_order="xyzw",
+    base_pose_source="odom",
+    sequence="000000",
 ):
-    odom_records = load_jsonl(raw_source / "state/000000/odom.jsonl")
-    odom_timestamps = [record["odom"]["timestamp_ns"] for record in odom_records]
-    odom_positions = [record["odom"]["position"] for record in odom_records]
-    odom_quaternions = [record["odom"]["orientation"] for record in odom_records]
+    if base_pose_source == "odom":
+        base_records = load_jsonl(raw_source / f"state/{sequence}/odom.jsonl")
+        base_samples = [odom_pose_sample(record) for record in base_records]
+    elif base_pose_source == "map":
+        base_records = load_jsonl(raw_source / f"state/{sequence}/map_pose.jsonl")
+        base_samples = [map_pose_sample(record) for record in base_records]
+    else:
+        raise ValueError(f"Unsupported base pose source: {base_pose_source}")
+    base_timestamps = [sample[0] for sample in base_samples]
+    base_positions = [sample[1] for sample in base_samples]
+    base_quaternions = [sample[2] for sample in base_samples]
 
     aux_records = load_jsonl(
-        raw_source / "poses/dense_global/000000/aux_poses.jsonl"
+        raw_source / f"poses/dense_global/{sequence}/aux_poses.jsonl"
     )
     camera_samples = [record["poses"]["head_camera"] for record in aux_records]
     camera_timestamps_ns = [sample["timestamp_ns"] for sample in camera_samples]
@@ -124,8 +206,8 @@ def compose_global_camera_poses(
             f"Unsupported camera quaternion order: {camera_quaternion_order}"
         )
 
-    world_t_base, world_r_base, odom_clamped = interpolate_poses(
-        odom_timestamps, odom_positions, odom_quaternions, target_timestamps
+    world_t_base, world_r_base, base_clamped = interpolate_poses(
+        base_timestamps, base_positions, base_quaternions, target_timestamps
     )
     base_t_camera, base_r_camera, camera_clamped = interpolate_poses(
         camera_timestamps_ns,
@@ -144,7 +226,7 @@ def compose_global_camera_poses(
         matrix[:3, :3] = rotation.as_matrix()
         matrix[:3, 3] = translation
         matrices.append(matrix)
-    return matrices, odom_clamped, camera_clamped
+    return matrices, base_clamped, camera_clamped
 
 
 def main():

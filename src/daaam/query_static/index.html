@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#f3f6fa" />
+    <meta
+      name="description"
+      content="DAAAM 独立语义地图查询：mesh 俯视定位、FastSAM 图片证据与候选详情。"
+    />
+    <title>DAAAM · 语义地图查询</title>
+    <link rel="stylesheet" href="/static/query.css" />
+    <script src="/static/query.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#map-stage">跳到地图</a>
+
+    <div class="query-app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span><span></span>
+          </div>
+          <div>
+            <strong>DAAAM</strong>
+            <span>语义地图查询</span>
+          </div>
+        </div>
+
+        <form class="map-loader" id="map-loader">
+          <label for="map-path">语义地图输出路径</label>
+          <div class="path-control">
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M3.5 7.5h6l2-2h9v13h-17Z" />
+            </svg>
+            <input
+              id="map-path"
+              name="map-path"
+              type="text"
+              list="available-maps"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="/home/user/Code/DAAAM_Origin/output/<semantic-run>"
+            />
+            <datalist id="available-maps"></datalist>
+            <button class="button button-primary" id="load-map-button" type="submit">
+              <span class="button-label">加载地图</span>
+              <span class="button-spinner" aria-hidden="true"></span>
+            </button>
+          </div>
+        </form>
+
+        <div class="service-state" id="service-state">
+          <i></i>
+          <div>
+            <strong id="service-state-title">连接中</strong>
+            <span id="service-state-copy">检查独立查询服务</span>
+          </div>
+        </div>
+      </header>
+
+      <main class="query-workspace">
+        <aside class="query-sidebar panel">
+          <div class="sidebar-scroll">
+            <section class="map-summary" aria-live="polite">
+              <div class="section-heading">
+                <div>
+                  <span class="eyebrow">Active map</span>
+                  <h1 id="map-name">尚未加载地图</h1>
+                </div>
+                <span class="map-state" id="map-state">未加载</span>
+              </div>
+              <p id="map-summary-copy">选择包含 dsg_updated.json 的语义地图输出目录。</p>
+              <div class="summary-grid">
+                <div><span>可查询物体</span><strong id="metric-objects">—</strong></div>
+                <div><span>Mesh 绑定</span><strong id="metric-mesh">—</strong></div>
+                <div><span>空间实体</span><strong id="metric-spatial">—</strong></div>
+                <div><span>证据覆盖</span><strong id="metric-evidence">—</strong></div>
+              </div>
+            </section>
+
+            <section class="query-section">
+              <div class="section-heading compact">
+                <div>
+                  <span class="eyebrow">Semantic retrieval</span>
+                  <h2>查询物体</h2>
+                </div>
+                <span class="shortcut">⌘ Enter</span>
+              </div>
+              <form id="query-form">
+                <label class="query-input-wrap" for="query-input">
+                  <svg aria-hidden="true" viewBox="0 0 24 24">
+                    <circle cx="10.5" cy="10.5" r="6.5" />
+                    <path d="m15.5 15.5 5 5" />
+                  </svg>
+                  <textarea
+                    id="query-input"
+                    rows="3"
+                    maxlength="500"
+                    placeholder="例如：黑色电脑显示器"
+                    disabled
+                  ></textarea>
+                </label>
+
+                <div class="query-options">
+                  <label>
+                    <span>候选数量</span>
+                    <select id="top-k" disabled>
+                      <option value="1">Top 1</option>
+                      <option value="3" selected>Top 3</option>
+                      <option value="5">Top 5</option>
+                      <option value="10">Top 10</option>
+                    </select>
+                  </label>
+                  <label class="toggle-control">
+                    <input id="require-mesh" type="checkbox" disabled />
+                    <span class="toggle-track"><i></i></span>
+                    <span>仅 Mesh 实体</span>
+                  </label>
+                </div>
+
+                <button class="button button-query" id="query-button" type="submit" disabled>
+                  <span class="button-label">在地图中查询</span>
+                  <span class="button-spinner" aria-hidden="true"></span>
+                  <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6" /></svg>
+                </button>
+              </form>
+
+              <div class="suggestions" aria-label="查询示例">
+                <span>试试</span>
+                <button type="button" data-query="黑色电脑显示器">黑色电脑显示器</button>
+                <button type="button" data-query="白色桌子">白色桌子</button>
+                <button type="button" data-query="天花板灯">天花板灯</button>
+              </div>
+            </section>
+
+            <section class="results-section">
+              <div class="section-heading compact">
+                <div>
+                  <span class="eyebrow">Ranked candidates</span>
+                  <h2>查询候选</h2>
+                </div>
+                <span class="result-count" id="result-count">0</span>
+              </div>
+              <div class="decision-banner is-hidden" id="decision-banner"></div>
+              <div class="result-list" id="result-list">
+                <div class="empty-state small">
+                  <span class="empty-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
+                  <strong>等待查询</strong>
+                  <p>候选物体会按语义相似度排列。</p>
+                </div>
+              </div>
+            </section>
+
+            <section class="history-section">
+              <div class="section-heading compact">
+                <h2>最近查询</h2>
+                <button class="text-button" id="clear-history" type="button">清除</button>
+              </div>
+              <div class="history-list" id="history-list">
+                <span class="history-empty">暂无历史</span>
+              </div>
+            </section>
+          </div>
+        </aside>
+
+        <section class="map-panel panel" aria-label="Mesh 地图俯视图">
+          <header class="map-toolbar">
+            <div>
+              <span class="eyebrow">Mesh overview</span>
+              <div class="map-title-row">
+                <h2>俯视定位</h2>
+                <span id="map-query-caption">等待加载语义地图</span>
+              </div>
+            </div>
+            <div class="map-actions">
+              <button class="icon-button" id="zoom-out" type="button" aria-label="缩小" title="缩小">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 12h14" /></svg>
+              </button>
+              <button class="zoom-value" id="zoom-reset" type="button" title="重置视图">100%</button>
+              <button class="icon-button" id="zoom-in" type="button" aria-label="放大" title="放大">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 12h14M12 5v14" /></svg>
+              </button>
+              <span class="toolbar-divider"></span>
+              <button class="icon-button" id="fullscreen-map" type="button" aria-label="全屏地图" title="全屏">
+                <svg aria-hidden="true" viewBox="0 0 24 24">
+                  <path d="M9 4H4v5M15 4h5v5M20 15v5h-5M4 15v5h5" />
+                </svg>
+              </button>
+              <a class="icon-button is-disabled" id="download-map" aria-label="下载俯视图" title="下载俯视图">
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 19h14" /></svg>
+              </a>
+            </div>
+          </header>
+
+          <div class="map-stage" id="map-stage" tabindex="0">
+            <div class="map-grid" aria-hidden="true"></div>
+            <img id="map-image" alt="语义地图 mesh 俯视图" draggable="false" />
+
+            <div class="map-placeholder" id="map-placeholder">
+              <div class="map-placeholder-glyph" aria-hidden="true">
+                <span></span><span></span><span></span><span></span>
+              </div>
+              <strong>加载一张语义地图</strong>
+              <p>中央区域将显示 RGB mesh 的 XY 俯视图。</p>
+            </div>
+
+            <div class="map-loading is-hidden" id="map-loading">
+              <span class="loading-ring" aria-hidden="true"></span>
+              <strong id="map-loading-title">正在加载语义地图</strong>
+              <p id="map-loading-copy">首次加载需要初始化多语种编码器。</p>
+            </div>
+
+            <div class="map-legend is-hidden" id="map-legend">
+              <span><i class="legend-star">★</i>Top 1</span>
+              <span><i class="legend-dot"></i>其他候选</span>
+              <span><i class="legend-camera">▲</i>证据相机</span>
+              <span><i class="legend-line"></i>观测连线</span>
+            </div>
+
+            <div class="map-help">滚轮缩放 · 拖动平移 · 双击重置</div>
+          </div>
+
+          <footer class="map-footer">
+            <div class="selected-location">
+              <span>当前选中</span>
+              <strong id="selected-node">—</strong>
+              <code id="selected-position">x — · y — · z —</code>
+            </div>
+            <div class="export-state">
+              <span>查询产物</span>
+              <a class="is-disabled" id="download-report">等待查询</a>
+            </div>
+          </footer>
+        </section>
+
+        <aside class="evidence-panel panel">
+          <header class="evidence-header">
+            <div>
+              <span class="eyebrow">Visual evidence</span>
+              <h2>图片证据</h2>
+            </div>
+            <span class="evidence-state" id="evidence-state">未选择</span>
+          </header>
+
+          <div class="evidence-scroll">
+            <section class="evidence-visual">
+              <img id="evidence-image" alt="FastSAM 查询物体图片证据" />
+              <div class="evidence-placeholder" id="evidence-placeholder">
+                <svg aria-hidden="true" viewBox="0 0 48 48">
+                  <rect x="6" y="8" width="36" height="32" rx="4" />
+                  <circle cx="18" cy="19" r="4" />
+                  <path d="m10 35 9-9 7 6 5-5 7 8" />
+                </svg>
+                <strong>查询后显示证据</strong>
+                <p>图片来自对应对象的精确 FastSAM mask 帧。</p>
+              </div>
+              <div class="evidence-badge is-hidden" id="evidence-badge">FastSAM</div>
+            </section>
+
+            <div class="evidence-actions">
+              <a class="button button-secondary is-disabled" id="open-evidence" target="_blank" rel="noopener">
+                查看原图
+              </a>
+              <a class="button button-secondary is-disabled" id="download-evidence" download>
+                下载证据
+              </a>
+            </div>
+
+            <section class="object-card" id="object-card">
+              <div class="object-identity">
+                <div>
+                  <span class="rank-badge" id="object-rank">—</span>
+                  <div>
+                    <strong id="object-id">尚未选择物体</strong>
+                    <span id="object-geometry">—</span>
+                  </div>
+                </div>
+                <div class="score-ring" id="score-ring" style="--score: 0">
+                  <strong id="object-score">—</strong>
+                  <span>相似度</span>
+                </div>
+              </div>
+              <p class="object-description" id="object-description">
+                查询候选的描述、坐标与证据元数据会显示在这里。
+              </p>
+            </section>
+
+            <section class="metadata-section">
+              <div class="section-heading compact"><h3>空间信息</h3></div>
+              <dl class="metadata-list">
+                <div><dt>世界坐标</dt><dd id="meta-position">—</dd></div>
+                <div><dt>包围盒尺寸</dt><dd id="meta-dimensions">—</dd></div>
+                <div><dt>语义标签</dt><dd id="meta-label">—</dd></div>
+                <div><dt>数据来源</dt><dd id="meta-source">—</dd></div>
+              </dl>
+            </section>
+
+            <section class="metadata-section">
+              <div class="section-heading compact"><h3>证据溯源</h3></div>
+              <dl class="metadata-list">
+                <div><dt>帧编号</dt><dd id="meta-frame">—</dd></div>
+                <div><dt>观测时间</dt><dd id="meta-time">—</dd></div>
+                <div><dt>Mask 像素</dt><dd id="meta-mask">—</dd></div>
+                <div><dt>相机坐标</dt><dd id="meta-camera">—</dd></div>
+                <div class="hash-row"><dt>图片 SHA-256</dt><dd id="meta-hash">—</dd></div>
+              </dl>
+            </section>
+          </div>
+        </aside>
+      </main>
+    </div>
+
+    <div class="toast-region" id="toast-region" aria-live="polite"></div>
+    <noscript><div class="noscript">该界面需要启用 JavaScript。</div></noscript>
+  </body>
+</html>

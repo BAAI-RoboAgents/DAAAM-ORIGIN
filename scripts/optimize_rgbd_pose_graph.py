@@ -74,9 +74,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--optimizer-mode",
-        choices=("gravity-se3", "planar-gravity", "se3-projected"),
+        choices=("source", "gravity-se3", "planar-gravity", "se3-projected"),
         default="gravity-se3",
         help=(
+            "source preserves an authoritative external-map trajectory; "
             "gravity-se3 optimizes full poses with height/tilt priors; "
             "planar-gravity preserves height/roll/pitch exactly; se3-projected "
             "retains the legacy two-step method."
@@ -708,6 +709,7 @@ def prepare_output(source: Path, output: Path, overwrite: bool) -> None:
         "keyframe_selection_report.json",
         "floor_calibration_application.json",
         "foundation_stereo_nominal_run.json",
+        "fast_foundation_stereo_run.json",
         "trajectory_refinement.json",
     ):
         source_path = source / name
@@ -730,10 +732,17 @@ def write_output(
         )
     )
     tick_index = copy.deepcopy(json.loads((source / "tick_index.json").read_text()))
+    source_preserved = report.get("parameters", {}).get("optimizer_mode") == "source"
     tick_index["trajectory_refinement"] = {
-        "method": "robot_prior_rgbd_odometry_verified_loop_pose_graph",
+        "method": (
+            "authoritative_source_trajectory"
+            if source_preserved
+            else "robot_prior_rgbd_odometry_verified_loop_pose_graph"
+        ),
         "report": "global_pose_graph_report.json",
-        "source_pose_use": "weak_consecutive_prior",
+        "source_pose_use": (
+            "preserved_exactly" if source_preserved else "weak_consecutive_prior"
+        ),
     }
     (output / "tick_index.json").write_text(json.dumps(tick_index, indent=2) + "\n")
     (output / "global_pose_graph_report.json").write_text(
@@ -757,13 +766,17 @@ def main() -> None:
         args.temporal_report.resolve(), frame_count
     )
     loop_report = json.loads(args.loop_report.resolve().read_text())
-    selected_loops = select_loop_candidates(
-        loop_report,
-        source_poses,
-        frame_count,
-        args.loop_cluster_radius_frames,
-        args.max_loop_edges,
-        args.max_loop_gravity_residual_deg,
+    selected_loops = (
+        []
+        if args.optimizer_mode == "source"
+        else select_loop_candidates(
+            loop_report,
+            source_poses,
+            frame_count,
+            args.loop_cluster_radius_frames,
+            args.max_loop_edges,
+            args.max_loop_gravity_residual_deg,
+        )
     )
 
     edges = []
@@ -840,7 +853,15 @@ def main() -> None:
         if args.planar_initialization == "rgbd-odometry"
         else source_poses
     )
-    if args.optimizer_mode == "planar-gravity":
+    if args.optimizer_mode == "source":
+        optimized = source_poses.copy()
+        optimization_report = {
+            "mode": "source",
+            "success": True,
+            "message": "Authoritative source trajectory preserved exactly.",
+            "initialization": "source",
+        }
+    elif args.optimizer_mode == "planar-gravity":
         optimized, optimization_report = optimize_planar_gravity(
             source_poses, edges, args.iterations, visual_initial
         )

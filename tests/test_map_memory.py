@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 
@@ -88,6 +89,118 @@ def test_user_name_and_alias_survive_reopen_and_automatic_correction(tmp_path):
     assert entity["canonical_name"] == "dining table"
     assert entity["name_locked"]
     assert "large table" in entity["aliases"]
+    reopened.close()
+
+
+def test_entity_observation_history_preserves_sensor_origin_and_interval(tmp_path):
+    database = tmp_path / "map_memory.sqlite3"
+    memory = make_memory(database)
+    memory.set_time_origin_ns(ORIGIN_NS)
+    memory.create_session("session-a", ORIGIN_NS, canonical=True)
+    entity_id, _ = memory.observe_entity(
+        "session-a",
+        "track-1",
+        np.array([1.0, 0.0, 0.0]),
+        sensor_time_ns=ORIGIN_NS + 1_000_000_000,
+        semantic_label="chair",
+        dimensions_m=np.array([0.5, 0.5, 1.0]),
+    )
+    memory.observe_entity(
+        "session-a",
+        "track-1",
+        np.array([1.1, 0.0, 0.0]),
+        sensor_time_ns=ORIGIN_NS + 4_000_000_000,
+        semantic_label="chair",
+        dimensions_m=np.array([0.5, 0.5, 1.0]),
+    )
+
+    history = memory.get_entity(entity_id)["temporal_history"]
+
+    assert memory.time_origin_ns == ORIGIN_NS
+    assert history["observation_count"] == 2
+    assert history["first_observed_ns"] == ORIGIN_NS + 1_000_000_000
+    assert history["last_observed_ns"] == ORIGIN_NS + 4_000_000_000
+    assert history["time_origin_source"] == "dataset_time_contract"
+    assert history["first_observed"] == pytest.approx(1.0)
+    assert history["last_observed"] == pytest.approx(4.0)
+    assert history["time_reference"] == "seconds_from_time_origin_ns"
+    memory.close()
+
+    reopened = make_memory(database)
+    assert reopened.get_entity(entity_id)["temporal_history"] == history
+    reopened.close()
+
+
+def test_local_track_is_split_on_3d_discontinuity_and_position_is_robust(tmp_path):
+    memory = make_memory(tmp_path / "memory.sqlite3")
+    memory.create_session("session-a", ORIGIN_NS, canonical=True)
+    dimensions = np.array([0.4, 0.4, 0.8])
+    first_id, created = memory.observe_entity(
+        "session-a",
+        "botsort:7",
+        np.array([0.0, 0.0, 0.4]),
+        sensor_time_ns=ORIGIN_NS + 1,
+        semantic_label="chair",
+        dimensions_m=dimensions,
+        confidence=0.9,
+    )
+    assert created
+    for index, x in enumerate((0.1, 0.2), start=2):
+        entity_id, created = memory.observe_entity(
+            "session-a",
+            "botsort:7",
+            np.array([x, 0.0, 0.4]),
+            sensor_time_ns=ORIGIN_NS + index,
+            semantic_label="chair",
+            dimensions_m=dimensions,
+            confidence=0.9,
+        )
+        assert entity_id == first_id
+        assert not created
+
+    assert memory.get_entity(first_id)["position_m"] == pytest.approx(
+        [0.1, 0.0, 0.4]
+    )
+
+    second_id, created = memory.observe_entity(
+        "session-a",
+        "botsort:7",
+        np.array([3.0, 0.0, 0.4]),
+        sensor_time_ns=ORIGIN_NS + 4,
+        semantic_label="chair",
+        dimensions_m=dimensions,
+        confidence=0.9,
+    )
+    assert created
+    assert second_id != first_id
+    assert memory.get_entity(first_id)["temporal_history"]["observation_count"] == 3
+    assert memory.get_entity(second_id)["temporal_history"]["observation_count"] == 1
+    assert any(
+        row["action"] == "local_track_reassociated"
+        and row["entity_id"] == second_id
+        for row in memory.audit_log()
+    )
+    memory.close()
+
+
+def test_legacy_entity_versions_backfill_observation_history(tmp_path):
+    database = tmp_path / "legacy.sqlite3"
+    memory = make_memory(database)
+    entity_id = create_table(memory)
+    memory.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute("DELETE FROM entity_observations")
+        connection.execute("DELETE FROM metadata WHERE key='time_origin_ns'")
+
+    reopened = make_memory(database)
+    history = reopened.get_entity_observation_history(entity_id)
+
+    assert reopened.time_origin_ns == ORIGIN_NS + 1
+    assert history["observation_count"] == 1
+    assert history["first_observed_ns"] == ORIGIN_NS + 1
+    assert history["last_observed_ns"] == ORIGIN_NS + 1
+    assert history["first_observed"] == 0.0
+    assert history["last_observed"] == 0.0
     reopened.close()
 
 

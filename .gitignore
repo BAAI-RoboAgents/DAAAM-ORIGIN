@@ -3,6 +3,7 @@ output/*
 checkpoints/*
 config/labels_pseudo.*
 null/
+data/*
 
 # Environments
 .env

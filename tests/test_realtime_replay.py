@@ -22,6 +22,7 @@ from run_realtime_mapping import (  # noqa: E402
     RealtimeResourceState,
     add_semantic_runtime_metrics,
     cleanup_realtime_resources,
+    evaluate_dam_runtime_gate,
     load_precomputed_depth_provenance,
     load_semantic_model_provenance,
     resolve_environment_python,
@@ -297,6 +298,38 @@ def test_precomputed_depth_manifest_keeps_generation_profile_and_report_hash(tmp
     assert model["precomputed_provenance"]["report_sha256"]
 
 
+def test_fast_precomputed_depth_manifest_keeps_generation_provenance(tmp_path):
+    dataset = create_dataset(tmp_path)
+    checkpoint = tmp_path / "fast_model.pth"
+    checkpoint.write_bytes(b"fast depth model")
+    (dataset / "fast_foundation_stereo_run.json").write_text(
+        json.dumps(
+            {
+                "settings": {
+                    "iterations": 8,
+                    "precision": "fp16",
+                    "confidence_mode": "left-right",
+                    "maximum_depth_m": 5.0,
+                },
+                "artifacts": {
+                    "checkpoint": str(checkpoint),
+                    "checkpoint_sha256": "recorded-checkpoint-hash",
+                },
+                "processed": 4,
+                "failed": 0,
+            }
+        )
+    )
+    provenance = load_precomputed_depth_provenance(dataset)
+    assert provenance is not None
+    assert provenance["backend"] == "fast-foundation-stereo"
+    assert provenance["profile"] == "fast-i8-fullres"
+    assert provenance["valid_iters"] == 8
+    assert provenance["precision"] == "fp16"
+    assert provenance["confidence_mode"] == "left-right"
+    assert provenance["checkpoint_sha256"] == "recorded-checkpoint-hash"
+
+
 def test_semantic_dry_run_records_independent_real_frontend_branch(tmp_path):
     dataset = create_dataset(tmp_path)
     run_dir = tmp_path / "semantic-dry"
@@ -306,17 +339,31 @@ def test_semantic_dry_run_records_independent_real_frontend_branch(tmp_path):
         "--dry-run",
         "--semantic-mode",
         "frontend",
+        "--entity-merge-distance-m",
+        "0.075",
+        "--object-binding-maximum-center-distance-m",
+        "0.10",
+        "--object-binding-maximum-aabb-gap-m",
+        "0.025",
     )
     plan = json.loads((run_dir / "dry_run_plan.json").read_text())
+    configuration = json.loads(
+        (run_dir / "run_manifest.json").read_text()
+    )["configuration"]
     assert plan["stages"] == ["pose", "depth", "dynamic", "fusion"]
     assert plan["semantic_branch"] == [
         "depth",
         "semantic_frontend",
         "frontend",
     ]
+    assert configuration["map_memory"]["entity_merge_distance_m"] == 0.075
+    assert configuration["semantic"]["object_binding_policy"] == {
+        "maximum_center_distance_m": 0.10,
+        "maximum_aabb_gap_m": 0.025,
+    }
 
 
-def test_dam_dry_run_enables_replay_activity_heartbeat(tmp_path):
+def test_dam_dry_run_scopes_activity_heartbeat_to_gpu_leases(tmp_path):
     dataset = create_dataset(tmp_path)
     hydra_config = tmp_path / "hydra.yaml"
     hydra_config.write_text("frontend: {}\n")
@@ -339,7 +386,45 @@ def test_dam_dry_run_enables_replay_activity_heartbeat(tmp_path):
         (run_dir / "run_manifest.json").read_text()
     )["configuration"]["gpu_coordination"]
     assert gpu_configuration["dam_minimum_idle_s"] == 1.0
+    assert gpu_configuration["activity_scope"] == "gpu_lease"
     assert gpu_configuration["activity_heartbeat_interval_s"] == 0.25
+
+
+def test_dam_runtime_gate_rejects_incomplete_entity_catchup():
+    semantic_stats = {
+        "startup": {"ready_before_first_frame": True},
+        "prompt_catchup": {
+            "complete": True,
+            "pending_entities": 0,
+            "unsubmitted_entities": 0,
+        },
+        "grounding_workers": {
+            "all_ready": True,
+            "workers": [
+                {
+                    "drained": True,
+                    "is_alive": False,
+                    "exitcode": 0,
+                    "timed_out": False,
+                    "forced_termination": False,
+                }
+            ],
+            "shutdown": {
+                "drain_requested": True,
+                "drain_complete": True,
+                "correction_tail_enqueued": True,
+                "timed_out": False,
+                "forced_termination": False,
+                "error": None,
+            },
+        },
+    }
+
+    assert evaluate_dam_runtime_gate(semantic_stats)["passed"] is True
+    semantic_stats["prompt_catchup"]["pending_entities"] = 1
+    gate = evaluate_dam_runtime_gate(semantic_stats)
+    assert gate["passed"] is False
+    assert gate["failures"] == ["prompt_catchup_complete"]
 
 
 def test_semantic_model_latency_is_reported_under_real_stage_names():

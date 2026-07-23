@@ -229,20 +229,23 @@ class SentenceEmbeddingHandler:
 			logger: Optional logger for output messages
 		"""
 
-		self.device = device
+		# SentenceTransformer otherwise auto-selects CUDA even when callers ask
+		# for CPU (for example, query-map preparation alongside a live GPU job).
+		self.device = device if device != "cuda" or torch.cuda.is_available() else "cpu"
 		self.model_name = model_name
 		self.logger = logger or get_default_logger()
 		
 		# Load sentence embedding model
 		self.logger.info(f"Loading sentence embedding model {model_name}...")
 		self.sentence_embedding_model = SentenceTransformer(
-			model_name, 
+			model_name,
+			device=self.device,
 			model_kwargs=model_kwargs, 
 			tokenizer_kwargs=tokenizer_kwargs
 		)
-		if device == "cuda" and torch.cuda.is_available():
-			self.sentence_embedding_model = self.sentence_embedding_model.cuda()
-		self.logger.info(f"Sentence embedding model loaded successfully on {device}")
+		self.logger.info(
+			f"Sentence embedding model loaded successfully on {self.device}"
+		)
 
 	def extract_text_embeddings(
 			self, 

@@ -150,6 +150,34 @@ def test_hydra_close_without_finalize_only_releases_pipeline(tmp_path):
     assert not backend.stats()["finalized"]
 
 
+def test_hydra_backend_adopts_isolated_final_output_without_initializing(tmp_path):
+    config = tmp_path / "hydra.yaml"
+    config.write_text("frontend: {}\n")
+    output = tmp_path / "isolated-map"
+    (output / "backend").mkdir(parents=True)
+    (output / "backend" / "mesh.ply").write_text("ply\n")
+    (output / "backend" / "dsg.json").write_text("{}\n")
+    factory_called = False
+
+    def factory(**_kwargs):
+        nonlocal factory_called
+        factory_called = True
+        return FakeHydraIntegration()
+
+    backend = HydraStaticMapBackend(
+        config,
+        output,
+        integration_factory=factory,
+    )
+
+    backend.adopt_finalized_output({"frames_processed": 40})
+
+    assert not factory_called
+    assert backend.stats()["frames_processed"] == 40
+    assert backend.stats()["finalized"] is True
+    backend.close(finalize=False)
+
+
 def test_hydra_close_shuts_down_when_finalize_fails(tmp_path):
     class FailingSaveIntegration(FakeHydraIntegration):
         def save_results(self, _output):

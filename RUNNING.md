@@ -162,7 +162,7 @@ python scripts/visualize_depth.py \
   --dataset /path/to/prepared_stereo_dataset \
   --frame 600 \
   --min-depth-m 0.25 \
-  --max-depth-m 3.0
+  --max-depth-m 5.0
 ```
 
 The default `turbo` color map uses the same fixed range for every frame; black
@@ -467,20 +467,57 @@ View the final scene graph with the Rerun-based static visualizer (requires reru
 ```bash
 python scripts/run_static_visualizer.py \
   --dsg output/my_run/dsg_updated.json \
-  --color-map config/labels_pseudo.csv \
   --spawn
 ```
+
+The viewer automatically discovers checksum-bound `dsg_updated.semantic.json` and
+`dsg_updated.evidence.json` sidecars. When the evidence provenance points to an accepted direct RGB-D
+fusion, the default **Dense RGB-D Overview** tab uses that color point cloud as the complete visual
+context and overlays only mesh-bound semantic objects. **Clean Map** retains the cleaned 5 cm Hydra
+mesh for authoritative geometry inspection, **All Recognized Objects** exposes every RGB-D mask
+cloud for recall inspection, and **DSG Debug** retains the complete graph. This separation prevents
+duplicated spatial-only detections, high-altitude debug layers, labels, and floating image cards from
+affecting normal map auto-fit.
+
+RGB-D mask clouds are reconstructed by joining each FastSAM mask pixel with its depth pixel and
+camera pose, rather than combining independent median mask/depth values. Their coordinates therefore
+share the map world frame and their colors are sampled from the original image. Small disconnected
+main-mesh components below 0.005 m² are hidden at display time; the source mesh is not modified.
 
 | Argument | Default | Description |
 |---|---|---|
 | `--dsg` | | Path to DSG JSON file |
-| `--color-map` | `config/labels_pseudo.csv` | Label color map |
+| `--color-map` | | Optional label color map; otherwise deterministic semantic colors are used |
 | `--gt-dsgs` | | Ground truth DSG(s) for comparison |
-| `--log-object-meshes` | `false` | Log individual object meshes |
+| `--log-object-meshes` / `--no-log-object-meshes` | enabled | Log individual object meshes |
+| `--main-mesh-opacity` | `0.90` | Opacity of the full-scene mesh |
+| `--main-mesh-min-component-area-m2` | `0.005` | Hide smaller disconnected scene-mesh components at display time |
+| `--object-mesh-colors` | `rgb` | Use original `rgb` colors or stable `semantic` colors |
+| `--no-semantic-sidecar` | disabled | Hide spatial-only semantic centers and boxes |
+| `--object-image-card-scope` | `none` | Floating FastSAM debug cards: `none`, `mesh-bound`, or `all` queryable entities |
+| `--object-mask-cloud-scope` | `all` | Load RGB-D mask clouds for `none`, `mesh-bound`, or `all` queryable entities; the Clean Map tab still selects mesh-bound only |
+| `--mask-cloud-point-size-ui` | `1.25` | Fixed screen-space RGB-D mask-point radius; it does not grow into spheres when zooming in |
+| `--mask-cloud-point-radius-m` | unset | Optional world-space override for diagnostic comparisons |
+| `--dense-map` | auto | Explicit accepted direct RGB-D fusion PLY; otherwise discover it through evidence pose provenance and checksum-bound acceptance |
+| `--no-dense-map` | disabled | Disable the Dense RGB-D Overview tab |
+| `--dense-map-point-size-ui` | `1.0` | Fixed screen-space dense-map point radius; it stays visually stable while zooming |
+| `--dense-map-point-radius-m` | unset | Optional world-space override for diagnostic comparisons |
+| `--image-card-scale` | `0.75` | Image-card height relative to object size |
+| `--image-card-max-height-m` | `1.0` | Maximum image-card height in meters |
+| `--image-card-grid-step-px` | `8` | Texture-mask mesh resolution; smaller is smoother but heavier |
+| `--show-node-labels` | disabled | Show DSG node labels in the debug layers |
+| `--no-focused-blueprint` | disabled | Disable the Clean Map / All Recognized Objects / DSG Debug tab layout |
+| `--save-rrd` | | Save the recording to an RRD file instead of spawning a viewer |
 | `--spawn` / `--no-spawn` | `--spawn` | Open Rerun viewer automatically |
+| `--connect` | | Connect to an existing Rerun gRPC server instead of spawning the native viewer |
 | `--z-offset-objects` | `0.0` | Z offset for object layer |
 | `--z-offset-places` | `10.0` | Z offset for places layer |
 | `--z-offset-rooms` | `20.0` | Z offset for rooms layer |
+
+Use Dense RGB-D Overview for scene recognition and Clean Map for Hydra geometry inspection. Switch to
+All Recognized Objects only when checking semantic recall: spatial-only observations can overlap and
+look like ghost geometry. Floating cards are intentionally debug-only because an image plane is
+evidence, not world geometry.
 
 ## 8. Pipeline Outputs
 

@@ -73,7 +73,7 @@ def parse_args():
         type=float,
         help=(
             "Maximum output depth. Defaults to recommended_max_depth_m from "
-            "tick_index.json, or 20m for legacy datasets."
+            "tick_index.json, or 5m for legacy datasets."
         ),
     )
     parser.add_argument("--overwrite", action="store_true")
@@ -186,7 +186,7 @@ def main():
     max_depth_m = (
         args.max_depth_m
         if args.max_depth_m is not None
-        else float(metadata.get("recommended_max_depth_m", 20.0))
+        else float(metadata.get("recommended_max_depth_m", 5.0))
     )
     if max_depth_m <= 0.0 or max_depth_m > np.iinfo(np.uint16).max / 1000.0:
         raise ValueError(f"Invalid maximum depth: {max_depth_m}m")

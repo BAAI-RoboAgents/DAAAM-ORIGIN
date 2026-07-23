@@ -105,6 +105,21 @@ def create_rgbd_dataset(root: Path) -> tuple[Path, list[int]]:
 
 
 class RgbdMappingGuardTests(unittest.TestCase):
+    def test_rgbd_match_ratio_filter_skips_queries_without_two_neighbors(self):
+        refiner = load_script_module(
+            "refine_rgbd_trajectory_ratio_test",
+            REPOSITORY_ROOT / "scripts/refine_rgbd_trajectory.py",
+        )
+        accepted = SimpleNamespace(distance=1.0)
+        alternate = SimpleNamespace(distance=2.0)
+        incomplete = SimpleNamespace(distance=0.1)
+
+        matches = refiner.ratio_test_matches(
+            [[incomplete], [accepted, alternate]], ratio_test=0.75
+        )
+
+        self.assertEqual(matches, [accepted])
+
     def test_gravity_pose_graph_uses_accurate_scaled_sparse_solver(self):
         optimizer = load_script_module(
             "optimize_rgbd_pose_graph_solver_test",
@@ -211,6 +226,17 @@ class RgbdMappingGuardTests(unittest.TestCase):
             self.assertIn("select_mapping_keyframes.py", result.stdout)
             self.assertIn("filter_temporal_depth_consistency.py", result.stdout)
             self.assertIn("run_pipeline.py", result.stdout)
+            max_depth_commands = [
+                line for line in planned_commands if "--max-depth-m" in line
+            ]
+            self.assertTrue(max_depth_commands)
+            self.assertTrue(
+                all("--max-depth-m 5.0" in line for line in max_depth_commands)
+            )
+            map_command = next(
+                line for line in planned_commands if "run_pipeline.py" in line
+            )
+            self.assertIn("--depth-ub 5.0", map_command)
             self.assertIn('"status": "planned"', result.stdout)
             self.assertFalse(run_dir.exists())
 

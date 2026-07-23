@@ -161,6 +161,19 @@ class MapMemory:
             entity_id TEXT NOT NULL REFERENCES entities(entity_id),
             PRIMARY KEY(session_id, local_entity_id)
         );
+        CREATE TABLE IF NOT EXISTS entity_observations (
+            observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES sessions(session_id),
+            local_entity_id TEXT NOT NULL,
+            entity_id TEXT NOT NULL REFERENCES entities(entity_id),
+            sensor_time_ns INTEGER NOT NULL,
+            position_m TEXT NOT NULL,
+            dimensions_m TEXT,
+            confidence REAL NOT NULL,
+            UNIQUE(session_id, local_entity_id, sensor_time_ns)
+        );
+        CREATE INDEX IF NOT EXISTS entity_observations_entity_time_idx
+            ON entity_observations(entity_id, sensor_time_ns);
         CREATE TABLE IF NOT EXISTS semantic_operations (
             operation_id TEXT PRIMARY KEY,
             entity_id TEXT NOT NULL,
@@ -215,6 +228,23 @@ class MapMemory:
                 """UPDATE semantic_deliveries SET status='retry'
                     WHERE status='delivering'"""
             )
+            # Older databases recorded observations only as entity versions. Keep
+            # their original sensor clock as the global origin instead of using a
+            # process/session wall-clock start time.
+            self._connection.execute(
+                """INSERT OR IGNORE INTO metadata(key, value)
+                    SELECT 'time_origin_ns', CAST(MIN(sensor_time_ns) AS TEXT)
+                    FROM entity_versions
+                    WHERE action IN ('entity_created', 'entity_observed')
+                    HAVING MIN(sensor_time_ns) IS NOT NULL"""
+            )
+            if self._connection.execute(
+                "SELECT 1 FROM metadata WHERE key='time_origin_ns'"
+            ).fetchone() is not None:
+                self._connection.execute(
+                    """INSERT OR IGNORE INTO metadata(key, value)
+                        VALUES('time_origin_source', 'derived_first_entity_observation')"""
+                )
 
     @property
     def current_revision(self) -> int:
@@ -408,6 +438,155 @@ class MapMemory:
             (entity_id, cleaned, source, sensor_time_ns),
         )
 
+    def _update_time_origin(self, sensor_time_ns: int) -> None:
+        row = self._connection.execute(
+            "SELECT value FROM metadata WHERE key='time_origin_ns'"
+        ).fetchone()
+        source_row = self._connection.execute(
+            "SELECT value FROM metadata WHERE key='time_origin_source'"
+        ).fetchone()
+        source = "" if source_row is None else str(source_row[0])
+        if row is not None and source == "dataset_time_contract":
+            if int(sensor_time_ns) < int(row[0]):
+                raise ValueError("entity observation predates the dataset time origin")
+            return
+        if row is None or int(row[0]) > int(sensor_time_ns):
+            self._connection.execute(
+                """INSERT INTO metadata(key, value) VALUES('time_origin_ns', ?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (str(int(sensor_time_ns)),),
+            )
+            self._connection.execute(
+                """INSERT INTO metadata(key, value)
+                    VALUES('time_origin_source', 'derived_first_entity_observation')
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value"""
+            )
+
+    def set_time_origin_ns(
+        self,
+        time_origin_ns: int,
+        *,
+        source: str = "dataset_time_contract",
+    ) -> None:
+        """Persist the dataset sensor-clock origin before observations arrive."""
+
+        origin = int(time_origin_ns)
+        cleaned_source = source.strip()
+        if origin <= 0 or not cleaned_source:
+            raise ValueError("time origin requires a positive timestamp and source")
+        with self._lock, self._connection:
+            earliest = self._connection.execute(
+                """SELECT MIN(sensor_time_ns) FROM entity_versions
+                    WHERE action IN ('entity_created', 'entity_observed')"""
+            ).fetchone()[0]
+            if earliest is not None and origin > int(earliest):
+                raise ValueError("dataset time origin is after an entity observation")
+            existing = self._connection.execute(
+                "SELECT value FROM metadata WHERE key='time_origin_ns'"
+            ).fetchone()
+            existing_source = self._connection.execute(
+                "SELECT value FROM metadata WHERE key='time_origin_source'"
+            ).fetchone()
+            if (
+                existing is not None
+                and existing_source is not None
+                and str(existing_source[0]) == "dataset_time_contract"
+                and int(existing[0]) != origin
+            ):
+                raise ValueError("dataset time origin is already fixed to another value")
+            self._connection.execute(
+                """INSERT INTO metadata(key, value) VALUES('time_origin_ns', ?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (str(origin),),
+            )
+            self._connection.execute(
+                """INSERT INTO metadata(key, value) VALUES('time_origin_source', ?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (cleaned_source,),
+            )
+
+    @property
+    def time_origin_ns(self) -> Optional[int]:
+        """Earliest authoritative entity observation on the sensor clock."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM metadata WHERE key='time_origin_ns'"
+            ).fetchone()
+            if row is not None:
+                return int(row[0])
+            row = self._connection.execute(
+                """SELECT MIN(sensor_time_ns) FROM entity_versions
+                    WHERE action IN ('entity_created', 'entity_observed')"""
+            ).fetchone()
+            return None if row is None or row[0] is None else int(row[0])
+
+    def get_entity_observation_history(
+        self,
+        entity_id: str,
+        *,
+        include_timestamps: bool = False,
+    ) -> dict:
+        """Return an entity's observed interval in absolute and relative time.
+
+        ``entity_versions`` is intentionally included for backward compatibility:
+        databases created before ``entity_observations`` remain losslessly usable,
+        even after new observations are appended with the upgraded schema.
+        """
+
+        with self._lock:
+            exists = self._connection.execute(
+                "SELECT 1 FROM entities WHERE entity_id=?", (entity_id,)
+            ).fetchone()
+            if exists is None:
+                raise KeyError(entity_id)
+            rows = self._connection.execute(
+                """SELECT sensor_time_ns FROM entity_observations
+                    WHERE entity_id=?
+                    UNION
+                    SELECT sensor_time_ns FROM entity_versions
+                    WHERE entity_id=?
+                      AND action IN ('entity_created', 'entity_observed')
+                    ORDER BY sensor_time_ns""",
+                (entity_id, entity_id),
+            ).fetchall()
+            origin = self.time_origin_ns
+            source_row = self._connection.execute(
+                "SELECT value FROM metadata WHERE key='time_origin_source'"
+            ).fetchone()
+            origin_source = None if source_row is None else str(source_row[0])
+
+        timestamps_ns = [int(row[0]) for row in rows]
+        first_ns = timestamps_ns[0] if timestamps_ns else None
+        last_ns = timestamps_ns[-1] if timestamps_ns else None
+        history = {
+            "schema": "daaam.temporal_history.v1",
+            "time_origin_ns": origin,
+            "time_origin_source": origin_source,
+            "time_reference": "seconds_from_time_origin_ns",
+            "observation_count": len(timestamps_ns),
+            "first_observed_ns": first_ns,
+            "last_observed_ns": last_ns,
+            "first_observed": (
+                None
+                if first_ns is None or origin is None
+                else (first_ns - origin) / 1.0e9
+            ),
+            "last_observed": (
+                None
+                if last_ns is None or origin is None
+                else (last_ns - origin) / 1.0e9
+            ),
+        }
+        if include_timestamps:
+            history["timestamps_ns"] = timestamps_ns
+            history["timestamps"] = (
+                []
+                if origin is None
+                else [(timestamp - origin) / 1.0e9 for timestamp in timestamps_ns]
+            )
+        return history
+
     def observe_entity(
         self,
         session_id: str,
@@ -435,12 +614,28 @@ class MapMemory:
             transform = self._session_transform(session_id)
             canonical_position = (transform @ np.r_[position, 1.0])[:3]
             mapped = self._connection.execute(
-                """SELECT entity_id FROM session_entities
-                    WHERE session_id=? AND local_entity_id=?""",
+                """SELECT e.* FROM session_entities AS se
+                    JOIN entities AS e ON e.entity_id=se.entity_id
+                    WHERE se.session_id=? AND se.local_entity_id=?
+                      AND e.deleted_ns IS NULL""",
                 (session_id, local_entity_id),
             ).fetchone()
-            matched_entity = str(mapped[0]) if mapped is not None else None
+            matched_entity = str(mapped["entity_id"]) if mapped is not None else None
             matched_distance = float("inf")
+            reassociated_from = None
+            mapped_distance_m = None
+            if mapped is not None and mapped["position_m"] is not None:
+                mapped_distance_m = float(
+                    np.linalg.norm(
+                        canonical_position - _parse_array(mapped["position_m"])
+                    )
+                )
+                if mapped_distance_m > self.config.entity_merge_distance_m:
+                    # BotSort IDs can switch after an occlusion or be reused for
+                    # another detection.  A persistent local-ID mapping must not
+                    # bypass the same 3D continuity gate used for new tracks.
+                    reassociated_from = matched_entity
+                    matched_entity = None
             if matched_entity is None:
                 candidates = self._connection.execute(
                     "SELECT * FROM entities WHERE deleted_ns IS NULL AND entity_type=?",
@@ -489,32 +684,87 @@ class MapMemory:
                     ),
                 )
             else:
-                existing = self._connection.execute(
-                    "SELECT position_m, geometry_confidence FROM entities WHERE entity_id=?",
+                self._add_alias(entity_id, semantic_label, "observation", sensor_time_ns)
+            self._connection.execute(
+                """INSERT INTO session_entities VALUES(?, ?, ?)
+                    ON CONFLICT(session_id, local_entity_id)
+                    DO UPDATE SET entity_id=excluded.entity_id""",
+                (session_id, local_entity_id, entity_id),
+            )
+            self._connection.execute(
+                """INSERT OR IGNORE INTO entity_observations(
+                    session_id, local_entity_id, entity_id, sensor_time_ns,
+                    position_m, dimensions_m, confidence
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    local_entity_id,
+                    entity_id,
+                    sensor_time_ns,
+                    _json_array(canonical_position),
+                    _json_array(dimensions) if dimensions is not None else None,
+                    confidence,
+                ),
+            )
+            if not created:
+                observations = self._connection.execute(
+                    """SELECT position_m, dimensions_m, confidence
+                        FROM entity_observations WHERE entity_id=?""",
                     (entity_id,),
-                ).fetchone()
-                old_confidence = float(existing["geometry_confidence"])
-                weight = confidence / max(confidence + old_confidence, 1e-9)
-                updated_position = (
-                    (1.0 - weight) * _parse_array(existing["position_m"])
-                    + weight * canonical_position
+                ).fetchall()
+                positions = np.asarray(
+                    [_parse_array(row["position_m"]) for row in observations],
+                    dtype=np.float64,
+                )
+                observed_dimensions = [
+                    _parse_array(row["dimensions_m"])
+                    for row in observations
+                    if row["dimensions_m"] is not None
+                ]
+                # The former confidence-weighted exponential update gave the
+                # newest (and potentially switched) observation roughly half of
+                # the final coordinate.  A component-wise median is stable under
+                # residual depth outliers and is deterministic after replay.
+                updated_position = np.median(positions, axis=0)
+                updated_dimensions = (
+                    None
+                    if not observed_dimensions
+                    else np.median(np.asarray(observed_dimensions), axis=0)
+                )
+                updated_confidence = max(
+                    float(row["confidence"]) for row in observations
                 )
                 self._connection.execute(
-                    """UPDATE entities SET position_m=?, geometry_confidence=?,
-                        geometry_revision=?, updated_ns=? WHERE entity_id=?""",
+                    """UPDATE entities SET position_m=?, dimensions_m=?,
+                        geometry_confidence=?, geometry_revision=?, updated_ns=?
+                        WHERE entity_id=?""",
                     (
                         _json_array(updated_position),
-                        max(confidence, old_confidence),
+                        (
+                            None
+                            if updated_dimensions is None
+                            else _json_array(updated_dimensions)
+                        ),
+                        updated_confidence,
                         self.current_revision,
                         sensor_time_ns,
                         entity_id,
                     ),
                 )
-                self._add_alias(entity_id, semantic_label, "observation", sensor_time_ns)
-            self._connection.execute(
-                "INSERT OR IGNORE INTO session_entities VALUES(?, ?, ?)",
-                (session_id, local_entity_id, entity_id),
-            )
+            if reassociated_from is not None and reassociated_from != entity_id:
+                self._audit(
+                    "local_track_reassociated",
+                    sensor_time_ns,
+                    entity_id=entity_id,
+                    details={
+                        "session_id": session_id,
+                        "local_entity_id": local_entity_id,
+                        "previous_entity_id": reassociated_from,
+                        "center_distance_m": mapped_distance_m,
+                        "maximum_center_distance_m": self.config.entity_merge_distance_m,
+                    },
+                )
+            self._update_time_origin(sensor_time_ns)
             self._record_entity_version(
                 entity_id, sensor_time_ns, "entity_created" if created else "entity_observed"
             )
@@ -559,6 +809,8 @@ class MapMemory:
         if snapshot["dimensions_m"] is not None:
             snapshot["dimensions_m"] = json.loads(snapshot["dimensions_m"])
         snapshot["name_locked"] = bool(snapshot["name_locked"])
+        snapshot["temporal_history"] = self.get_entity_observation_history(entity_id)
+        snapshot["time_origin_ns"] = snapshot["temporal_history"]["time_origin_ns"]
         return snapshot
 
     def list_entities(self, *, include_deleted: bool = False) -> list[dict]:
