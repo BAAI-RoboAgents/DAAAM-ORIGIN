@@ -1,0 +1,6 @@
+diff --git a/hydra/src/places/graph_extractor.cpp b/hydra/src/places/graph_extractor.cpp
+--- a/hydra/src/places/graph_extractor.cpp
++++ b/hydra/src/places/graph_extractor.cpp
+@@ -211 +211 @@ NearestVertexInfo convertInfo(const GvdVertexInfo& parent_info) {
+-  NearestVertexInfo info;
++  NearestVertexInfo info{};

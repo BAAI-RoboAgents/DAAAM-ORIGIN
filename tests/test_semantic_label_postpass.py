@@ -24,6 +24,9 @@ from daaam.realtime.semantic_labels import (  # noqa: E402
     validate_semantic_label_binding,
 )
 import run_realtime_mapping as realtime_module  # noqa: E402
+from run_hydra_semantic_postpass import (  # noqa: E402
+    validate_plan_frame_records,
+)
 from run_realtime_mapping import (  # noqa: E402
     ReplayFrame,
     rebuild_and_promote_semantic_hydra,
@@ -250,6 +253,29 @@ def test_hydra_postpass_replays_exact_labels_with_full_coverage(tmp_path):
     assert np.array_equal(
         backend.frames[1]["semantic_labels"], expected_labels[1]
     )
+
+
+def test_hydra_postpass_plan_rejects_duplicate_and_out_of_order_frames():
+    records = [
+        {"frame_index": 0, "sensor_time_ns": ORIGIN_NS},
+        {"frame_index": 0, "sensor_time_ns": ORIGIN_NS + 1},
+    ]
+    with pytest.raises(ValueError, match="indices must be unique"):
+        validate_plan_frame_records(records)
+
+    records[1]["frame_index"] = 1
+    assert validate_plan_frame_records(records) == records
+    with pytest.raises(ValueError, match="ordered by frame index"):
+        validate_plan_frame_records(list(reversed(records)))
+
+
+def test_hydra_postpass_plan_rejects_nonmonotonic_sensor_time():
+    records = [
+        {"frame_index": 0, "sensor_time_ns": ORIGIN_NS},
+        {"frame_index": 1, "sensor_time_ns": ORIGIN_NS},
+    ]
+    with pytest.raises(ValueError, match="strictly increasing"):
+        validate_plan_frame_records(records)
 
 
 def test_hydra_postpass_fails_before_fusion_when_one_label_is_missing(tmp_path):

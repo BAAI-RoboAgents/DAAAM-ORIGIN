@@ -33,6 +33,51 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def validate_plan_frame_records(records: object) -> list[dict]:
+    """Reject ambiguous replay plans before Hydra allocates any state."""
+
+    if not isinstance(records, list) or not records:
+        raise ValueError("Hydra semantic postpass plan contains no frames")
+    normalized: list[dict] = []
+    indices: list[int] = []
+    sensor_times: list[int] = []
+    for offset, source in enumerate(records):
+        if not isinstance(source, dict):
+            raise ValueError(
+                f"Hydra semantic postpass frame {offset} must be an object"
+            )
+        try:
+            frame_index = int(source["frame_index"])
+            sensor_time_ns = int(source["sensor_time_ns"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"Hydra semantic postpass frame {offset} has invalid identity"
+            ) from error
+        if frame_index < 0:
+            raise ValueError("Hydra semantic postpass frame indices must be non-negative")
+        if sensor_time_ns <= 0:
+            raise ValueError(
+                "Hydra semantic postpass sensor times must be absolute nanoseconds"
+            )
+        indices.append(frame_index)
+        sensor_times.append(sensor_time_ns)
+        normalized.append(source)
+    if len(set(indices)) != len(indices):
+        raise ValueError("Hydra semantic postpass frame indices must be unique")
+    if indices != sorted(indices):
+        raise ValueError(
+            "Hydra semantic postpass frames must be ordered by frame index"
+        )
+    if any(
+        current <= previous
+        for previous, current in zip(sensor_times, sensor_times[1:])
+    ):
+        raise ValueError(
+            "Hydra semantic postpass sensor times must be strictly increasing"
+        )
+    return normalized
+
+
 def _frame(record: dict) -> ReplayFrame:
     placeholder = Path(record["rgb_path"])
     return ReplayFrame(
@@ -55,9 +100,8 @@ def main() -> None:
     plan = json.loads(args.plan.resolve().read_text())
     if plan.get("schema") != "daaam.hydra_semantic_postpass_plan.v1":
         raise ValueError("unsupported Hydra semantic postpass plan")
-    frames = [_frame(record) for record in plan["frames"]]
-    if not frames:
-        raise ValueError("Hydra semantic postpass plan contains no frames")
+    records = validate_plan_frame_records(plan.get("frames"))
+    frames = [_frame(record) for record in records]
     completed_indices = {frame.frame_index for frame in frames}
     first_rgb = cv2.imread(str(frames[0].rgb_path), cv2.IMREAD_COLOR)
     if first_rgb is None:
