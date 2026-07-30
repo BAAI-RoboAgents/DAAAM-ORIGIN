@@ -563,6 +563,7 @@ def migrate(args: argparse.Namespace) -> dict:
             "maximum_aabb_gap_m": policy.maximum_aabb_gap_m,
             "acceptance": "center_distance OR AABB_gap",
             "conflict_policy": "never_rebind_a_node_owned_by_another_entity",
+            "cross_semantic_id_policy": policy.cross_semantic_id_policy,
         },
         "mesh_counts": output_mesh_counts,
         "verification": verification,

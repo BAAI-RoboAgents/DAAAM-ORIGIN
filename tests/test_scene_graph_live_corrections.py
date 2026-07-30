@@ -19,7 +19,10 @@ from daaam.grounding.models import ObjectAnnotation  # noqa: E402
 from daaam.memory import DeliveredSemanticCorrection  # noqa: E402
 from daaam.realtime.contracts import SemanticCorrection  # noqa: E402
 from daaam.realtime.semantic import HydraDsgSemanticSink  # noqa: E402
-from daaam.scene_graph.services import SceneGraphService  # noqa: E402
+from daaam.scene_graph.services import (  # noqa: E402
+    ObjectBindingPolicy,
+    SceneGraphService,
+)
 from spark_dsg import (  # noqa: E402
     BoundingBoxType,
     DsgLayers,
@@ -581,6 +584,54 @@ def test_owner_mapping_validates_current_binding_request():
             sensor_time_ns=1_700_000_000_000_000_012,
             semantic_id_owners={12: "entity-twelve"},
         )
+
+
+@pytest.mark.parametrize(
+    "policy_name, expected_status",
+    [
+        ("reject", "rejected_semantic_mismatch"),
+        ("pending", "pending_spatial_review"),
+    ],
+)
+def test_cross_semantic_id_policy_prevents_commit(
+    policy_name,
+    expected_status,
+):
+    graph = DynamicSceneGraph()
+    assert graph.add_node(
+        DsgLayers.OBJECTS,
+        NodeSymbol("O", 1),
+        _mesh_object(77, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    )
+    service = SceneGraphService(
+        REPOSITORY_ROOT / "config" / "labels_pseudo.yaml",
+        REPOSITORY_ROOT / "config" / "labels_pseudo.csv",
+        enable_background_objects=False,
+        object_binding_policy=ObjectBindingPolicy(
+            maximum_center_distance_m=0.35,
+            maximum_aabb_gap_m=0.075,
+            cross_semantic_id_policy=policy_name,
+        ),
+    )
+    service.set_scene_graph(graph)
+
+    assert not service.ensure_object_node(
+        semantic_id=8,
+        entity_id="entity-eight",
+        position_m=[0.0, 0.0, 0.0],
+        dimensions_m=[1.0, 1.0, 1.0],
+        sensor_time_ns=1,
+        allow_unmeshed_fallback=False,
+        semantic_id_owners={8: "entity-eight"},
+    )
+    node = next(iter(graph.get_layer(DsgLayers.OBJECTS).nodes))
+    assert not (node.attributes.metadata.get() or {}).get("entity_id")
+    assert any(
+        event["status"] == expected_status
+        and event["semantic_id"] == 8
+        and event["candidate_semantic_id"] == 77
+        for event in service.object_binding_audit
+    )
 
 
 def test_distant_mesh_is_not_claimed_and_fallback_is_removed():

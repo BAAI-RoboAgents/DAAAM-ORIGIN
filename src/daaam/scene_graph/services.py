@@ -40,6 +40,7 @@ class ObjectBindingPolicy:
 	maximum_center_distance_m: float = 0.75
 	maximum_aabb_gap_m: float = 0.15
 	audit_capacity: int = 1000
+	cross_semantic_id_policy: str = "apply"
 
 	def __post_init__(self) -> None:
 		if self.maximum_center_distance_m <= 0.0:
@@ -48,6 +49,10 @@ class ObjectBindingPolicy:
 			raise ValueError("object binding AABB-gap threshold cannot be negative")
 		if self.audit_capacity < 1:
 			raise ValueError("object binding audit capacity must be positive")
+		if self.cross_semantic_id_policy not in {"apply", "reject", "pending"}:
+			raise ValueError(
+				"cross-semantic-ID binding policy must be apply, reject, or pending"
+			)
 
 
 class SceneGraphService:
@@ -594,6 +599,27 @@ class SceneGraphService:
 						)
 						continue
 					evaluated_mesh_candidates.append(evidence)
+					if (
+						evidence["accepted"]
+						and not evidence["semantic_id_match"]
+						and self.object_binding_policy.cross_semantic_id_policy
+						!= "apply"
+					):
+						self._record_object_binding_event(
+							{
+								"entity_id": entity_id,
+								"semantic_id": int(semantic_id),
+								"sensor_time_ns": int(sensor_time_ns),
+								"status": (
+									"pending_spatial_review"
+									if self.object_binding_policy.cross_semantic_id_policy
+									== "pending"
+									else "rejected_semantic_mismatch"
+								),
+								**evidence,
+							}
+						)
+						continue
 					if evidence["accepted"]:
 						mesh_candidates.append((candidate, evidence))
 			mesh_candidates.sort(
