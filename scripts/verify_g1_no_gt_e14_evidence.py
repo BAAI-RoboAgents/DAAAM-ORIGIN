@@ -137,6 +137,7 @@ def reconstruct_records(
     threshold: int,
     events: list[dict[str, Any]],
     frames: Mapping[int, dict[str, Any]],
+    prompt_policy: str = "legacy",
 ) -> list[dict[str, Any]]:
     by_frame: dict[int, list[dict[str, Any]]] = defaultdict(list)
     first_by_entity: dict[str, dict[str, Any]] = {}
@@ -145,6 +146,7 @@ def reconstruct_records(
         first_by_entity.setdefault(str(event["entity_id"]), event)
     counts: dict[str, int] = defaultdict(int)
     prompted: set[str] = set()
+    colliding_entities: set[str] = set()
     records = []
     request_index = 0
     for frame_index in sorted(by_frame):
@@ -152,14 +154,50 @@ def reconstruct_records(
             by_frame[frame_index],
             key=lambda row: (int(row["track_id"]), int(row["e11_instance_id"])),
         )
+        current_by_entity: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for event in current:
-            counts[str(event["entity_id"])] += 1
-        selected = [
-            event
-            for event in current
-            if counts[str(event["entity_id"])] >= threshold
-            and str(event["entity_id"]) not in prompted
-        ]
+            current_by_entity[str(event["entity_id"])].append(event)
+        if prompt_policy == "legacy":
+            for event in current:
+                counts[str(event["entity_id"])] += 1
+            selected = [
+                event
+                for event in current
+                if counts[str(event["entity_id"])] >= threshold
+                and str(event["entity_id"]) not in prompted
+            ]
+        elif prompt_policy == "unique_safe":
+            for entity_id, entity_events in current_by_entity.items():
+                counts[entity_id] += 1
+                if len({int(event["track_id"]) for event in entity_events}) > 1:
+                    colliding_entities.add(entity_id)
+            selected = []
+            for entity_id, entity_events in current_by_entity.items():
+                if (
+                    counts[entity_id] < threshold
+                    or entity_id in prompted
+                    or entity_id in colliding_entities
+                ):
+                    continue
+                selected.append(
+                    max(
+                        entity_events,
+                        key=lambda event: (
+                            int(
+                                (
+                                    cv2.imread(
+                                        str(event["source_mask_path"]),
+                                        cv2.IMREAD_GRAYSCALE,
+                                    )
+                                    > 0
+                                ).sum()
+                            ),
+                            -int(event["track_id"]),
+                        ),
+                    )
+                )
+        else:
+            raise ValueError(f"unsupported prompt policy: {prompt_policy}")
         if not selected:
             continue
         frame = frames[frame_index]
@@ -397,6 +435,7 @@ def verify_cell(
     threshold: int,
     seed: int,
     expected_records: list[dict[str, Any]],
+    expected_entity_count: int = 89,
 ) -> dict[str, Any]:
     cell = root / "cells" / f"obs_{threshold:02d}" / f"seed_{seed}"
     prompt_requests = read_jsonl(
@@ -457,7 +496,7 @@ def verify_cell(
                 "SELECT operation_id, entity_id, label, status FROM semantic_operations"
             )
         ]
-    check(entity_count == 89, "cell entity count")
+    check(entity_count == expected_entity_count, "cell entity count")
     eligible = {row["entity_id"] for row in responses}
     expected_operations = {
         operation_id(row): row
@@ -519,7 +558,11 @@ def verify_cell(
     }
 
 
-def verify_consistency(root: Path) -> dict[str, int]:
+def verify_consistency(
+    root: Path,
+    seeds: tuple[int, ...] = SEEDS,
+    thresholds: tuple[int, ...] = THRESHOLDS,
+) -> dict[str, int]:
     final_labels = read_jsonl(root / "tables/final_labels.jsonl")
     lookup = {
         (row["threshold_observations"], row["seed"], row["entity_id"]): row
@@ -531,42 +574,57 @@ def verify_consistency(root: Path) -> dict[str, int]:
             lookup[(row["threshold_observations"], seed, row["entity_id"])][
                 "final_label"
             ]
-            for seed in SEEDS
+            for seed in seeds
         ]
         scores = [
             jaccard(labels[i], labels[j])
-            for i in range(3)
-            for j in range(i + 1, 3)
-        ]
+            for i in range(len(labels))
+            for j in range(i + 1, len(labels))
+        ] or [1.0]
         check(
             row["exact_all_seed_agreement"]
             == (len({label.casefold() for label in labels}) == 1),
             "seed exact agreement",
         )
-        check(close(row["mean_pairwise_token_jaccard"], sum(scores) / 3), "seed jaccard mean")
-        check(close(row["minimum_pairwise_token_jaccard"], min(scores)), "seed jaccard min")
+        check(
+            close(
+                row["mean_pairwise_token_jaccard"],
+                sum(scores) / len(scores),
+            ),
+            "seed jaccard mean",
+        )
+        check(
+            close(row["minimum_pairwise_token_jaccard"], min(scores)),
+            "seed jaccard min",
+        )
         check(row["correctness_label"] is None, "seed correctness null")
     threshold_rows = read_jsonl(root / "tables/threshold_consistency.jsonl")
     for row in threshold_rows:
         labels = [
             lookup[(threshold, row["seed"], row["entity_id"])]["final_label"]
-            for threshold in THRESHOLDS
+            for threshold in thresholds
         ]
         scores = [
             jaccard(labels[i], labels[j])
-            for i in range(3)
-            for j in range(i + 1, 3)
-        ]
+            for i in range(len(labels))
+            for j in range(i + 1, len(labels))
+        ] or [1.0]
         check(
             row["exact_all_threshold_agreement"]
             == (len({label.casefold() for label in labels}) == 1),
             "threshold exact agreement",
         )
         check(
-            close(row["mean_pairwise_token_jaccard"], sum(scores) / 3),
+            close(
+                row["mean_pairwise_token_jaccard"],
+                sum(scores) / len(scores),
+            ),
             "threshold jaccard mean",
         )
-        check(close(row["minimum_pairwise_token_jaccard"], min(scores)), "threshold jaccard min")
+        check(
+            close(row["minimum_pairwise_token_jaccard"], min(scores)),
+            "threshold jaccard min",
+        )
         check(row["correctness_label"] is None, "threshold correctness null")
     return {
         "final_label_rows": len(final_labels),
@@ -581,13 +639,13 @@ def main() -> int:
     check(root.is_dir(), f"missing E14 run: {root}")
     check(not (root / "INDEPENDENT_AUDIT.json").exists(), "audit already exists")
     prereg = read_json(root / "PRE_REGISTRATION.json")
-    check(prereg["executed_thresholds"] == list(THRESHOLDS), "threshold preregistration")
-    check(prereg["seeds"] == list(SEEDS), "seed preregistration")
+    thresholds = tuple(int(value) for value in prereg["executed_thresholds"])
+    seeds = tuple(int(value) for value in prereg["seeds"])
+    check(bool(thresholds), "at least one threshold")
+    check(bool(seeds), "at least one seed")
     check(prereg["smoke_truncation"] is None, "formal run is not truncated")
-    check(
-        prereg["fixed_upstream"]["e13_variant"] == "merge_0p50m",
-        "fixed E13 variant",
-    )
+    prompt_policy = str(prereg["prompt_contract"].get("policy", "legacy"))
+    check(prompt_policy in {"legacy", "unique_safe"}, "prompt policy")
     reference_count = 0
     for section in ("fixed_upstream", "sources"):
         for key, value in prereg[section].items():
@@ -602,21 +660,40 @@ def main() -> int:
         verify_reference(model[key], f"dam_contract.model.{key}")
         reference_count += 1
     inventory = verify_inventory(root)
-    e13 = Path(prereg["fixed_upstream"]["e13_merge_events"]["path"]).parents[2]
-    source_variant = e13 / "variants/merge_0p50m"
+    source_variant = Path(
+        prereg["fixed_upstream"]["e13_merge_events"]["path"]
+    ).parent
+    e13 = source_variant.parents[1]
     events = read_jsonl(source_variant / "merge_events.jsonl")
     frame_rows = read_jsonl(e13 / "input_manifests/e12_frames.jsonl")
     frames = {int(row["frame_index"]): row for row in frame_rows}
+    with sqlite3.connect(source_variant / "map_memory.sqlite3") as connection:
+        expected_entity_count = int(
+            connection.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+        )
     prompt_results = []
     cell_results = []
     reconstructed = {}
-    for threshold in THRESHOLDS:
-        expected = reconstruct_records(threshold, events, frames)
+    for threshold in thresholds:
+        expected = reconstruct_records(
+            threshold,
+            events,
+            frames,
+            prompt_policy,
+        )
         reconstructed[threshold] = expected
         prompt_results.append(verify_prompt_inputs(root, threshold, expected))
-        for seed in SEEDS:
-            cell_results.append(verify_cell(root, threshold, seed, expected))
-    consistency = verify_consistency(root)
+        for seed in seeds:
+            cell_results.append(
+                verify_cell(
+                    root,
+                    threshold,
+                    seed,
+                    expected,
+                    expected_entity_count,
+                )
+            )
+    consistency = verify_consistency(root, seeds, thresholds)
     screening = read_json(root / "SCREENING_RESULT.json")
     check(screening["winner"] is None, "winner must remain null")
     check(

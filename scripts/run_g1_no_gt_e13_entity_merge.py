@@ -15,9 +15,7 @@ import csv
 from datetime import datetime, timezone
 import hashlib
 import json
-import math
 from pathlib import Path
-import shutil
 import sqlite3
 import sys
 import time
@@ -154,8 +152,9 @@ def require_image(path: Path, image: np.ndarray) -> None:
         raise OSError(f"failed to write {path}")
 
 
-def variant_id(threshold_m: float) -> str:
-    return f"merge_{threshold_m:.2f}m".replace(".", "p")
+def variant_id(threshold_m: float, association_policy: str = "legacy") -> str:
+    base = f"merge_{threshold_m:.2f}m".replace(".", "p")
+    return base if association_policy == "legacy" else f"{association_policy}_{base}"
 
 
 def stable_color(ordinal: int) -> tuple[int, int, int]:
@@ -634,13 +633,18 @@ def run_variant(
     threshold_m: float,
     frames: Sequence[dict[str, Any]],
     observations: Sequence[dict[str, Any]],
+    *,
+    association_policy: str = "legacy",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    identifier = variant_id(threshold_m)
+    identifier = variant_id(threshold_m, association_policy)
     root = output / "variants" / identifier
     database = root / "map_memory.sqlite3"
     memory = MapMemory(
         database,
-        MapMemoryConfig(entity_merge_distance_m=threshold_m),
+        MapMemoryConfig(
+            entity_merge_distance_m=threshold_m,
+            entity_association_policy=association_policy,
+        ),
     )
     memory.create_session(
         SESSION_ID, int(frames[0]["sensor_time_ns"]), canonical=True
@@ -696,6 +700,7 @@ def run_variant(
                 "schema": "daaam.g1_no_gt_e13_merge_event.v1",
                 "variant_id": identifier,
                 "threshold_m": threshold_m,
+                "association_policy": association_policy,
                 "event_index": len(events),
                 "frame_index": frame_index,
                 "source_frame_index": int(geometry["source_frame_index"]),
@@ -831,6 +836,7 @@ def run_variant(
         "schema": "daaam.g1_no_gt_e13_variant_summary.v1",
         "variant_id": identifier,
         "threshold_m": threshold_m,
+        "association_policy": association_policy,
         "input_geometry_observations": len(observations),
         "unique_e12_track_ids": len({row["track_id"] for row in observations}),
         "entity_count": len(entities),

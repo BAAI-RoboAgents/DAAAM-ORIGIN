@@ -342,6 +342,12 @@ def test_semantic_dry_run_records_independent_real_frontend_branch(tmp_path):
         "frontend",
         "--entity-merge-distance-m",
         "0.075",
+        "--entity-association-policy",
+        "safe",
+        "--entity-maximum-dimension-ratio",
+        "2.5",
+        "--entity-maximum-observation-spread-m",
+        "0.4",
         "--object-binding-maximum-center-distance-m",
         "0.10",
         "--object-binding-maximum-aabb-gap-m",
@@ -358,6 +364,17 @@ def test_semantic_dry_run_records_independent_real_frontend_branch(tmp_path):
         "frontend",
     ]
     assert configuration["map_memory"]["entity_merge_distance_m"] == 0.075
+    assert configuration["map_memory"]["entity_association_policy"] == "safe"
+    assert configuration["map_memory"]["entity_maximum_dimension_ratio"] == 2.5
+    assert (
+        configuration["map_memory"]["entity_maximum_observation_spread_m"]
+        == 0.4
+    )
+    assert (
+        configuration["semantic"]["observation_counting_unit"]
+        == "unique_segmentation_frame_per_entity"
+    )
+    assert configuration["semantic"]["reject_colliding_prompt_entities"] is True
     assert configuration["semantic"]["object_binding_policy"] == {
         "maximum_center_distance_m": 0.10,
         "maximum_aabb_gap_m": 0.025,

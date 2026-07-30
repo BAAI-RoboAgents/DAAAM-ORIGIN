@@ -183,6 +183,150 @@ def test_local_track_is_split_on_3d_discontinuity_and_position_is_robust(tmp_pat
     memory.close()
 
 
+def test_safe_association_rejects_distinct_tracks_in_the_same_frame(tmp_path):
+    memory = MapMemory(
+        tmp_path / "memory.sqlite3",
+        MapMemoryConfig(
+            entity_merge_distance_m=0.5,
+            entity_association_policy="safe",
+        ),
+    )
+    memory.create_session("session-a", ORIGIN_NS, canonical=True)
+    first_id, _ = memory.observe_entity(
+        "session-a",
+        "botsort:1",
+        np.array([0.0, 0.0, 0.5]),
+        sensor_time_ns=ORIGIN_NS + 1,
+        semantic_label="unknown",
+        dimensions_m=np.array([0.4, 0.4, 0.8]),
+    )
+    second_id, created = memory.observe_entity(
+        "session-a",
+        "botsort:2",
+        np.array([0.1, 0.0, 0.5]),
+        sensor_time_ns=ORIGIN_NS + 1,
+        semantic_label="unknown",
+        dimensions_m=np.array([0.4, 0.4, 0.8]),
+    )
+
+    assert created
+    assert second_id != first_id
+    rejection = next(
+        row
+        for row in memory.audit_log()
+        if row["action"] == "entity_association_rejected"
+    )
+    assert json.loads(rejection["details_json"])["reason"] == (
+        "same_frame_distinct_track"
+    )
+    memory.close()
+
+
+def test_safe_association_keeps_compatible_non_simultaneous_track_merge(tmp_path):
+    memory = MapMemory(
+        tmp_path / "memory.sqlite3",
+        MapMemoryConfig(
+            entity_merge_distance_m=0.5,
+            entity_association_policy="safe",
+        ),
+    )
+    memory.create_session("session-a", ORIGIN_NS, canonical=True)
+    first_id, _ = memory.observe_entity(
+        "session-a",
+        "botsort:1",
+        np.array([0.0, 0.0, 0.5]),
+        sensor_time_ns=ORIGIN_NS + 1,
+        semantic_label="unknown",
+        dimensions_m=np.array([0.4, 0.4, 0.8]),
+    )
+    second_id, created = memory.observe_entity(
+        "session-a",
+        "botsort:2",
+        np.array([0.1, 0.0, 0.5]),
+        sensor_time_ns=ORIGIN_NS + 2,
+        semantic_label="unknown",
+        dimensions_m=np.array([0.5, 0.4, 0.8]),
+    )
+
+    assert not created
+    assert second_id == first_id
+    memory.close()
+
+
+def test_safe_association_splits_prior_merge_when_tracks_later_coexist(tmp_path):
+    memory = MapMemory(
+        tmp_path / "memory.sqlite3",
+        MapMemoryConfig(
+            entity_merge_distance_m=0.5,
+            entity_association_policy="safe",
+        ),
+    )
+    memory.create_session("session-a", ORIGIN_NS, canonical=True)
+    first_id, _ = memory.observe_entity(
+        "session-a",
+        "botsort:1",
+        np.array([0.0, 0.0, 0.5]),
+        sensor_time_ns=ORIGIN_NS + 1,
+        semantic_label="unknown",
+    )
+    merged_id, created = memory.observe_entity(
+        "session-a",
+        "botsort:2",
+        np.array([0.1, 0.0, 0.5]),
+        sensor_time_ns=ORIGIN_NS + 2,
+        semantic_label="unknown",
+    )
+    memory.observe_entity(
+        "session-a",
+        "botsort:1",
+        np.array([0.0, 0.0, 0.5]),
+        sensor_time_ns=ORIGIN_NS + 3,
+        semantic_label="unknown",
+    )
+    split_id, split_created = memory.observe_entity(
+        "session-a",
+        "botsort:2",
+        np.array([0.1, 0.0, 0.5]),
+        sensor_time_ns=ORIGIN_NS + 3,
+        semantic_label="unknown",
+    )
+
+    assert not created
+    assert merged_id == first_id
+    assert split_created
+    assert split_id != first_id
+    memory.close()
+
+
+def test_track_only_association_never_merges_distinct_local_tracks(tmp_path):
+    memory = MapMemory(
+        tmp_path / "memory.sqlite3",
+        MapMemoryConfig(
+            entity_merge_distance_m=0.5,
+            entity_association_policy="track_only",
+        ),
+    )
+    memory.create_session("session-a", ORIGIN_NS, canonical=True)
+    first_id, _ = memory.observe_entity(
+        "session-a",
+        "botsort:1",
+        np.array([0.0, 0.0, 0.5]),
+        sensor_time_ns=ORIGIN_NS + 1,
+        semantic_label="unknown",
+    )
+    second_id, created = memory.observe_entity(
+        "session-a",
+        "botsort:2",
+        np.array([0.1, 0.0, 0.5]),
+        sensor_time_ns=ORIGIN_NS + 2,
+        semantic_label="unknown",
+    )
+
+    assert created
+    assert second_id != first_id
+    memory.close()
+
+
 def test_legacy_entity_versions_backfill_observation_history(tmp_path):
     database = tmp_path / "legacy.sqlite3"
     memory = make_memory(database)

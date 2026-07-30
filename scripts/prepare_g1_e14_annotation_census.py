@@ -118,6 +118,7 @@ def fit_tile(image: np.ndarray, width: int, height: int) -> np.ndarray:
 
 def render_entity(
     census_index: int,
+    population_count: int,
     entity: dict[str, Any],
     entity_responses: list[dict[str, Any]],
     rgb_path: str,
@@ -206,7 +207,7 @@ def render_entity(
     cv2.putText(
         overlay,
         (
-            f"E14 annotation census {census_index + 1}/52 | "
+            f"E14 annotation census {census_index + 1}/{population_count} | "
             f"E{entity['entity_ordinal']} | obs={threshold} seed={seed} | "
             f"source={entity_responses[0]['source_frame_index']}"
         ),
@@ -367,7 +368,9 @@ def main() -> int:
                 f"all E14 obs={threshold}, seed={seed} eligible final entities"
             ),
             "finite_population_count": len(final_labels),
-            "coverage_target": "52/52 unique eligible entities",
+            "coverage_target": (
+                f"{len(final_labels)}/{len(final_labels)} unique eligible entities"
+            ),
             "stopping_rule": (
                 "stop only after every population entity has an artifact, union-mask, "
                 "main-identity, and visible-attribute verdict"
@@ -434,6 +437,7 @@ def main() -> int:
         manifest.append(
             render_entity(
                 index,
+                len(final_labels),
                 entity,
                 entity_responses,
                 rgb_path,

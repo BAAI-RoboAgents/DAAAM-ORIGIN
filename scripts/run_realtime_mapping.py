@@ -312,6 +312,36 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--entity-association-policy",
+        choices=("legacy", "safe", "track_only"),
+        default="legacy",
+        help=(
+            "Cross-track MapMemory association policy. safe adds same-frame, "
+            "dimension, and history-spread gates; track_only disables unknown "
+            "cross-track merging."
+        ),
+    )
+    parser.add_argument(
+        "--entity-maximum-dimension-ratio",
+        type=float,
+        default=3.0,
+        help="Maximum 3D diagonal ratio accepted by safe entity association.",
+    )
+    parser.add_argument(
+        "--entity-maximum-observation-spread-m",
+        type=float,
+        default=0.75,
+        help="Maximum history spread accepted by safe entity association.",
+    )
+    parser.add_argument(
+        "--allow-colliding-prompt-entities",
+        action="store_true",
+        help=(
+            "Permit DAM prompts after an entity has contained distinct tracks in "
+            "one segmentation frame. The safe default rejects such entities."
+        ),
+    )
+    parser.add_argument(
         "--object-binding-maximum-center-distance-m",
         type=float,
         default=0.75,
@@ -819,6 +849,9 @@ class ReplayEngine:
         write_fusion_products: bool,
         time_origin_ns: int,
         entity_merge_distance_m: float = 0.50,
+        entity_association_policy: str = "legacy",
+        entity_maximum_dimension_ratio: float = 3.0,
+        entity_maximum_observation_spread_m: float = 0.75,
         depth_worker: Optional[SubprocessDepthBackend] = None,
         stereo_fx: Optional[float] = None,
         stereo_baseline_m: Optional[float] = None,
@@ -921,6 +954,11 @@ class ReplayEngine:
             run_dir / "map_memory.sqlite3",
             config=MapMemoryConfig(
                 entity_merge_distance_m=entity_merge_distance_m,
+                entity_association_policy=entity_association_policy,
+                entity_maximum_dimension_ratio=entity_maximum_dimension_ratio,
+                entity_maximum_observation_spread_m=(
+                    entity_maximum_observation_spread_m
+                ),
             ),
         )
         try:
@@ -2433,12 +2471,14 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         )
     if (
         args.entity_merge_distance_m <= 0
+        or args.entity_maximum_dimension_ratio < 1.0
+        or args.entity_maximum_observation_spread_m <= 0
         or args.object_binding_maximum_center_distance_m <= 0
         or args.object_binding_maximum_aabb_gap_m < 0
     ):
         raise ValueError(
-            "Entity merge and object-binding center distances must be positive; "
-            "the object-binding AABB gap must be non-negative"
+            "Entity distances/spread must be positive, the dimension ratio must "
+            "be at least one, and the object-binding AABB gap must be non-negative"
         )
     if args.telemetry_sample_interval_s <= 0.0:
         raise ValueError("--telemetry-sample-interval-s must be positive")
@@ -2652,6 +2692,13 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         },
         "map_memory": {
             "entity_merge_distance_m": args.entity_merge_distance_m,
+            "entity_association_policy": args.entity_association_policy,
+            "entity_maximum_dimension_ratio": (
+                args.entity_maximum_dimension_ratio
+            ),
+            "entity_maximum_observation_spread_m": (
+                args.entity_maximum_observation_spread_m
+            ),
         },
         "static_map_backend": args.static_map_backend,
         "hydra_config_path": (
@@ -2692,6 +2739,12 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             "frontend_rate_hz": args.semantic_frontend_rate_hz,
             "queue_capacity": args.semantic_queue_capacity,
             "minimum_observations": args.semantic_minimum_observations,
+            "observation_counting_unit": (
+                "unique_segmentation_frame_per_entity"
+            ),
+            "reject_colliding_prompt_entities": (
+                not args.allow_colliding_prompt_entities
+            ),
             "object_binding_policy": {
                 "maximum_center_distance_m": (
                     args.object_binding_maximum_center_distance_m
@@ -2983,6 +3036,11 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         write_fusion_products=not args.no_write_fusion_products,
         time_origin_ns=int(time_contract["time_origin_ns"]),
         entity_merge_distance_m=args.entity_merge_distance_m,
+        entity_association_policy=args.entity_association_policy,
+        entity_maximum_dimension_ratio=args.entity_maximum_dimension_ratio,
+        entity_maximum_observation_spread_m=(
+            args.entity_maximum_observation_spread_m
+        ),
         depth_worker=depth_worker,
         stereo_fx=float(metadata.get("fx", frames[0].intrinsics[0, 0])),
         stereo_baseline_m=(
@@ -3064,6 +3122,9 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
                 correction_queue_capacity=max(10, args.semantic_queue_capacity * 20),
                 grounding_startup_timeout_s=args.semantic_startup_timeout_s,
                 grounding_enabled=args.semantic_mode == "dam",
+                reject_colliding_prompt_entities=(
+                    not args.allow_colliding_prompt_entities
+                ),
                 object_binding_maximum_center_distance_m=(
                     args.object_binding_maximum_center_distance_m
                 ),

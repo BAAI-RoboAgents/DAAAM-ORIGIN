@@ -17,12 +17,10 @@ import csv
 from datetime import datetime, timezone
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import random
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -92,7 +90,18 @@ INVENTORY_EXCLUDES = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--e13-run", type=Path, default=DEFAULT_E13)
+    parser.add_argument("--e13-variant", default=E13_VARIANT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--prompt-policy",
+        choices=("legacy", "unique_safe"),
+        default="legacy",
+        help=(
+            "legacy counts every track observation; unique_safe counts one "
+            "entity observation per frame, selects one mask, and rejects "
+            "entities after a same-frame multi-track collision"
+        ),
+    )
     parser.add_argument(
         "--thresholds",
         type=int,
@@ -362,12 +371,14 @@ def model_identity() -> dict[str, Any]:
 def write_preregistration(
     output: Path,
     e13: Path,
+    e13_variant: str,
+    prompt_policy: str,
     thresholds: Sequence[int],
     seeds: Sequence[int],
     maximum_prompt_records: int | None,
 ) -> None:
     completion = json.loads((e13 / "COMPLETION.json").read_text())
-    source_variant = e13 / "variants" / E13_VARIANT
+    source_variant = e13 / "variants" / e13_variant
     preregistration = {
         "schema": "daaam.g1_no_gt_e14_preregistration.v1",
         "registered_at": utc_now(),
@@ -378,10 +389,9 @@ def write_preregistration(
         "seeds": list(seeds),
         "smoke_truncation": maximum_prompt_records,
         "fixed_upstream": {
-            "e13_variant": E13_VARIANT,
-            "entity_merge_distance_m": 0.50,
+            "e13_variant": e13_variant,
             "selection_reason": (
-                "current production default, not an E13 winner; E13 selected no winner"
+                "explicit invocation; no formal E13 winner without independent GT"
             ),
             "e13_inventory_root_sha256": completion[
                 "artifact_inventory_root_sha256"
@@ -395,10 +405,11 @@ def write_preregistration(
             ),
         },
         "prompt_contract": {
+            "policy": prompt_policy,
             "counter_domain": "MapMemory entity, not frame and not BotSort track",
             "counted_observations": (
-                "every E13 observation originating from a real E11 segmentation "
-                "and accepted 3D geometry"
+                "legacy: every accepted entity-track observation; unique_safe: "
+                "one accepted observation per entity per segmentation frame"
             ),
             "trigger": (
                 "after all accepted observations in the current frame increment "
@@ -406,7 +417,8 @@ def write_preregistration(
                 "meets N and whose entity revision has not been prompted"
             ),
             "same_frame_duplicate_entity_masks": (
-                "retained exactly to reproduce the realtime adapter; no deduplication"
+                "legacy retains duplicates; unique_safe rejects colliding entities "
+                "and otherwise selects one largest-area mask per entity"
             ),
             "map_revision": 0,
             "semantic_id": "E13 entity ordinal",
@@ -433,7 +445,9 @@ def write_preregistration(
             ),
         },
         "correction_contract": {
-            "database": "fresh SQLite backup of frozen E13 merge_0p50m per cell",
+            "database": (
+                f"fresh SQLite backup of frozen E13 {e13_variant} per cell"
+            ),
             "automatic_confidence": AUTOMATIC_CONFIDENCE,
             "operation_id": (
                 "SHA256(source|request_id|entity_id|map_revision|label.casefold())"
@@ -492,6 +506,7 @@ def prompt_records_for_threshold(
     events: Sequence[dict[str, Any]],
     frames: Mapping[int, dict[str, Any]],
     maximum_prompt_records: int | None,
+    prompt_policy: str = "legacy",
 ) -> list[dict[str, Any]]:
     by_frame: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for event in events:
@@ -501,6 +516,7 @@ def prompt_records_for_threshold(
         first_by_entity.setdefault(event["entity_id"], event)
     counts: dict[str, int] = defaultdict(int)
     prompted: set[str] = set()
+    colliding_entities: set[str] = set()
     records = []
     request_index = 0
     for frame_index in sorted(by_frame):
@@ -508,14 +524,49 @@ def prompt_records_for_threshold(
             by_frame[frame_index],
             key=lambda row: (int(row["track_id"]), int(row["e11_instance_id"])),
         )
+        current_by_entity: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for event in current:
-            counts[event["entity_id"]] += 1
-        selected = [
-            event
-            for event in current
-            if counts[event["entity_id"]] >= threshold
-            and event["entity_id"] not in prompted
-        ]
+            current_by_entity[str(event["entity_id"])].append(event)
+        if prompt_policy == "legacy":
+            for event in current:
+                counts[event["entity_id"]] += 1
+            selected = [
+                event
+                for event in current
+                if counts[event["entity_id"]] >= threshold
+                and event["entity_id"] not in prompted
+            ]
+        elif prompt_policy == "unique_safe":
+            for entity_id, entity_events in current_by_entity.items():
+                counts[entity_id] += 1
+                if len({int(event["track_id"]) for event in entity_events}) > 1:
+                    colliding_entities.add(entity_id)
+            selected = []
+            for entity_id, entity_events in current_by_entity.items():
+                if (
+                    counts[entity_id] < threshold
+                    or entity_id in prompted
+                    or entity_id in colliding_entities
+                ):
+                    continue
+                selected.append(
+                    max(
+                        entity_events,
+                        key=lambda event: (
+                            int(
+                                np.count_nonzero(
+                                    cv2.imread(
+                                        event["source_mask_path"],
+                                        cv2.IMREAD_GRAYSCALE,
+                                    )
+                                )
+                            ),
+                            -int(event["track_id"]),
+                        ),
+                    )
+                )
+        else:
+            raise ValueError(f"unsupported E14 prompt policy: {prompt_policy}")
         if not selected:
             continue
         if maximum_prompt_records is not None and len(records) >= maximum_prompt_records:
@@ -563,6 +614,7 @@ def prompt_records_for_threshold(
             {
                 "schema": "daaam.g1_no_gt_e14_prompt_record.v1",
                 "threshold_observations": threshold,
+                "prompt_policy": prompt_policy,
                 "prompt_record_index": len(records),
                 "request_id": request_id,
                 "frame_index": frame_index,
@@ -1512,6 +1564,9 @@ def write_report(
     threshold_summaries: Sequence[dict[str, Any]],
     cell_count: int,
     failures: Sequence[dict[str, Any]],
+    *,
+    e13_variant: str = E13_VARIANT,
+    prompt_policy: str = "legacy",
 ) -> None:
     table = "\n".join(
         (
@@ -1525,23 +1580,27 @@ def write_report(
         )
         for row in threshold_summaries
     )
+    executed_thresholds = "/".join(
+        str(row["threshold_observations"]) for row in threshold_summaries
+    )
     report = f"""# E14 DAM 观察门限诊断（E13-fed、无 GT）
 
 ## 结论边界
 
-本实验固定使用 E13 `merge_0p50m`，比较 MapMemory entity 的真实分割观察门限
-3/5/8，并对每个候选运行 seed 0/1/2，共 {cell_count} 个 DAM 单元。选择 0.50 m
-只因为它是当前生产默认值，不代表 E13 已选出 winner。正式 E14 要求 GT entity
+本实验固定使用 E13 `{e13_variant}`，E14 prompt policy 为
+`{prompt_policy}`，比较 MapMemory entity 的真实分割观察门限
+{executed_thresholds}，共运行 {cell_count} 个 DAM 单元。选择某个距离
+或安全策略不代表 E13 已选出 winner。正式 E14 要求 GT entity
 crops/observations；当前没有人工名称 GT，所以名称准确率、描述正确率和真实早期错命名率
 均不可得，不能选择 E14 winner。
 
 ## 实际原理
 
-门限按 MapMemory entity 累计观察计数，不按帧数，也不按单一 BotSort track。
+门限按 MapMemory entity 累计观察计数，不按单一 BotSort track。
 只有来自真实 E11 分割、通过深度资格并成功形成 E13 observation 的记录计数。
-一帧内可能有多个 track 已被 E13 合入同一 entity，因此计数可在一帧增加多次，且触发时
-会保留同一 entity 的多个当前 mask；这与准实时 adapter 一致，也是本实验重点审查的
-名称冲突来源。
+`legacy` 让一帧内多个 track 分别计数并保留重复 mask；`unique_safe` 每个 entity
+每个分割帧只计一次、只选择一个最大面积 mask，并在发现同帧不同 track 冲突后拒绝
+该 entity。这一策略与当前分支修订后的准实时 adapter 契约一致。
 
 每个触发记录以完整左目校正图和独立二值 mask 调用生产
 `DAMAgentPanoptic.query_multi_image_multi_mask()`，固定问题
@@ -1552,7 +1611,7 @@ operation-id 和 supersession 规则写入 MapMemory；Hydra mesh 绑定留给 E
 
 ## 结果
 
-| observation 门限 | 有描述资格 entity | DAM mask 请求 | 平均首描述延迟/帧 | 全部 89 entity 覆盖 | DAM batch calls/seed | 跨 seed 完全一致 | 跨 seed token Jaccard |
+| observation 门限 | 有描述资格 entity | DAM mask 请求 | 平均首描述延迟/帧 | 全部 E13 entity 覆盖 | DAM batch calls/seed | 跨 seed 完全一致 | 跨 seed token Jaccard |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 {table}
 
@@ -1574,8 +1633,8 @@ coverage、调用数和延迟是精确工程量；跨 seed/threshold 文本重�
 
 ## 尚不能回答
 
-没有人工 GT 就无法判断 3 次观察的早期描述是否正确，也无法判断 8 次门限漏掉的
-37 个 entity 是否本应被命名。正式筛选必须补充固定 GT entity crops/observations、
+没有人工 GT 就无法判断较早触发的描述是否正确，也无法判断当前门限未命名的
+entity 是否本应被命名。正式筛选必须补充固定 GT entity crops/observations、
 人工名称/描述裁决及独立 held-out，再计算名称准确率和真实缺失率。
 """
     (output / "REPORT.md").write_text(report, encoding="utf-8")
@@ -1620,6 +1679,8 @@ def main() -> int:
             "seeds": list(seeds),
             "maximum_prompt_records": args.maximum_prompt_records,
             "e13_run": str(args.e13_run.resolve()),
+            "e13_variant": args.e13_variant,
+            "prompt_policy": args.prompt_policy,
             "output": str(args.output.resolve()),
             "environment": {
                 "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE"),
@@ -1637,11 +1698,13 @@ def main() -> int:
     write_preregistration(
         args.output,
         args.e13_run,
+        args.e13_variant,
+        args.prompt_policy,
         thresholds,
         seeds,
         args.maximum_prompt_records,
     )
-    source_variant = args.e13_run / "variants" / E13_VARIANT
+    source_variant = args.e13_run / "variants" / args.e13_variant
     events = read_jsonl(source_variant / "merge_events.jsonl")
     frames_list = read_jsonl(
         args.e13_run / "input_manifests/e12_frames.jsonl"
@@ -1650,7 +1713,11 @@ def main() -> int:
     records_by_threshold = {}
     for threshold in thresholds:
         records = prompt_records_for_threshold(
-            threshold, events, frames, args.maximum_prompt_records
+            threshold,
+            events,
+            frames,
+            args.maximum_prompt_records,
+            args.prompt_policy,
         )
         records_by_threshold[threshold], _ = materialize_prompt_inputs(
             args.output, threshold, records
@@ -1728,7 +1795,14 @@ def main() -> int:
             },
         },
     )
-    write_report(args.output, threshold_summaries, len(summaries), failures)
+    write_report(
+        args.output,
+        threshold_summaries,
+        len(summaries),
+        failures,
+        e13_variant=args.e13_variant,
+        prompt_policy=args.prompt_policy,
+    )
     write_json(
         args.output / "RUN_SUMMARY.json",
         {
@@ -1739,7 +1813,8 @@ def main() -> int:
             "thresholds": list(thresholds),
             "seeds": list(seeds),
             "cell_count": len(summaries),
-            "source_e13_variant": E13_VARIANT,
+            "source_e13_variant": args.e13_variant,
+            "prompt_policy": args.prompt_policy,
             "threshold_summaries": threshold_summaries,
             "failure_proxy_count": len(failures),
             "formal_claims_permitted": False,

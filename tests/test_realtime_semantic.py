@@ -833,7 +833,107 @@ def test_mapmemory_entity_owns_canonical_semantic_id_across_duplicate_tracks(
     assert len(sink.mappings) == 1
     assert stats["entity_semantic_merges"] == 1
     assert memory.stats()["entities"]["active"] == 1
+    assert stats["semantic_unique_entity_frames"] == 1
+    assert stats["semantic_same_frame_duplicate_tracks"] == 1
+    assert stats["semantic_observations"]["colliding_entity_count"] == 1
     memory.close()
+
+
+def test_prompt_uses_one_largest_mask_for_each_entity(tmp_path):
+    memory = MapMemory(tmp_path / "memory.sqlite3")
+    memory.create_session("replay", ORIGIN_NS, canonical=True)
+    adapter = RealtimeSemanticAdapter(
+        pipeline_config(),
+        memory,
+        session_id="replay",
+        output_dir=tmp_path / "semantic",
+        config=RealtimeSemanticConfig(
+            grounding_enabled=True,
+            minimum_observations=1,
+            reject_colliding_prompt_entities=False,
+        ),
+        segmentation_service=FakeSegmenter(),
+        tracking_service=FakeTracker(),
+        grounding_service=FakeRecordingDrainingGrounding(),
+        dsg_sink=FakeDsgSink(),
+    )
+    entity_id = "entity"
+    adapter._observations_by_entity[entity_id] = 1
+    frame = np.zeros((32, 32, 3), dtype=np.uint8)
+    small_mask = np.zeros((32, 32), dtype=bool)
+    small_mask[2:8, 2:8] = True
+    large_mask = np.zeros((32, 32), dtype=bool)
+    large_mask[2:24, 2:24] = True
+    small = Track.from_mask(1, small_mask, np.asarray([2, 2, 8, 8]))
+    large = Track.from_mask(2, large_mask, np.asarray([2, 2, 24, 24]))
+
+    try:
+        adapter._enqueue_prompt(
+            ORIGIN_NS,
+            0,
+            1,
+            frame,
+            [small, large],
+            {1: 7, 2: 7},
+            {1: entity_id, 2: entity_id},
+        )
+        record = adapter.query_queue.get(timeout=1.0)
+
+        assert [track.id for track in record.tracks] == [2]
+        assert adapter.stats()["prompt_duplicate_entity_tracks_dropped"] == 1
+    finally:
+        adapter.query_queue.close()
+        adapter.correction_queue.close()
+        adapter.query_queue.join_thread()
+        adapter.correction_queue.join_thread()
+        memory.close()
+
+
+def test_prompt_rejects_entity_with_same_frame_track_collision(tmp_path):
+    memory = MapMemory(tmp_path / "memory.sqlite3")
+    memory.create_session("replay", ORIGIN_NS, canonical=True)
+    adapter = RealtimeSemanticAdapter(
+        pipeline_config(),
+        memory,
+        session_id="replay",
+        output_dir=tmp_path / "semantic",
+        config=RealtimeSemanticConfig(
+            grounding_enabled=True,
+            minimum_observations=1,
+        ),
+        segmentation_service=FakeSegmenter(),
+        tracking_service=FakeTracker(),
+        grounding_service=FakeRecordingDrainingGrounding(),
+        dsg_sink=FakeDsgSink(),
+    )
+    entity_id = "colliding-entity"
+    adapter._observations_by_entity[entity_id] = 8
+    adapter._colliding_prompt_entities.add(entity_id)
+    frame = np.zeros((32, 32, 3), dtype=np.uint8)
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[2:24, 2:24] = True
+    track = Track.from_mask(1, mask, np.asarray([2, 2, 24, 24]))
+
+    try:
+        adapter._enqueue_prompt(
+            ORIGIN_NS,
+            0,
+            1,
+            frame,
+            [track],
+            {1: 7},
+            {1: entity_id},
+        )
+
+        with pytest.raises(queue.Empty):
+            adapter.query_queue.get(timeout=0.05)
+        assert adapter.stats()["prompt_entities_rejected_collision"] == 1
+    finally:
+        adapter.query_queue.close()
+        adapter.correction_queue.close()
+        adapter.query_queue.join_thread()
+        adapter.correction_queue.join_thread()
+        memory.close()
 
 
 def test_propagation_state_and_audit_history_are_bounded(tmp_path):

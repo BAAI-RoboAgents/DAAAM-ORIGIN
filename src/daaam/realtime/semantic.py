@@ -55,6 +55,7 @@ class RealtimeSemanticConfig:
     automatic_confidence: float = 0.5
     object_binding_maximum_center_distance_m: float = 0.75
     object_binding_maximum_aabb_gap_m: float = 0.15
+    reject_colliding_prompt_entities: bool = True
     gpu_lock_path: Path | str | None = None
     gpu_activity_path: Path | str | None = None
     label_run_configuration_sha256: str = (
@@ -929,6 +930,10 @@ class RealtimeSemanticAdapter:
         self._entity_by_semantic_id: dict[int, str] = {}
         self._context_by_semantic_id: dict[int, tuple[int, int]] = {}
         self._observations_by_entity: dict[str, int] = {}
+        self._last_observation_time_by_entity: dict[str, int] = {}
+        self._observation_tracks_by_entity: dict[str, set[int]] = {}
+        self._colliding_prompt_entities: set[str] = set()
+        self._collision_rejected_entity_revisions: set[tuple[str, int]] = set()
         self._prompted_entity_revisions: set[tuple[str, int]] = set()
         self._eligible_prompt_entities: set[str] = set()
         self._submitted_prompt_entities: set[str] = set()
@@ -972,6 +977,10 @@ class RealtimeSemanticAdapter:
             "prompt_entities_deferred": 0,
             "prompt_candidates_replaced": 0,
             "prompt_candidates_retained": 0,
+            "prompt_duplicate_entity_tracks_dropped": 0,
+            "prompt_entities_rejected_collision": 0,
+            "semantic_unique_entity_frames": 0,
+            "semantic_same_frame_duplicate_tracks": 0,
             "prompt_catchup_records_submitted": 0,
             "prompt_catchup_entities_submitted": 0,
             "prompt_pending_high_water": 0,
@@ -1495,6 +1504,8 @@ class RealtimeSemanticAdapter:
         entity_ids: dict[int, str] = {}
         audit_tracks: list[dict[str, Any]] = []
         overlap_pixels = 0
+        if segmentation_due:
+            self._observation_tracks_by_entity.clear()
         for state, propagation_method in candidates:
             track_id = state.track_id
             semantic_id = state.semantic_id
@@ -1555,8 +1566,24 @@ class RealtimeSemanticAdapter:
                 envelope.key.map_revision,
             )
             if segmentation_due:
-                observations = self._observations_by_entity.get(entity_id, 0) + 1
-                self._observations_by_entity[entity_id] = observations
+                tracks_in_frame = self._observation_tracks_by_entity.setdefault(
+                    entity_id, set()
+                )
+                if tracks_in_frame:
+                    with self._lock:
+                        self._stats["semantic_same_frame_duplicate_tracks"] += 1
+                    self._colliding_prompt_entities.add(entity_id)
+                tracks_in_frame.add(track_id)
+                if (
+                    self._last_observation_time_by_entity.get(entity_id)
+                    != sensor_time_ns
+                ):
+                    self._observations_by_entity[entity_id] = (
+                        self._observations_by_entity.get(entity_id, 0) + 1
+                    )
+                    self._last_observation_time_by_entity[entity_id] = sensor_time_ns
+                    with self._lock:
+                        self._stats["semantic_unique_entity_frames"] += 1
                 track = Track.from_mask(
                     id=track_id,
                     mask=mask,
@@ -1780,14 +1807,50 @@ class RealtimeSemanticAdapter:
     ) -> None:
         if not self.config.grounding_enabled:
             return
-        selected = [
-            track
-            for track in tracks
-            if self._observations_by_entity.get(entity_ids[track.id], 0)
-            >= self.config.minimum_observations
-            and (entity_ids[track.id], map_revision)
-            not in self._prompted_entity_revisions
-        ]
+        tracks_by_entity: dict[str, list[Track]] = {}
+        for track in tracks:
+            entity_id = entity_ids[track.id]
+            tracks_by_entity.setdefault(entity_id, []).append(track)
+        selected: list[Track] = []
+        for entity_id, entity_tracks in tracks_by_entity.items():
+            if (
+                self._observations_by_entity.get(entity_id, 0)
+                < self.config.minimum_observations
+                or (entity_id, map_revision) in self._prompted_entity_revisions
+            ):
+                continue
+            if (
+                self.config.reject_colliding_prompt_entities
+                and entity_id in self._colliding_prompt_entities
+            ):
+                key = (entity_id, map_revision)
+                if key not in self._collision_rejected_entity_revisions:
+                    self._collision_rejected_entity_revisions.add(key)
+                    with self._lock:
+                        self._stats["prompt_entities_rejected_collision"] += 1
+                    self._audit(
+                        "dam_events",
+                        "prompt_entity_rejected_collision",
+                        {
+                            "entity_id": entity_id,
+                            "map_revision": map_revision,
+                            "sensor_time_ns": sensor_time_ns,
+                            "track_ids": sorted(
+                                track.id for track in entity_tracks
+                            ),
+                        },
+                    )
+                continue
+            selected.append(
+                max(
+                    entity_tracks,
+                    key=lambda track: (int(track.region_area), -int(track.id)),
+                )
+            )
+            with self._lock:
+                self._stats["prompt_duplicate_entity_tracks_dropped"] += (
+                    len(entity_tracks) - 1
+                )
         if not selected:
             return
         self._flush_pending_prompts()
@@ -1986,6 +2049,8 @@ class RealtimeSemanticAdapter:
             eligible_prompt_entities = sorted(self._eligible_prompt_entities)
             submitted_prompt_entities = sorted(self._submitted_prompt_entities)
             pending_prompt_entities = list(self._pending_prompts)
+            observation_counts = dict(self._observations_by_entity)
+            colliding_prompt_entities = sorted(self._colliding_prompt_entities)
         values["latency"] = {
             "segmentation_ms": self._latency(segmentation_ms),
             "tracking_ms": self._latency(tracking_ms),
@@ -2038,6 +2103,15 @@ class RealtimeSemanticAdapter:
             ],
             "complete": bool(values["prompt_catchup_complete"])
             and not pending_prompt_entities,
+        }
+        values["semantic_observations"] = {
+            "counting_unit": "unique_segmentation_frame_per_entity",
+            "counts_by_entity": observation_counts,
+            "colliding_entity_count": len(colliding_prompt_entities),
+            "colliding_entity_ids": colliding_prompt_entities,
+            "reject_colliding_prompt_entities": (
+                self.config.reject_colliding_prompt_entities
+            ),
         }
         values["memory"] = self.processor.stats()
         values["dsg"] = self.dsg_sink.stats()

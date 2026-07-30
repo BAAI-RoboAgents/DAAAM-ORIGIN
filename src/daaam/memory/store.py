@@ -21,16 +21,27 @@ class MapMemoryConfig:
     maximum_registration_rms_m: float = 0.20
     maximum_registration_std: float = 0.50
     entity_merge_distance_m: float = 0.50
+    entity_association_policy: str = "legacy"
+    entity_maximum_dimension_ratio: float = 3.0
+    entity_maximum_observation_spread_m: float = 0.75
 
     def __post_init__(self) -> None:
         if self.minimum_registration_inliers < 3:
             raise ValueError("registration requires at least three inliers")
+        if self.entity_association_policy not in {"legacy", "safe", "track_only"}:
+            raise ValueError(
+                "entity association policy must be legacy, safe, or track_only"
+            )
         if min(
             self.maximum_registration_rms_m,
             self.maximum_registration_std,
             self.entity_merge_distance_m,
+            self.entity_maximum_dimension_ratio,
+            self.entity_maximum_observation_spread_m,
         ) <= 0:
             raise ValueError("map memory quality thresholds must be positive")
+        if self.entity_maximum_dimension_ratio < 1.0:
+            raise ValueError("maximum entity dimension ratio must be at least one")
 
 
 @dataclass(frozen=True)
@@ -636,7 +647,42 @@ class MapMemory:
                     # bypass the same 3D continuity gate used for new tracks.
                     reassociated_from = matched_entity
                     matched_entity = None
-            if matched_entity is None:
+                elif self.config.entity_association_policy == "safe":
+                    simultaneous = self._connection.execute(
+                        """SELECT local_entity_id
+                            FROM entity_observations
+                            WHERE session_id=? AND entity_id=?
+                              AND sensor_time_ns=? AND local_entity_id<>?
+                            LIMIT 1""",
+                        (
+                            session_id,
+                            matched_entity,
+                            sensor_time_ns,
+                            local_entity_id,
+                        ),
+                    ).fetchone()
+                    if simultaneous is not None:
+                        reassociated_from = matched_entity
+                        matched_entity = None
+                        self._audit(
+                            "entity_association_rejected",
+                            sensor_time_ns,
+                            entity_id=reassociated_from,
+                            details={
+                                "policy": self.config.entity_association_policy,
+                                "reason": "same_frame_distinct_track",
+                                "session_id": session_id,
+                                "local_entity_id": local_entity_id,
+                                "conflicting_local_entity_id": str(
+                                    simultaneous["local_entity_id"]
+                                ),
+                                "center_distance_m": mapped_distance_m,
+                            },
+                        )
+            if (
+                matched_entity is None
+                and self.config.entity_association_policy != "track_only"
+            ):
                 candidates = self._connection.execute(
                     "SELECT * FROM entities WHERE deleted_ns IS NULL AND entity_type=?",
                     (entity_type,),
@@ -658,9 +704,103 @@ class MapMemory:
                     distance = float(
                         np.linalg.norm(_parse_array(candidate["position_m"]) - canonical_position)
                     )
-                    if distance <= self.config.entity_merge_distance_m and distance < matched_distance:
-                        matched_entity = str(candidate["entity_id"])
-                        matched_distance = distance
+                    if (
+                        distance > self.config.entity_merge_distance_m
+                        or distance >= matched_distance
+                    ):
+                        continue
+                    rejection_reason = None
+                    rejection_details: dict[str, object] = {}
+                    if self.config.entity_association_policy == "safe":
+                        simultaneous = self._connection.execute(
+                            """SELECT local_entity_id
+                                FROM entity_observations
+                                WHERE session_id=? AND entity_id=?
+                                  AND sensor_time_ns=? AND local_entity_id<>?
+                                LIMIT 1""",
+                            (
+                                session_id,
+                                candidate["entity_id"],
+                                sensor_time_ns,
+                                local_entity_id,
+                            ),
+                        ).fetchone()
+                        if simultaneous is not None:
+                            rejection_reason = "same_frame_distinct_track"
+                            rejection_details["conflicting_local_entity_id"] = str(
+                                simultaneous["local_entity_id"]
+                            )
+                        candidate_dimensions = (
+                            None
+                            if candidate["dimensions_m"] is None
+                            else _parse_array(candidate["dimensions_m"])
+                        )
+                        if (
+                            rejection_reason is None
+                            and dimensions is not None
+                            and candidate_dimensions is not None
+                        ):
+                            diagonals = (
+                                float(np.linalg.norm(dimensions)),
+                                float(np.linalg.norm(candidate_dimensions)),
+                            )
+                            dimension_ratio = max(diagonals) / max(
+                                min(diagonals), 1.0e-9
+                            )
+                            if (
+                                dimension_ratio
+                                > self.config.entity_maximum_dimension_ratio
+                            ):
+                                rejection_reason = "dimension_ratio"
+                                rejection_details["dimension_ratio"] = dimension_ratio
+                        if rejection_reason is None:
+                            position_rows = self._connection.execute(
+                                """SELECT position_m FROM entity_observations
+                                    WHERE entity_id=?""",
+                                (candidate["entity_id"],),
+                            ).fetchall()
+                            historical_positions = [
+                                _parse_array(row["position_m"])
+                                for row in position_rows
+                            ]
+                            trial_positions = np.asarray(
+                                [*historical_positions, canonical_position],
+                                dtype=np.float64,
+                            )
+                            trial_center = np.median(trial_positions, axis=0)
+                            maximum_spread_m = float(
+                                np.max(
+                                    np.linalg.norm(
+                                        trial_positions - trial_center,
+                                        axis=1,
+                                    )
+                                )
+                            )
+                            if (
+                                maximum_spread_m
+                                > self.config.entity_maximum_observation_spread_m
+                            ):
+                                rejection_reason = "observation_spread"
+                                rejection_details[
+                                    "maximum_observation_spread_m"
+                                ] = maximum_spread_m
+                        if rejection_reason is not None:
+                            self._audit(
+                                "entity_association_rejected",
+                                sensor_time_ns,
+                                entity_id=str(candidate["entity_id"]),
+                                details={
+                                    "policy": self.config.entity_association_policy,
+                                    "reason": rejection_reason,
+                                    "session_id": session_id,
+                                    "local_entity_id": local_entity_id,
+                                    "center_distance_m": distance,
+                                    **rejection_details,
+                                },
+                            )
+                            continue
+                    matched_entity = str(candidate["entity_id"])
+                    matched_distance = distance
 
             created = matched_entity is None
             entity_id = matched_entity or f"entity-{uuid.uuid4().hex}"
