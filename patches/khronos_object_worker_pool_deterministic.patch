@@ -1,0 +1,36 @@
+diff --git a/khronos/src/active_window/object_extraction/object_worker_pool.cpp b/khronos/src/active_window/object_extraction/object_worker_pool.cpp
+--- a/khronos/src/active_window/object_extraction/object_worker_pool.cpp
++++ b/khronos/src/active_window/object_extraction/object_worker_pool.cpp
+@@ -69,6 +69,7 @@ ObjectWorkerPool::ObjectWorkerPool(const Config& config,
+ ObjectWorkerPool::~ObjectWorkerPool() { stop(); }
+ 
+ void ObjectWorkerPool::stop() {
++  join();
+   should_shutdown_ = true;
+   if (spin_thread_) {
+     spin_thread_->join();
+@@ -79,7 +80,7 @@ void ObjectWorkerPool::stop() {
+ 
+ void ObjectWorkerPool::join() {
+   CLOG(5) << "Joining " << curr_workers_ << " extraction threads!";
+-  while (curr_workers_ > 0) {
++  while (!work_queue_.empty() || curr_workers_ > 0) {
+     CLOG(10) << "Waiting on " << curr_workers_ << " extraction threads to finish!";
+     std::this_thread::sleep_for(10ms);
+   }
+@@ -136,15 +137,15 @@ void ObjectWorkerPool::runOnce(Request::Ptr req) const {
+   auto attrs = extractor_->extractObject(req->track, req->frame_data);
+   const auto stop = std::chrono::high_resolution_clock::now();
+ 
+-  ElapsedTimeRecorder::instance().record("active_window/extract_object", req->stamp, start - stop);
++  ElapsedTimeRecorder::instance().record("active_window/extract_object", req->stamp, stop - start);
+ 
+-  curr_workers_--;
+   if (attrs) {
+     std::lock_guard<std::mutex> lock(output_mutex_);
+     output_.emplace_back(std::move(attrs));
+   }
++  curr_workers_--;
+ }
+ 
+ }  // namespace khronos

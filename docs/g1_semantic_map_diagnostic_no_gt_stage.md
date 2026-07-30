@@ -166,6 +166,12 @@ stage 和 parent artifact hash，并保存 inventory 自身 hash。数据库须�
 - 现有 844 帧运行可证明链路闭合，但发生过从 600 帧恢复；它不是 zero-resume 权威运行。
 - 当前全量运行的 `global` service P95 超过既定 250 ms 门，因此功能性地图可用，但整体
   quality 不能标为 PASS。
+- E16 在冻结的 E11→E14 safe0.35 输入上完成 5 个 Hydra 候选并独立复算。12 cm 是唯一
+  通过 250 ms P95 门的候选（132.0 ms），但对象到期/提取 flush 的最大延迟仍为
+  110.8 s；5 cm baseline、obs4、低 min-volume 与 3 cm diagnostic 的 P95 均失败。
+  低 min-volume 的最大延迟达到 822.1 s、峰值 13.47 GiB；3 cm 还存在 GVD
+  `min_distance=0.10 m` 大于 truncation `0.09 m` 的配置冲突，只能作失败/资源诊断。
+  稀疏 LiDAR 最近邻与标签生存仍是 proxy，缺少表面/object GT，因此不能产生正式 winner。
 - 自动校正、LiDAR scale、语义 label、track、entity 和 query 都不能替代独立人工 GT。
 - 该阶段的最终标签最多为
   `engineering-diagnostic-on-g1-existing-data`。
