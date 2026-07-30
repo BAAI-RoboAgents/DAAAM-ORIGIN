@@ -12,11 +12,13 @@ import math
 import os
 from pathlib import Path
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import traceback
 from typing import Callable, Optional
 import uuid
 
@@ -48,6 +50,11 @@ from daaam.mapping.paths import PathObservation, PathRepository  # noqa: E402
 from daaam.mapping.submaps import SubmapManager  # noqa: E402
 from daaam.memory import MapMemory, MapMemoryConfig  # noqa: E402
 from daaam.quality import QualityGateConfig, QualityGateRunner  # noqa: E402
+from daaam.realtime.audit import (  # noqa: E402
+    JsonlAuditWriter,
+    RealtimeAuditBundle,
+    ResourceSampler,
+)
 from daaam.realtime.checkpoint import RealtimeCheckpoint  # noqa: E402
 from daaam.realtime.contracts import (  # noqa: E402
     FrameValue,
@@ -80,7 +87,7 @@ class ReplayFrame:
     frame_index: int
     sensor_time_ns: int
     rgb_path: Path
-    right_path: Path
+    right_path: Optional[Path]
     depth_path: Path
     confidence_path: Path
     consistency_path: Path
@@ -107,6 +114,7 @@ class TrackedFrame:
     confidence: np.ndarray
     dynamic_mask: np.ndarray
     unknown_mask: np.ndarray
+    residual_px: np.ndarray
     motion_metrics: dict
 
 
@@ -164,6 +172,25 @@ def parse_args():
         "--depth-backend",
         choices=("precomputed", "foundation-worker"),
         default="precomputed",
+    )
+    parser.add_argument(
+        "--maximum-depth-m",
+        type=float,
+        help=(
+            "Maximum depth represented by the runtime depth product. Defaults "
+            "to the dataset recommendation. This is distinct from Hydra's "
+            "finite view-frustum allocation range."
+        ),
+    )
+    parser.add_argument(
+        "--hydra-maximum-range-m",
+        type=float,
+        help=(
+            "Finite Hydra camera/view-frustum range. Defaults to the smaller "
+            "of --maximum-depth-m and map_window.max_radius_m from the Hydra "
+            "configuration. This does not modify source or runtime depth "
+            "products."
+        ),
     )
     parser.add_argument("--foundation-stereo-env", default="foundation_stereo")
     parser.add_argument("--foundation-stereo-python", type=Path)
@@ -329,7 +356,51 @@ def parse_args():
     )
     parser.add_argument("--quality-report-only", action="store_true")
     parser.add_argument("--map-metrics-json", type=Path)
+    parser.add_argument(
+        "--experiment-telemetry",
+        action="store_true",
+        help=(
+            "Persist append-only frame, queue, resource, semantic, track, "
+            "binding, and DAM audit streams under run_dir/telemetry."
+        ),
+    )
+    parser.add_argument(
+        "--telemetry-sample-interval-s",
+        type=float,
+        default=0.5,
+        help="Host/GPU resource sampling interval for experiment telemetry.",
+    )
+    parser.add_argument(
+        "--experiment-visualizations",
+        action="store_true",
+        help=(
+            "Persist per-frame stereo, depth, confidence, motion residual, mask "
+            "overlay, static-depth montage, and trajectory visualizations."
+        ),
+    )
+    parser.add_argument(
+        "--visualization-stride",
+        type=int,
+        default=1,
+        help="Write experiment visualizations for every Nth frame.",
+    )
     return parser.parse_args()
+
+
+def load_hydra_map_window_radius(config_path: Path) -> Optional[float]:
+    """Return the configured spatial active-map radius when one is available."""
+
+    configuration = yaml.safe_load(config_path.read_text()) or {}
+    map_window = configuration.get("map_window", {})
+    if not isinstance(map_window, dict):
+        raise ValueError("Hydra map_window configuration must be a mapping")
+    radius = map_window.get("max_radius_m")
+    if radius is None:
+        return None
+    radius_m = float(radius)
+    if not math.isfinite(radius_m) or radius_m <= 0.0:
+        raise ValueError("Hydra map_window.max_radius_m must be positive")
+    return radius_m
 
 
 def read_poses(dataset: Path) -> list[np.ndarray]:
@@ -436,7 +507,9 @@ def build_frames(
                 frame_index=frame_index,
                 sensor_time_ns=int(frame["sensor_time_ns"]),
                 rgb_path=Path(frame["cam0"]),
-                right_path=Path(frame["cam1"]),
+                right_path=(
+                    Path(frame["cam1"]) if frame.get("cam1") is not None else None
+                ),
                 depth_path=dataset / "depth" / f"{frame_index:08d}.png",
                 confidence_path=dataset / "depth_confidence" / f"{frame_index:08d}.png",
                 consistency_path=dataset
@@ -458,6 +531,43 @@ def build_frames(
 
 def load_precomputed_depth_provenance(dataset: Path) -> Optional[dict]:
     """Resolve the report that produced a precomputed metric-depth dataset."""
+
+    rgbd_path = dataset / "rgbd_preparation_report.json"
+    if rgbd_path.is_file():
+        try:
+            report = json.loads(rgbd_path.read_text())
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"Invalid precomputed RGB-D report: {rgbd_path}"
+            ) from error
+        if report.get("status") != "complete":
+            raise ValueError(
+                f"Precomputed RGB-D report is not complete: {rgbd_path}"
+            )
+        settings = report.get("settings", {})
+        counts = report.get("counts", {})
+        artifacts = report.get("artifacts", {})
+        return {
+            "backend": "sensor-aligned-rgbd",
+            "report": str(rgbd_path.resolve()),
+            "report_sha256": sha256_file(rgbd_path),
+            "profile": "unitree-head-d455-aligned-rgbd",
+            "valid_iters": None,
+            "scale": None,
+            "precision": "sensor-float32-to-uint16-mm",
+            "confidence_mode": report.get(
+                "confidence_mode", "sensor-validity"
+            ),
+            "checkpoint": None,
+            "checkpoint_sha256": None,
+            "processed": counts.get("prepared_frames"),
+            "failed": counts.get("dropped_frames"),
+            "maximum_depth_m": settings.get("maximum_depth_m"),
+            "camera_calibration_sha256": artifacts.get(
+                "camera_calibration_sha256"
+            ),
+            "time_contract_sha256": artifacts.get("time_contract_sha256"),
+        }
 
     for name in (
         "fast_foundation_stereo_run.json",
@@ -559,6 +669,14 @@ def load_semantic_model_provenance(
     workers = config.get("workers", {})
     dam_config = workers.get("dam_grounding_config", {})
     dam_model = dam_config.get("dam_model_path")
+    dam_local_path = None
+    if dam_model:
+        configured_dam_path = Path(str(dam_model)).expanduser()
+        if not configured_dam_path.is_absolute():
+            configured_dam_path = repository_root / configured_dam_path
+        configured_dam_path = configured_dam_path.resolve()
+        if configured_dam_path.is_dir():
+            dam_local_path = configured_dam_path
     cache_root = Path(
         os.environ.get(
             "HF_HUB_CACHE",
@@ -567,7 +685,7 @@ def load_semantic_model_provenance(
     )
     dam_revision_path = (
         cache_root / f"models--{str(dam_model).replace('/', '--')}" / "refs" / "main"
-        if dam_model
+        if dam_model and dam_local_path is None
         else None
     )
     dam_revision = (
@@ -592,11 +710,98 @@ def load_semantic_model_provenance(
         ),
         "dam": {
             "model_id": dam_model,
+            "local_path": str(dam_local_path) if dam_local_path is not None else None,
+            "model_index_sha256": (
+                sha256_file(dam_local_path / "llm" / "model.safetensors.index.json")
+                if dam_local_path is not None
+                and (dam_local_path / "llm" / "model.safetensors.index.json").is_file()
+                else None
+            ),
             "cached_revision": dam_revision,
+            "cached_snapshot_path": (
+                str(
+                    cache_root
+                    / f"models--{str(dam_model).replace('/', '--')}"
+                    / "snapshots"
+                    / dam_revision
+                )
+                if dam_model and dam_revision and dam_local_path is None
+                else None
+            ),
         },
         "semantic_labelspace": semantic_labelspace,
         "labelspace_colors": labelspace_colors,
     }
+
+
+def resolve_cached_huggingface_snapshot(
+    model_id_or_path: str,
+    *,
+    cache_root: Optional[Path] = None,
+) -> Path:
+    """Resolve and validate a model without making a network request."""
+
+    configured = Path(model_id_or_path).expanduser()
+    if configured.exists():
+        return configured.resolve()
+    if "/" not in model_id_or_path:
+        raise FileNotFoundError(
+            f"DAM model path does not exist: {configured}"
+        )
+
+    resolved_cache_root = (
+        cache_root
+        if cache_root is not None
+        else Path(
+            os.environ.get(
+                "HF_HUB_CACHE",
+                Path.home() / ".cache" / "huggingface" / "hub",
+            )
+        )
+    )
+    repository_dir = (
+        resolved_cache_root
+        / f"models--{model_id_or_path.replace('/', '--')}"
+    )
+    revision_path = repository_dir / "refs" / "main"
+    if not revision_path.is_file():
+        raise FileNotFoundError(
+            f"DAM model is not cached locally: {model_id_or_path}"
+        )
+    revision = revision_path.read_text().strip()
+    snapshot = repository_dir / "snapshots" / revision
+    if not snapshot.is_dir():
+        raise FileNotFoundError(
+            f"DAM cached revision is missing its snapshot: {snapshot}"
+        )
+
+    tree_path = repository_dir / "trees" / f"{revision}.json"
+    if tree_path.is_file():
+        tree = json.loads(tree_path.read_text())
+        expected_files = tree.get("files")
+        if not isinstance(expected_files, dict) or not expected_files:
+            raise ValueError(f"Invalid Hugging Face cache tree: {tree_path}")
+        invalid: list[str] = []
+        for relative_path, metadata in expected_files.items():
+            expected_size = metadata.get("size")
+            artifact = snapshot / relative_path
+            if (
+                not artifact.is_file()
+                or expected_size is None
+                or artifact.stat().st_size != int(expected_size)
+            ):
+                invalid.append(relative_path)
+        if invalid:
+            preview = ", ".join(invalid[:5])
+            raise FileNotFoundError(
+                "DAM cached snapshot is incomplete or size-invalid "
+                f"({len(invalid)} files): {preview}"
+            )
+    elif not (snapshot / "config.json").is_file():
+        raise FileNotFoundError(
+            f"DAM cached snapshot has no config.json: {snapshot}"
+        )
+    return snapshot.resolve()
 
 
 class ReplayEngine:
@@ -622,6 +827,9 @@ class ReplayEngine:
         depth_lr_interval: int = 3,
         static_map_backend: Optional[HydraStaticMapBackend] = None,
         checkpoint_state: Optional[dict] = None,
+        frame_audit_writer: Optional[JsonlAuditWriter] = None,
+        write_experiment_visualizations: bool = False,
+        visualization_stride: int = 1,
     ) -> None:
         self.run_dir = run_dir
         self.checkpoint = checkpoint
@@ -637,6 +845,11 @@ class ReplayEngine:
         self.depth_confidence_mode = depth_confidence_mode
         self.depth_lr_interval = depth_lr_interval
         self.static_map_backend = static_map_backend
+        self.frame_audit_writer = frame_audit_writer
+        if visualization_stride <= 0:
+            raise ValueError("visualization_stride must be positive")
+        self.write_experiment_visualizations = write_experiment_visualizations
+        self.visualization_stride = visualization_stride
         self.semantic_label_provider: Optional[
             Callable[[int], Optional[np.ndarray]]
         ] = None
@@ -722,6 +935,165 @@ class ReplayEngine:
             self.memory.close()
             raise
 
+    def _frame_metric(
+        self,
+        stage: str,
+        frame: ReplayFrame,
+        **values,
+    ) -> None:
+        if self.frame_audit_writer is None:
+            return
+        try:
+            self.frame_audit_writer.write(
+                "stage_frame",
+                {
+                    "stage": stage,
+                    "frame_index": frame.frame_index,
+                    "sensor_time_ns": frame.sensor_time_ns,
+                    **values,
+                },
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return
+
+    def _visualize_frame(self, frame_index: int) -> bool:
+        return (
+            self.write_experiment_visualizations
+            and frame_index % self.visualization_stride == 0
+        )
+
+    @staticmethod
+    def _depth_colormap(depth_m: np.ndarray) -> np.ndarray:
+        valid = np.isfinite(depth_m) & (depth_m > 0.0)
+        normalized = np.zeros(depth_m.shape, dtype=np.uint8)
+        if np.any(valid):
+            maximum = max(0.25, float(np.percentile(depth_m[valid], 95)))
+            normalized[valid] = np.clip(
+                np.rint(depth_m[valid] / maximum * 255.0),
+                1,
+                255,
+            ).astype(np.uint8)
+        colored = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+        colored[~valid] = 0
+        return colored
+
+    @staticmethod
+    def _write_image(path: Path, image: np.ndarray) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(path), image):
+            raise RuntimeError(f"Failed to write visualization: {path}")
+
+    def _write_depth_visualizations(self, payload: DepthFrame) -> None:
+        frame = payload.source
+        if not self._visualize_frame(frame.frame_index):
+            return
+        name = f"{frame.frame_index:08d}.png"
+        root = self.run_dir / "visualizations"
+        rgb_bgr = cv2.cvtColor(payload.rgb_image, cv2.COLOR_RGB2BGR)
+        if frame.right_path is None:
+            self._write_image(root / "rgb" / name, rgb_bgr)
+        else:
+            right_bgr = cv2.imread(str(frame.right_path), cv2.IMREAD_COLOR)
+            if right_bgr is None:
+                raise FileNotFoundError(
+                    f"Right RGB frame is missing: {frame.right_path}"
+                )
+            stereo = np.hstack((rgb_bgr, right_bgr))
+            self._write_image(root / "stereo" / name, stereo)
+        self._write_image(
+            root / "depth" / name,
+            self._depth_colormap(payload.depth_m),
+        )
+        confidence = np.clip(
+            np.rint(payload.confidence * 255.0),
+            0,
+            255,
+        ).astype(np.uint8)
+        self._write_image(root / "depth_confidence" / name, confidence)
+
+    def _write_tracking_visualizations(self, payload: TrackedFrame) -> None:
+        frame = payload.source
+        if not self._visualize_frame(frame.frame_index):
+            return
+        name = f"{frame.frame_index:08d}.png"
+        root = self.run_dir / "visualizations"
+        rgb_bgr = cv2.cvtColor(payload.rgb_image, cv2.COLOR_RGB2BGR)
+        overlay = rgb_bgr.copy()
+        overlay[payload.unknown_mask] = (
+            0.5 * overlay[payload.unknown_mask] + np.array([0, 215, 255]) * 0.5
+        ).astype(np.uint8)
+        overlay[payload.dynamic_mask] = (
+            0.35 * overlay[payload.dynamic_mask] + np.array([0, 0, 255]) * 0.65
+        ).astype(np.uint8)
+        self._write_image(root / "motion_overlay" / name, overlay)
+        residual = np.nan_to_num(
+            payload.residual_px,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).astype(np.float32, copy=False)
+        residual_directory = root / "motion_residual_raw"
+        residual_directory.mkdir(parents=True, exist_ok=True)
+        np.save(
+            residual_directory / f"{frame.frame_index:08d}.npy",
+            residual,
+            allow_pickle=False,
+        )
+        residual_uint8 = np.clip(
+            np.rint(residual / max(1.0, self.motion_config.residual_threshold_px) * 64),
+            0,
+            255,
+        ).astype(np.uint8)
+        self._write_image(
+            root / "motion_residual" / name,
+            cv2.applyColorMap(residual_uint8, cv2.COLORMAP_INFERNO),
+        )
+
+    def _write_fusion_visualizations(self, payload: FusionFrame) -> None:
+        frame = payload.tracked.source
+        if not self._visualize_frame(frame.frame_index):
+            return
+        name = f"{frame.frame_index:08d}.png"
+        root = self.run_dir / "visualizations"
+        rgb_bgr = cv2.cvtColor(payload.tracked.rgb_image, cv2.COLOR_RGB2BGR)
+        depth = self._depth_colormap(payload.tracked.depth_m)
+        static = self._depth_colormap(payload.static_depth_m)
+        overlay = rgb_bgr.copy()
+        overlay[payload.tracked.unknown_mask] = (
+            0.5 * overlay[payload.tracked.unknown_mask] + np.array([0, 215, 255]) * 0.5
+        ).astype(np.uint8)
+        overlay[payload.tracked.dynamic_mask] = (
+            0.35 * overlay[payload.tracked.dynamic_mask]
+            + np.array([0, 0, 255]) * 0.65
+        ).astype(np.uint8)
+        montage = np.vstack(
+            (
+                np.hstack((rgb_bgr, depth)),
+                np.hstack((overlay, static)),
+            )
+        )
+        cv2.putText(
+            montage,
+            "RGB | depth",
+            (18, 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            montage,
+            "dynamic(red)/unknown(yellow) | static depth",
+            (18, rgb_bgr.shape[0] + 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        self._write_image(root / "fusion_montage" / name, montage)
+
     def initialize_previous(self, frame: ReplayFrame) -> None:
         try:
             if self.depth_worker is not None:
@@ -744,20 +1116,28 @@ class ReplayEngine:
         validation = self.pose_validator.validate(estimate, calibration_revision=0)
         if not validation.accepted:
             raise ValueError(f"pose rejected: {validation.reason}")
+        translation_step_m = None
+        rotation_step_deg = None
         with self.state_lock:
             if self.previous_pose is not None:
                 relative = np.linalg.inv(self.previous_pose) @ frame.world_T_camera
-                self.pose_translation_steps.append(
-                    float(np.linalg.norm(relative[:3, 3]))
-                )
+                translation_step_m = float(np.linalg.norm(relative[:3, 3]))
+                self.pose_translation_steps.append(translation_step_m)
                 rotation_trace = np.clip(
                     (np.trace(relative[:3, :3]) - 1.0) / 2.0, -1.0, 1.0
                 )
-                self.pose_rotation_steps.append(
-                    float(np.degrees(np.arccos(rotation_trace)))
-                )
+                rotation_step_deg = float(np.degrees(np.arccos(rotation_trace)))
+                self.pose_rotation_steps.append(rotation_step_deg)
             self.previous_pose = frame.world_T_camera.copy()
             self.frames_by_stage["pose"] += 1
+        self._frame_metric(
+            "pose",
+            frame,
+            accepted=True,
+            translation_step_m=translation_step_m,
+            rotation_step_deg=rotation_step_deg,
+            position_m=frame.world_T_camera[:3, 3].tolist(),
+        )
         return envelope
 
     def _load_depth(
@@ -883,6 +1263,10 @@ class ReplayEngine:
             return generated
         if self.stereo_fx is None or self.stereo_baseline_m is None:
             raise RuntimeError("FoundationStereo worker geometry is not configured")
+        if frame.right_path is None:
+            raise RuntimeError(
+                "FoundationStereo worker requires a right image; this dataset is RGB-D"
+            )
         confidence_mode = scheduled_confidence_mode(
             frame.frame_index,
             configured_mode=self.depth_confidence_mode,
@@ -913,6 +1297,26 @@ class ReplayEngine:
             self._temporal_agreement(previous_quality, payload)
         with self.state_lock:
             self.previous_depth_quality = payload
+            temporal_agreement = (
+                self.temporal_agreements[-1] if self.temporal_agreements else None
+            )
+            stereo_consistency = (
+                self.stereo_consistency[-1] if self.stereo_consistency else None
+            )
+        self._frame_metric(
+            "depth",
+            frame,
+            valid_ratio=float(np.mean(payload.depth_m > 0.0)),
+            has_left_right_confidence=payload.has_stereo_confidence,
+            left_right_consistency=stereo_consistency,
+            temporal_agreement=temporal_agreement,
+            median_depth_m=(
+                float(np.median(payload.depth_m[payload.depth_m > 0.0]))
+                if np.any(payload.depth_m > 0.0)
+                else None
+            ),
+        )
+        self._write_depth_visualizations(payload)
         return RealtimeEnvelope(
             envelope.key,
             payload,
@@ -977,6 +1381,7 @@ class ReplayEngine:
         if previous is None:
             dynamic = np.zeros(current.depth_m.shape, dtype=bool)
             unknown = np.ones(current.depth_m.shape, dtype=bool)
+            residual_px = np.zeros(current.depth_m.shape, dtype=np.float32)
             motion_metrics = {
                 "reason": "first_frame_no_motion_baseline",
                 "dynamic_ratio": 0.0,
@@ -1054,6 +1459,7 @@ class ReplayEngine:
             except Exception as error:
                 dynamic = np.zeros(current.depth_m.shape, dtype=bool)
                 unknown = np.ones(current.depth_m.shape, dtype=bool)
+                residual_px = np.zeros(current.depth_m.shape, dtype=np.float32)
                 motion_metrics = {
                     "reason": "motion_uncertain",
                     "error": repr(error),
@@ -1126,8 +1532,21 @@ class ReplayEngine:
             current.confidence,
             dynamic,
             unknown,
+            residual_px,
             motion_metrics,
         )
+        dynamic_metric = dict(motion_metrics)
+        dynamic_metric.update(
+            {
+                "dynamic_pixels": int(np.count_nonzero(dynamic)),
+                "unknown_pixels": int(np.count_nonzero(unknown)),
+                "dynamic_entities_active": len(
+                    self.dynamic_layer.active_objects
+                ),
+            }
+        )
+        self._frame_metric("dynamic", current.source, **dynamic_metric)
+        self._write_tracking_visualizations(payload)
         return RealtimeEnvelope(
             envelope.key,
             payload,
@@ -1172,6 +1591,13 @@ class ReplayEngine:
         payload = FusionFrame(
             tracked, static.depth_m, static.confidence, static.metrics
         )
+        self._frame_metric(
+            "fusion",
+            tracked.source,
+            **static.metrics,
+            static_valid_ratio=float(np.mean(static.depth_m > 0.0)),
+        )
+        self._write_fusion_visualizations(payload)
         return RealtimeEnvelope(
             envelope.key,
             payload,
@@ -1205,6 +1631,13 @@ class ReplayEngine:
                 world_T_camera=frame.world_T_camera,
                 semantic_labels=semantic_labels,
             )
+        self._frame_metric(
+            "global",
+            frame,
+            map_revision=self.submaps.map_revision,
+            submap_count=len(self.submaps.submaps),
+            hydra_enabled=self.static_map_backend is not None,
+        )
         return envelope
 
     def _path_buffer_snapshot(self) -> dict:
@@ -1238,6 +1671,8 @@ class ReplayEngine:
             temporary = output.with_suffix(".json.tmp")
             temporary.write_text(json.dumps(snapshot, indent=2, allow_nan=False) + "\n")
             temporary.replace(output)
+            if self.write_experiment_visualizations:
+                self._write_trajectory_visualization(snapshot)
             self.checkpoint.update_mapping_state(
                 map_revision=self.submaps.map_revision,
                 dynamic_layer=self.dynamic_layer.snapshot(),
@@ -1245,6 +1680,64 @@ class ReplayEngine:
                 paths=snapshot,
                 path_buffer=self._path_buffer_snapshot(),
             )
+
+    def _write_trajectory_visualization(self, snapshot: dict) -> None:
+        paths = [
+            np.asarray(record["points_m"], dtype=np.float64)
+            for record in snapshot.get("paths", [])
+            if len(record.get("points_m", [])) >= 2
+        ]
+        if not paths:
+            return
+        root = self.run_dir / "visualizations" / "trajectory"
+        root.mkdir(parents=True, exist_ok=True)
+        all_points = np.concatenate(paths, axis=0)
+        minimum = all_points[:, :2].min(axis=0)
+        maximum = all_points[:, :2].max(axis=0)
+        extent = np.maximum(maximum - minimum, 1.0e-6)
+        canvas = np.full((1024, 1024, 3), 248, dtype=np.uint8)
+        colors = (
+            (31, 119, 180),
+            (255, 127, 14),
+            (44, 160, 44),
+            (214, 39, 40),
+            (148, 103, 189),
+        )
+        csv_lines = ["path_index,point_index,x_m,y_m,z_m"]
+        for path_index, points in enumerate(paths):
+            pixels = np.empty((len(points), 2), dtype=np.int32)
+            pixels[:, 0] = np.rint(
+                64 + (points[:, 0] - minimum[0]) / extent[0] * 896
+            ).astype(np.int32)
+            pixels[:, 1] = np.rint(
+                960 - (points[:, 1] - minimum[1]) / extent[1] * 896
+            ).astype(np.int32)
+            cv2.polylines(
+                canvas,
+                [pixels.reshape(-1, 1, 2)],
+                False,
+                colors[path_index % len(colors)],
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.circle(canvas, tuple(pixels[0]), 7, (0, 180, 0), -1)
+            cv2.circle(canvas, tuple(pixels[-1]), 7, (0, 0, 220), -1)
+            csv_lines.extend(
+                f"{path_index},{point_index},{point[0]:.9f},{point[1]:.9f},{point[2]:.9f}"
+                for point_index, point in enumerate(points)
+            )
+        cv2.putText(
+            canvas,
+            "XY trajectory (green=start, red=end)",
+            (28, 42),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (25, 25, 25),
+            2,
+            cv2.LINE_AA,
+        )
+        self._write_image(root / "trajectory_xy.png", canvas)
+        (root / "trajectory_points.csv").write_text("\n".join(csv_lines) + "\n")
 
     def finalize_static_map(self) -> None:
         if self.static_map_backend is not None:
@@ -1373,6 +1866,9 @@ class RealtimeResourceState:
     depth_worker: Optional[SubprocessDepthBackend] = None
     memory: Optional[MapMemory] = None
     static_map_backend: Optional[HydraStaticMapBackend] = None
+    resource_sampler: Optional[ResourceSampler] = None
+    audit_bundle: Optional[RealtimeAuditBundle] = None
+    run_dir: Optional[Path] = None
 
 
 def cleanup_realtime_resources(
@@ -1431,6 +1927,16 @@ def cleanup_realtime_resources(
             "static_map_backend",
             lambda: static_map_backend.close(finalize=False),
         )
+
+    resource_sampler = resources.resource_sampler
+    resources.resource_sampler = None
+    if resource_sampler is not None:
+        attempt("resource_sampler", resource_sampler.stop)
+
+    audit_bundle = resources.audit_bundle
+    resources.audit_bundle = None
+    if audit_bundle is not None:
+        attempt("audit_bundle", audit_bundle.close)
 
     return errors
 
@@ -1934,6 +2440,10 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             "Entity merge and object-binding center distances must be positive; "
             "the object-binding AABB gap must be non-negative"
         )
+    if args.telemetry_sample_interval_s <= 0.0:
+        raise ValueError("--telemetry-sample-interval-s must be positive")
+    if args.visualization_stride <= 0:
+        raise ValueError("--visualization-stride must be positive")
     if args.semantic_mode != "disabled" and not args.semantic_config.is_file():
         raise ValueError("Real semantic mode requires a valid --semantic-config")
     if args.depth_lr_interval <= 0:
@@ -1998,11 +2508,58 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         )
     time_contract = validate_time_contract(dataset)
     metadata = json.loads((dataset / "tick_index.json").read_text())
+    dataset_maximum_depth_m = float(
+        metadata.get("recommended_max_depth_m", 5.0)
+    )
+    maximum_depth_m = (
+        dataset_maximum_depth_m
+        if args.maximum_depth_m is None
+        else float(args.maximum_depth_m)
+    )
+    if maximum_depth_m <= 0.0:
+        raise ValueError("--maximum-depth-m must be positive")
+    if (
+        args.depth_backend == "precomputed"
+        and maximum_depth_m > dataset_maximum_depth_m
+    ):
+        raise ValueError(
+            "--maximum-depth-m cannot exceed the precomputed dataset "
+            f"recommendation ({dataset_maximum_depth_m} m)"
+        )
+    if args.hydra_maximum_range_m is not None and args.static_map_backend != "hydra":
+        raise ValueError("--hydra-maximum-range-m requires --static-map-backend hydra")
+    hydra_map_window_radius_m = None
+    hydra_maximum_range_source = None
+    hydra_maximum_range_m = None
+    if args.static_map_backend == "hydra":
+        hydra_map_window_radius_m = load_hydra_map_window_radius(
+            args.hydra_config_path
+        )
+        if args.hydra_maximum_range_m is not None:
+            hydra_maximum_range_m = float(args.hydra_maximum_range_m)
+            hydra_maximum_range_source = "explicit_cli"
+        elif hydra_map_window_radius_m is not None:
+            hydra_maximum_range_m = min(
+                maximum_depth_m,
+                hydra_map_window_radius_m,
+            )
+            hydra_maximum_range_source = "hydra_map_window_radius"
+        else:
+            hydra_maximum_range_m = maximum_depth_m
+            hydra_maximum_range_source = "runtime_depth_fallback"
+        if hydra_maximum_range_m <= 0.0:
+            raise ValueError("--hydra-maximum-range-m must be positive")
+        if hydra_maximum_range_m > maximum_depth_m:
+            raise ValueError(
+                "--hydra-maximum-range-m cannot exceed --maximum-depth-m "
+                f"({maximum_depth_m} m)"
+            )
     time_contract.update(
         {
             "monotonic": True,
             "pose_exact_match": True,
             "relative_time_consistent": True,
+            "input_modality": metadata.get("input_modality", "stereo"),
             "maximum_stereo_delta_ms": max(
                 (
                     float(frame.get("stereo_delta_ms", 0.0))
@@ -2032,6 +2589,18 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
     if args.overwrite and run_dir.exists():
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    resources.run_dir = run_dir
+    audit_bundle = None
+    if args.experiment_telemetry:
+        audit_bundle = RealtimeAuditBundle(run_dir / "telemetry")
+        resources.audit_bundle = audit_bundle
+        resource_sampler = ResourceSampler(
+            audit_bundle.writer("resource_samples"),
+            interval_s=args.telemetry_sample_interval_s,
+            repository_root=REPOSITORY_ROOT,
+        )
+        resources.resource_sampler = resource_sampler
+        resource_sampler.start()
     gpu_lock_path = (
         run_dir / "gpu_coordination" / "single_gpu.lock"
         if args.gpu_sharing_mode == "staggered"
@@ -2046,6 +2615,11 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         "stop_after": args.stop_after,
         "requested_stop_after": requested_stop_after,
         "depth_backend": args.depth_backend,
+        "dataset_maximum_depth_m": dataset_maximum_depth_m,
+        "maximum_depth_m": maximum_depth_m,
+        "hydra_maximum_range_m": hydra_maximum_range_m,
+        "hydra_maximum_range_source": hydra_maximum_range_source,
+        "hydra_map_window_radius_m": hydra_map_window_radius_m,
         "depth_confidence_mode": effective_depth_confidence_mode,
         "requested_depth_confidence_mode": args.depth_confidence_mode,
         "depth_lr_interval": args.depth_lr_interval,
@@ -2062,6 +2636,20 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         "motion_analysis_width": args.motion_analysis_width,
         "submap_frames": args.submap_frames,
         "checkpoint_interval_frames": args.checkpoint_interval_frames,
+        "experiment_telemetry": {
+            "enabled": args.experiment_telemetry,
+            "sample_interval_s": args.telemetry_sample_interval_s,
+            "directory": str(run_dir / "telemetry")
+            if args.experiment_telemetry
+            else None,
+        },
+        "experiment_visualizations": {
+            "enabled": args.experiment_visualizations,
+            "stride": args.visualization_stride,
+            "directory": str(run_dir / "visualizations")
+            if args.experiment_visualizations
+            else None,
+        },
         "map_memory": {
             "entity_merge_distance_m": args.entity_merge_distance_m,
         },
@@ -2188,7 +2776,20 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
                         else None
                     )
                 ),
-                "license": "NVIDIA research/non-commercial",
+                "license": (
+                    "NVIDIA research/non-commercial"
+                    if (
+                        args.depth_backend == "foundation-worker"
+                        or (
+                            precomputed_depth_provenance
+                            and "foundation-stereo"
+                            in str(
+                                precomputed_depth_provenance.get("backend", "")
+                            )
+                        )
+                    )
+                    else None
+                ),
                 "profile": depth_profile_manifest["name"],
                 "valid_iters": depth_profile_manifest["valid_iters"],
                 "scale": depth_profile_manifest["scale"],
@@ -2361,7 +2962,7 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
             hydra_output_dir,
             labelspace_path=args.hydra_labelspace_path,
             labelspace_colors=args.hydra_labelspace_colors,
-            maximum_depth_m=float(metadata.get("recommended_max_depth_m", 5.0)),
+            maximum_depth_m=hydra_maximum_range_m,
         )
         resources.static_map_backend = static_map_backend
         static_map_backend.initialize(
@@ -2384,12 +2985,23 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         entity_merge_distance_m=args.entity_merge_distance_m,
         depth_worker=depth_worker,
         stereo_fx=float(metadata.get("fx", frames[0].intrinsics[0, 0])),
-        stereo_baseline_m=float(metadata["baseline"]),
-        maximum_depth_m=float(metadata.get("recommended_max_depth_m", 5.0)),
+        stereo_baseline_m=(
+            float(metadata["baseline"])
+            if metadata.get("baseline") is not None
+            else None
+        ),
+        maximum_depth_m=maximum_depth_m,
         depth_confidence_mode=args.depth_confidence_mode,
         depth_lr_interval=args.depth_lr_interval,
         static_map_backend=static_map_backend,
         checkpoint_state=checkpoint_state,
+        frame_audit_writer=(
+            audit_bundle.writer("frame_metrics")
+            if audit_bundle is not None
+            else None
+        ),
+        write_experiment_visualizations=args.experiment_visualizations,
+        visualization_stride=args.visualization_stride,
     )
     resources.memory = engine.memory
     if static_map_backend is not None and start_index > 0:
@@ -2424,6 +3036,12 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
 
         pipeline_config = PipelineConfig.from_yaml(str(args.semantic_config.resolve()))
         pipeline_config.log_dir = str(run_dir / "semantic_sidecar" / "logs")
+        if args.semantic_mode == "dam":
+            pipeline_config.workers.dam_grounding_config.dam_model_path = str(
+                resolve_cached_huggingface_snapshot(
+                    pipeline_config.workers.dam_grounding_config.dam_model_path
+                )
+            )
         pipeline_config.workers.dam_grounding_config.gpu_lock_path = (
             str(gpu_lock_path) if gpu_lock_path is not None else None
         )
@@ -2457,6 +3075,20 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
                 label_run_configuration_sha256=(
                     label_run_configuration_sha256
                 ),
+                write_visualizations=args.experiment_visualizations,
+            ),
+            audit_writers=(
+                {
+                    name: audit_bundle.writer(name)
+                    for name in (
+                        "semantic_decisions",
+                        "track_events",
+                        "binding_candidates",
+                        "dam_events",
+                    )
+                }
+                if audit_bundle is not None
+                else None
             ),
         )
         resources.semantic_adapter = semantic_adapter
@@ -2472,7 +3104,14 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
         every=args.fault_every,
         error_every=args.fault_error_every,
     )
-    scheduler = MultiRateScheduler(active_revision=engine.submaps.map_revision)
+    scheduler = MultiRateScheduler(
+        active_revision=engine.submaps.map_revision,
+        audit_writer=(
+            audit_bundle.writer("queue_events")
+            if audit_bundle is not None
+            else None
+        ),
+    )
     resources.scheduler = scheduler
     # These are worker service-capacity ceilings, not requested map publication
     # rates. Keeping them above the 1 Hz dispatch target avoids accumulating one
@@ -2749,12 +3388,58 @@ def _run_realtime_mapping(resources: RealtimeResourceState) -> None:
 
 def main() -> None:
     resources = RealtimeResourceState()
+    previous_signal_handlers = {}
+
+    def interrupt_handler(signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt(f"received signal {signum}")
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_signal_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, interrupt_handler)
     try:
         _run_realtime_mapping(resources)
-    except BaseException:
+    except BaseException as error:
+        rendered_traceback = traceback.format_exc()
         cleanup_errors = cleanup_realtime_resources(resources)
         _log_cleanup_errors(cleanup_errors)
+        run_dir = resources.run_dir
+        if (
+            run_dir is not None
+            and run_dir.is_dir()
+            and not (run_dir / "realtime_run_report.json").is_file()
+        ):
+            failure_report = {
+                "schema": "daaam.realtime_failure.v1",
+                "status": (
+                    "interrupted"
+                    if isinstance(error, KeyboardInterrupt)
+                    else "failed"
+                ),
+                "time_ns": time.time_ns(),
+                "error": repr(error),
+                "traceback": rendered_traceback,
+                "cleanup_errors": [
+                    {
+                        "resource": name,
+                        "error": repr(cleanup_error),
+                    }
+                    for name, cleanup_error in cleanup_errors
+                ],
+                "partial_artifacts_retained": True,
+            }
+            (run_dir / "realtime_failure_report.json").write_text(
+                json.dumps(
+                    failure_report,
+                    ensure_ascii=False,
+                    indent=2,
+                    allow_nan=False,
+                )
+                + "\n"
+            )
         raise
+    finally:
+        for signum, previous in previous_signal_handlers.items():
+            signal.signal(signum, previous)
 
     cleanup_errors = cleanup_realtime_resources(resources)
     if cleanup_errors:

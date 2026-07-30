@@ -1,0 +1,48 @@
+schema: daaam.g1_semantic_map_experiment.v1
+repository_root: /home/user/Code/DAAAM_Origin
+python_executable: /home/user/Code/DAAAM_Origin/.repro/venv/bin/python
+environment_setup: /home/user/Code/DAAAM_Origin/.repro/ros2_ws/install/setup.bash
+workspace: experiments/g1_semantic_map
+raw_dataset: /home/user/datasets/test_ros2_all_tf_map
+
+source_frames:
+  start: 815
+  end: 915
+
+repeats: 3
+seeds: [0, 1, 2]
+
+# Contiguous blocks prevent adjacent-frame leakage. Review and version these
+# content labels before treating held_out as a formal untouched test split.
+splits:
+  calibration: [815, 829]
+  development: [830, 869]
+  stress: [870, 899]
+  held_out: [900, 915]
+
+# External model/report paths are expanded from the environment. The manager
+# records empty/missing values as blockers instead of inventing provenance.
+inputs:
+  fast_foundation_repo: experiments/g1_semantic_map/shared_inputs/Fast-FoundationStereo-pinned
+  fast_foundation_checkpoint: /home/user/Code/Fast-FoundationStereo/weights/20-30-48/model_best_bp2_serialize.pth
+  foundation_stereo_checkpoint: /home/user/Code/FoundationStereo/pretrained_models/11-33-40/model_best_bp2.pth
+  # Validated on pinhole_visual_only_selected with relaxed ROI distance bounds;
+  # failed lidar-right attempt retained as floor_calibration_diagnostic.json.
+  floor_calibration_report: experiments/g1_semantic_map/shared_inputs/floor_calibration_report.json
+  right_rectification_report: experiments/g1_semantic_map/shared_inputs/right_rectification_lidar_815_915/lidar_guided_rectification_report.json
+  fastsam_engine: checkpoints/fastsam/FastSAM-x-640x480.engine
+  reid_engine: checkpoints/reid_weights/clip_general.engine
+  dam_model: nvidia/DAM-3B
+
+artifacts:
+  # Formal prepared input: visual-right geometry-passing subset (78 frames; audit 57/57).
+  # Prior lidar-right 01_pinhole (0/96 gate) is retained under offline_prepared/01_pinhole.
+  prepared_dataset: experiments/g1_semantic_map/shared_inputs/offline_prepared/01_pinhole_visual_geometry_pass
+  selected_dataset: experiments/g1_semantic_map/shared_inputs/offline_prepared_geometry_pass/02_selected
+  geometry_dataset: experiments/g1_semantic_map/shared_inputs/offline_prepared_geometry_pass/03_geometry
+  temporal_report: experiments/g1_semantic_map/shared_inputs/offline_prepared_geometry_pass/04_temporal_input/temporal_depth_consistency_report.json
+  odometry_dataset: experiments/g1_semantic_map/shared_inputs/offline_prepared_geometry_pass/05_rgbd_window_graph
+  loop_report: experiments/g1_semantic_map/shared_inputs/offline_prepared_geometry_pass/06_loop_closures/loop_closure_report.json
+  optimized_dataset: experiments/g1_semantic_map/shared_inputs/offline_prepared_geometry_pass/07_global_pose_graph
+  filtered_dataset: experiments/g1_semantic_map/shared_inputs/offline_prepared_geometry_pass/08_temporal_depth_filtered
+  query_dsg: experiments/g1_semantic_map/shared_inputs/query_map/dsg_updated.json

@@ -44,6 +44,7 @@ class QualityGateConfig:
     require_pinhole_projection: bool = True
     minimum_depth_valid_ratio: float = 0.15
     minimum_depth_temporal_agreement: float = 0.70
+    require_left_right_evidence: bool = True
     minimum_left_right_consistency: float = 0.60
     minimum_left_right_coverage: float = 0.25
     maximum_pose_translation_step_m: float = 0.50
@@ -204,18 +205,27 @@ class QualityGateRunner:
             )
         )
         passed = (
-            lr_evidence_available
-            and valid_ratio >= self.config.minimum_depth_valid_ratio
+            valid_ratio >= self.config.minimum_depth_valid_ratio
             and temporal >= self.config.minimum_depth_temporal_agreement
-            and lr_consistency >= self.config.minimum_left_right_consistency
-            and lr_coverage >= self.config.minimum_left_right_coverage
+            and (
+                not self.config.require_left_right_evidence
+                or (
+                    lr_evidence_available
+                    and lr_consistency >= self.config.minimum_left_right_consistency
+                    and lr_coverage >= self.config.minimum_left_right_coverage
+                )
+            )
         )
-        if not lr_evidence_available:
+        if self.config.require_left_right_evidence and not lr_evidence_available:
             code = "depth.missing_lr_evidence"
             message = "Verifiable left/right depth evidence is missing"
         elif passed:
             code = "depth.quality"
-            message = "Depth validity and consistency passed"
+            message = (
+                "Depth validity and temporal consistency passed"
+                if not self.config.require_left_right_evidence
+                else "Depth validity and consistency passed"
+            )
         else:
             code = "depth.inconsistent"
             message = (
@@ -234,10 +244,16 @@ class QualityGateRunner:
                 "left_right_consistency": lr_consistency,
                 "left_right_coverage": lr_coverage,
                 "left_right_evidence_available": lr_evidence_available,
+                "left_right_evidence_required": (
+                    self.config.require_left_right_evidence
+                ),
             },
             thresholds={
                 "minimum_valid_ratio": self.config.minimum_depth_valid_ratio,
                 "minimum_temporal_agreement": self.config.minimum_depth_temporal_agreement,
+                "require_left_right_evidence": (
+                    self.config.require_left_right_evidence
+                ),
                 "minimum_left_right_consistency": self.config.minimum_left_right_consistency,
                 "minimum_left_right_coverage": self.config.minimum_left_right_coverage,
             },

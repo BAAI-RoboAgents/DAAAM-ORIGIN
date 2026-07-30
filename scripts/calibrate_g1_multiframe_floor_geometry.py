@@ -24,6 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, type=Path)
     parser.add_argument("--output-report", type=Path)
+    parser.add_argument(
+        "--visualization-dir",
+        type=Path,
+        help="Save per-frame floor fits and a sequence summary without subsampling.",
+    )
     parser.add_argument("--frame-count", type=int, default=150)
     parser.add_argument("--floor-world-z-m", type=float, default=0.0)
     parser.add_argument("--roi-x-min", type=float, default=0.03)
@@ -224,6 +229,126 @@ def main() -> None:
     y0 = int(round(args.roi_y_min * height))
     y1 = int(round(args.roi_y_max * height))
     max_depth = float(tick_index.get("recommended_max_depth_m", 5.0))
+    visualization_dir = (
+        args.visualization_dir.expanduser().resolve()
+        if args.visualization_dir is not None
+        else None
+    )
+    if visualization_dir is not None:
+        if visualization_dir.exists() and not args.overwrite:
+            raise FileExistsError(
+                f"Floor visualization directory exists: {visualization_dir}"
+            )
+        visualization_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_frame_visualization(
+        frame_index: int,
+        label: str,
+        color: tuple[int, int, int],
+        sample_u: np.ndarray | None = None,
+        sample_v: np.ndarray | None = None,
+        inliers: np.ndarray | None = None,
+    ) -> str | None:
+        if visualization_dir is None:
+            return None
+        image = cv2.imread(
+            str(tick_index["frames"][frame_index]["cam0"]),
+            cv2.IMREAD_COLOR,
+        )
+        if image is None:
+            raise FileNotFoundError(tick_index["frames"][frame_index]["cam0"])
+        cv2.rectangle(image, (x0, y0), (x1, y1), color, 4)
+        if sample_u is not None and sample_v is not None and inliers is not None:
+            selected = np.linspace(
+                0,
+                len(sample_u) - 1,
+                min(1500, len(sample_u)),
+            ).astype(int)
+            for index in selected:
+                point_color = (
+                    (40, 210, 40) if bool(inliers[index]) else (30, 30, 220)
+                )
+                cv2.circle(
+                    image,
+                    (int(sample_u[index]), int(sample_v[index])),
+                    1,
+                    point_color,
+                    -1,
+                )
+        cv2.rectangle(image, (0, 0), (image.shape[1], 62), (0, 0, 0), -1)
+        cv2.putText(
+            image,
+            label,
+            (18, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.85,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+        path = visualization_dir / f"{frame_index:06d}.jpg"
+        if not cv2.imwrite(
+            str(path), image, [cv2.IMWRITE_JPEG_QUALITY, 92]
+        ):
+            raise RuntimeError(f"Could not write floor visualization: {path}")
+        return str(path)
+
+    def write_failure_report(
+        reason: str,
+        accepted_records: list[dict],
+        rejected_records: list[dict],
+        **details: object,
+    ) -> None:
+        failure = {
+            "schema": "daaam.g1_multiframe_floor_geometry.v1",
+            "status": "failed_quality_gate",
+            "reason": reason,
+            "dataset": str(dataset),
+            "source_dataset_unmodified": True,
+            "requested_frame_count": args.frame_count,
+            "sampled_frame_count": int(len(frame_indices)),
+            "accepted_frame_count": len(accepted_records),
+            "rejected_frame_count": len(rejected_records),
+            "floor_roi_pixels": [x0, y0, x1, y1],
+            "details": details,
+            "accepted_frames": accepted_records,
+            "rejected_frames": rejected_records,
+        }
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(failure, indent=2) + "\n")
+        if visualization_dir is not None:
+            canvas = np.full((420, 1400, 3), 250, dtype=np.uint8)
+            cv2.putText(
+                canvas,
+                "FLOOR CALIBRATION FAILED QUALITY GATE",
+                (45, 90),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.35,
+                (20, 20, 210),
+                3,
+                cv2.LINE_AA,
+            )
+            lines = (
+                f"reason={reason}",
+                f"accepted={len(accepted_records)}/{len(frame_indices)}",
+                f"rejected={len(rejected_records)}",
+                json.dumps(details, ensure_ascii=False),
+            )
+            for index, line in enumerate(lines):
+                cv2.putText(
+                    canvas,
+                    line[:170],
+                    (45, 165 + 55 * index),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (30, 30, 30),
+                    2,
+                    cv2.LINE_AA,
+                )
+            cv2.imwrite(
+                str(visualization_dir / "floor_calibration_failure.png"),
+                canvas,
+            )
 
     accepted = []
     rejected = []
@@ -237,7 +362,17 @@ def main() -> None:
         z = depth[y0:y1:args.sample_stride, x0:x1:args.sample_stride]
         valid = (z >= 0.25) & (z < max_depth)
         if int(valid.sum()) < 1000:
-            rejected.append({"frame_index": int(frame_index), "reason": "too_few_samples"})
+            rejected.append(
+                {
+                    "frame_index": int(frame_index),
+                    "reason": "too_few_samples",
+                    "visualization": save_frame_visualization(
+                        int(frame_index),
+                        f"frame={int(frame_index)} REJECT too_few_samples",
+                        (30, 30, 220),
+                    ),
+                }
+            )
             continue
         design = np.column_stack(
             (
@@ -274,6 +409,17 @@ def main() -> None:
                     "reason": reason,
                     "inlier_ratio": inlier_ratio,
                     "floor_distance_m": plane_offset,
+                    "visualization": save_frame_visualization(
+                        int(frame_index),
+                        (
+                            f"frame={int(frame_index)} REJECT {reason} "
+                            f"inliers={inlier_ratio:.3f} floor={plane_offset:.3f}m"
+                        ),
+                        (30, 30, 220),
+                        u[valid],
+                        v[valid],
+                        inlier_mask,
+                    ),
                 }
             )
             continue
@@ -293,6 +439,17 @@ def main() -> None:
                 "floor_distance_m": plane_offset,
                 "camera_height_m": camera_height,
                 "depth_scale": camera_height / plane_offset,
+                "visualization": save_frame_visualization(
+                    int(frame_index),
+                    (
+                        f"frame={int(frame_index)} ACCEPT "
+                        f"inliers={inlier_ratio:.3f} floor={plane_offset:.3f}m"
+                    ),
+                    (40, 210, 40),
+                    u[valid],
+                    v[valid],
+                    inlier_mask,
+                ),
             }
         )
         if ordinal % 25 == 0 or ordinal == len(frame_indices):
@@ -303,6 +460,12 @@ def main() -> None:
 
     minimum_accepted = max(20, len(frame_indices) // 2)
     if len(accepted) < minimum_accepted:
+        write_failure_report(
+            "too_few_reliable_floor_planes",
+            accepted,
+            rejected,
+            minimum_accepted=minimum_accepted,
+        )
         raise RuntimeError(
             f"Too few reliable floor planes: {len(accepted)}/{len(frame_indices)}"
         )
@@ -336,6 +499,13 @@ def main() -> None:
             )
     accepted = [record for record, keep in zip(accepted, retained) if keep]
     if len(accepted) < minimum_accepted:
+        write_failure_report(
+            "too_few_mutually_consistent_floor_planes",
+            accepted,
+            rejected,
+            minimum_accepted=minimum_accepted,
+            inconsistent_count=len(inconsistent),
+        )
         raise RuntimeError(
             "Too few mutually consistent floor planes after gravity filtering: "
             f"{len(accepted)}/{len(frame_indices)}; rejected={len(inconsistent)}"
@@ -354,10 +524,28 @@ def main() -> None:
     median_angular_residual = float(np.median(angular_residuals))
     p90_angular_residual = float(np.percentile(angular_residuals, 90.0))
     if median_angular_residual > args.maximum_median_angular_residual_deg:
+        write_failure_report(
+            "median_floor_normal_residual_too_large",
+            accepted,
+            rejected,
+            median_angular_residual_deg=median_angular_residual,
+            maximum_median_angular_residual_deg=(
+                args.maximum_median_angular_residual_deg
+            ),
+        )
         raise RuntimeError(
             f"Median floor-normal residual is too large: {median_angular_residual:.3f} deg"
         )
     if p90_angular_residual > args.maximum_p90_angular_residual_deg:
+        write_failure_report(
+            "p90_floor_normal_residual_too_large",
+            accepted,
+            rejected,
+            p90_angular_residual_deg=p90_angular_residual,
+            maximum_p90_angular_residual_deg=(
+                args.maximum_p90_angular_residual_deg
+            ),
+        )
         raise RuntimeError(
             f"P90 floor-normal residual is too large: {p90_angular_residual:.3f} deg"
         )
@@ -365,6 +553,13 @@ def main() -> None:
     depth_scales = np.asarray([record["depth_scale"] for record in accepted])
     depth_scale = float(np.median(depth_scales))
     if not 0.75 <= depth_scale <= 1.5:
+        write_failure_report(
+            "stereo_scale_correction_implausible",
+            accepted,
+            rejected,
+            depth_scale=depth_scale,
+            allowed_range=[0.75, 1.5],
+        )
         raise RuntimeError(f"Stereo scale correction is implausible: {depth_scale:.3f}")
     source_baseline = float(camera["baseline"])
     effective_baseline = source_baseline * depth_scale
@@ -425,6 +620,71 @@ def main() -> None:
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2) + "\n")
+    if visualization_dir is not None:
+        canvas = np.full((900, 1600, 3), 250, dtype=np.uint8)
+        scales = np.asarray([record["depth_scale"] for record in accepted])
+        residuals = np.asarray(
+            [record["angular_residual_deg"] for record in accepted]
+        )
+        indices = np.asarray([record["frame_index"] for record in accepted])
+        for values, top, bottom, color, title in (
+            (scales, 100, 400, (180, 90, 30), "per-frame depth scale"),
+            (
+                residuals,
+                500,
+                800,
+                (30, 140, 50),
+                "floor-normal angular residual (deg)",
+            ),
+        ):
+            minimum = float(values.min())
+            maximum = float(values.max())
+            extent = max(maximum - minimum, 1.0e-9)
+            points = np.column_stack(
+                (
+                    80
+                    + (indices - indices.min())
+                    / max(1, int(indices.max() - indices.min()))
+                    * 1440,
+                    bottom - (values - minimum) / extent * (bottom - top),
+                )
+            ).astype(np.int32)
+            cv2.polylines(
+                canvas,
+                [points.reshape(-1, 1, 2)],
+                False,
+                color,
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                canvas,
+                f"{title}: min={minimum:.4f} max={maximum:.4f}",
+                (60, top - 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (30, 30, 30),
+                2,
+                cv2.LINE_AA,
+            )
+        cv2.putText(
+            canvas,
+            (
+                f"accepted={len(accepted)} rejected={len(rejected)} "
+                f"scale={depth_scale:.6f} correction={report['correction_angle_deg']:.3f}deg"
+            ),
+            (60, 45),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (20, 20, 20),
+            2,
+            cv2.LINE_AA,
+        )
+        if not cv2.imwrite(
+            str(visualization_dir / "floor_calibration_summary.png"),
+            canvas,
+        ):
+            raise RuntimeError("Could not write floor calibration summary")
     print(
         f"Calibrated fixed image frame from {len(accepted)}/{len(frame_indices)} floor planes\n"
         f"  angular residual median/p90={median_angular_residual:.3f}/"

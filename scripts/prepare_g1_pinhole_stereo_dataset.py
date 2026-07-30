@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import cv2
@@ -20,6 +21,9 @@ from build_synchronized_stereo_dataset import (
     monotonic_matches,
     odom_pose_sample,
 )
+
+PREPARATION_CONTRACT_VERSION = 4
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def parse_args():
@@ -53,7 +57,12 @@ def parse_args():
     parser.add_argument("--max-delta-ms", type=float, default=10.0)
     parser.add_argument(
         "--input-projection-model",
-        choices=("auto", "kannala_brandt", "pinhole_rectified"),
+        choices=(
+            "auto",
+            "kannala_brandt",
+            "pinhole_rectified",
+            "pinhole_unrectified",
+        ),
         default="auto",
         help=(
             "Projection model of the stored input pixels. Auto treats zero-"
@@ -82,8 +91,9 @@ def parse_args():
         choices=("auto", "xyzw", "wxyz"),
         default="auto",
         help=(
-            "Storage order of head_camera orientation values. Auto selects "
-            "the interpretation whose optical down axis best matches base -Z."
+            "Storage order of head_camera orientation values. Auto compares "
+            "both interpretations with the capture's recorded poses.txt "
+            "rotation matrices and rejects inputs without that reference."
         ),
     )
     parser.add_argument(
@@ -96,7 +106,25 @@ def parse_args():
             "validated before the report is accepted."
         ),
     )
+    parser.add_argument(
+        "--right-rectification-report",
+        type=Path,
+        help=(
+            "LiDAR-validated right-only projective rectification report. The "
+            "original left image and its intrinsics remain unchanged; only "
+            "the stored right pixels are remapped."
+        ),
+    )
     parser.add_argument("--recommended-max-depth-m", type=float, default=5.0)
+    parser.add_argument(
+        "--source-indices",
+        nargs="+",
+        type=int,
+        help=(
+            "Optional raw manifest tick indices to prepare. This keeps a formal "
+            "experiment subset from decoding or writing unrelated frames."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -148,6 +176,88 @@ def load_calibration(src: Path, sequence: str):
     )
 
 
+def load_declared_rectified_stereo_calibration(
+    src: Path,
+    sequence: str,
+    baseline: float,
+) -> tuple[np.ndarray, np.ndarray, dict] | None:
+    """Load the authoritative optical-frame transform for rectified pixels.
+
+    The capture file declares ``left_T_right``. OpenCV stereo geometry uses
+    ``right_T_left``, so the returned transform is its explicit inverse.
+    """
+
+    path = src / "calibrations" / sequence / "calib_cam0_to_cam1.yaml"
+    if not path.is_file():
+        return None
+    document = yaml.safe_load(path.read_text())
+    transform_record = document.get("transform")
+    if not isinstance(transform_record, dict):
+        return None
+    if (
+        transform_record.get("target_frame")
+        != "head_left_camera_color_optical_frame"
+        or transform_record.get("source_frame")
+        != "head_right_camera_color_optical_frame"
+    ):
+        raise ValueError(
+            "Declared stereo transform must map the right optical frame into "
+            "the left optical frame"
+        )
+    try:
+        left_T_right = np.asarray(
+            transform_record["matrix_row_major"], dtype=np.float64
+        ).reshape(4, 4)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"Invalid declared stereo transform: {path}") from error
+    if not np.isfinite(left_T_right).all() or not np.allclose(
+        left_T_right[3], [0.0, 0.0, 0.0, 1.0], atol=1.0e-12
+    ):
+        raise ValueError("Declared stereo transform is not homogeneous")
+    left_R_right = left_T_right[:3, :3]
+    if not np.allclose(left_R_right.T @ left_R_right, np.eye(3), atol=1.0e-8):
+        raise ValueError("Declared stereo rotation is not orthonormal")
+    if not np.isclose(np.linalg.det(left_R_right), 1.0, atol=1.0e-8):
+        raise ValueError("Declared stereo rotation is not proper")
+
+    right_T_left = np.linalg.inv(left_T_right)
+    right_R_left = right_T_left[:3, :3]
+    right_t_left = right_T_left[:3, 3]
+    translation_norm = float(np.linalg.norm(right_t_left))
+    if not np.isclose(translation_norm, baseline, rtol=0.0, atol=1.0e-9):
+        raise ValueError(
+            "Declared stereo transform baseline disagrees with camera "
+            f"intrinsics: {translation_norm} vs {baseline}"
+        )
+    if not np.allclose(right_R_left, np.eye(3), atol=1.0e-8) or not np.allclose(
+        right_t_left[1:], 0.0, atol=1.0e-9
+    ):
+        raise ValueError(
+            "Stored pinhole_rectified images require identity relative "
+            "rotation and an X-only stereo baseline"
+        )
+    return right_R_left, right_t_left, {
+        "mode": "declared_rectified_optical_transform",
+        "report_path": str(path.resolve()),
+        "report_sha256": sha256_file(path),
+        "declared_semantics": transform_record.get("semantics"),
+        "declared_left_T_right": left_T_right.tolist(),
+        "opencv_right_T_left": right_T_left.tolist(),
+        # Keep the established report keys for downstream compatibility.
+        "camera0_R_camera1": right_R_left.tolist(),
+        "camera0_t_camera1_m": right_t_left.tolist(),
+        "camera0_R_camera1_euler_xyz_deg": [0.0, 0.0, 0.0],
+        "baseline_direction": (right_t_left / translation_norm).tolist(),
+        "right_image_pixels_preserved": False,
+        "right_vertical_rectification": {
+            "model": "pending_current_capture_vertical_validation",
+            "left_image_preserved": True,
+            "right_image_preserved": False,
+            "source": "authoritative_optical_frame_stereo_calibration",
+        },
+    }
+
+
 def image_path(src: Path, record, camera: str) -> Path:
     images = {image["camera"]: image for image in record.get("images", [])}
     if camera not in images:
@@ -170,7 +280,12 @@ def resolve_input_projection_model(
     zero, because the zero-coefficient fisheye projection is still equidistant.
     """
 
-    if requested_model not in {"auto", "kannala_brandt", "pinhole_rectified"}:
+    if requested_model not in {
+        "auto",
+        "kannala_brandt",
+        "pinhole_rectified",
+        "pinhole_unrectified",
+    }:
         raise ValueError(f"Unsupported input projection model: {requested_model}")
     image_paths = [
         str(image.get("path", ""))
@@ -201,9 +316,9 @@ def resolve_input_projection_model(
     else:
         model = requested_model
         source = "explicit_cli"
-    if model == "pinhole_rectified" and not zero_distortion:
+    if model in {"pinhole_rectified", "pinhole_unrectified"} and not zero_distortion:
         raise ValueError(
-            "pinhole_rectified input requires zero stored-image distortion; "
+            f"{model} input requires zero stored-image distortion; "
             "non-zero Kannala-Brandt coefficients describe raw fisheye pixels"
         )
     return model, {
@@ -248,6 +363,94 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def load_lidar_guided_right_rectification(
+    report_path: Path,
+    source_dataset: Path,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    baseline: float,
+) -> dict:
+    """Load a LiDAR-validated right-source to rectified-pixel homography."""
+
+    report_path = report_path.resolve()
+    try:
+        report = json.loads(report_path.read_text())
+        method = report["method"]
+        report_source = Path(report["source_dataset"]).resolve()
+        geometry = report["camera_geometry"]
+        homography = np.asarray(
+            report["right_source_to_rectified_homography"],
+            dtype=np.float64,
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Invalid LiDAR-guided right rectification report: {report_path}"
+        ) from error
+    if method != "lidar_guided_right_only_projective_rectification":
+        raise ValueError(f"Unsupported right rectification method: {method!r}")
+    if report_source != source_dataset.resolve():
+        raise ValueError(
+            "Right rectification report belongs to a different source dataset: "
+            f"{report_source} != {source_dataset.resolve()}"
+        )
+    expected_geometry = {
+        "width": width,
+        "height": height,
+        "fx": float(K[0, 0]),
+        "fy": float(K[1, 1]),
+        "cx": float(K[0, 2]),
+        "cy": float(K[1, 2]),
+        "baseline": baseline,
+    }
+    for key, expected in expected_geometry.items():
+        actual = geometry.get(key)
+        if actual is None or not np.isclose(
+            float(actual), float(expected), rtol=0.0, atol=1.0e-9
+        ):
+            raise ValueError(
+                "Right rectification camera geometry mismatch for "
+                f"{key}: report={actual!r}, source={expected!r}"
+            )
+    if (
+        report.get("left_image_policy") != "byte-for-byte original left PNG"
+        or report.get("extra_left_rotation_applied") is not False
+    ):
+        raise ValueError(
+            "Right rectification report does not guarantee original-left "
+            "pixel and orientation preservation"
+        )
+    if homography.shape != (3, 3) or not np.isfinite(homography).all():
+        raise ValueError("Right rectification homography must be a finite 3x3 matrix")
+    determinant = float(np.linalg.det(homography))
+    if abs(determinant) < 1.0e-6:
+        raise ValueError("Right rectification homography is singular")
+    valid_ratio = float(report.get("right_warp_valid_ratio", 0.0))
+    if valid_ratio < 0.95:
+        raise ValueError(
+            "Right rectification leaves too little valid image area: "
+            f"{valid_ratio:.6f}"
+        )
+    return {
+        "model": "right_projective_homography",
+        "right_source_to_rectified_homography": homography.tolist(),
+        "source": "lidar_guided_multiframe_heldout_validation",
+        "report_path": str(report_path),
+        "report_sha256": sha256_file(report_path),
+        "right_warp_valid_ratio": valid_ratio,
+        "training_frames": int(
+            report.get("training", {}).get("selected_frames", 0)
+        ),
+        "training_associations": int(
+            report.get("training", {}).get("associations", 0)
+        ),
+        "holdout_source_index": report.get("holdout_source_index"),
+        "left_image_rotation_deg": 0.0,
+        "left_image_preserved": True,
+        "right_image_preserved": False,
+    }
 
 
 def load_fixed_stereo_calibration(
@@ -565,6 +768,32 @@ def invert_rectified_right_remap(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map left-oriented rectified pixels back into the right source image."""
 
+    if rectification.get("model") == "declared_rectified_identity":
+        return aligned_x.astype(np.float32), aligned_y.astype(np.float32)
+    if rectification.get("model") == "right_projective_homography":
+        source_to_rectified = np.asarray(
+            rectification["right_source_to_rectified_homography"],
+            dtype=np.float64,
+        ).reshape(3, 3)
+        rectified_to_source = np.linalg.inv(source_to_rectified)
+        denominator = (
+            rectified_to_source[2, 0] * aligned_x
+            + rectified_to_source[2, 1] * aligned_y
+            + rectified_to_source[2, 2]
+        )
+        if np.any(np.abs(denominator) < 1.0e-8):
+            raise RuntimeError("Right-image projective rectification is singular")
+        source_x = (
+            rectified_to_source[0, 0] * aligned_x
+            + rectified_to_source[0, 1] * aligned_y
+            + rectified_to_source[0, 2]
+        ) / denominator
+        source_y = (
+            rectified_to_source[1, 0] * aligned_x
+            + rectified_to_source[1, 1] * aligned_y
+            + rectified_to_source[1, 2]
+        ) / denominator
+        return source_x.astype(np.float32), source_y.astype(np.float32)
     oriented_y = invert_rectified_right_vertical_warp(
         aligned_x, aligned_y, rectification
     )
@@ -604,6 +833,7 @@ def estimate_stereo_extrinsics(
     baseline: float,
     input_projection_model: str,
     calibration_report: Path | None = None,
+    declared_calibration: tuple[np.ndarray, np.ndarray, dict] | None = None,
     sample_count: int = 24,
 ):
     """Estimate the omitted stereo rotation and baseline direction."""
@@ -664,7 +894,10 @@ def estimate_stereo_extrinsics(
         normalized_right = cv2.fisheye.undistortPoints(
             pixels_right, K, distortion
         ).reshape(-1, 2)
-    elif input_projection_model == "pinhole_rectified":
+    elif input_projection_model in {
+        "pinhole_rectified",
+        "pinhole_unrectified",
+    }:
         zero_distortion = np.zeros(5, dtype=np.float64)
         normalized_left = cv2.undistortPoints(
             pixels_left, K, zero_distortion
@@ -689,6 +922,11 @@ def estimate_stereo_extrinsics(
             f"Too few finite stereo matches: {len(normalized_left)}"
         )
 
+    if calibration_report is not None and declared_calibration is not None:
+        raise ValueError(
+            "Use either a fixed stereo calibration report or the declared "
+            "current-capture calibration, not both"
+        )
     if calibration_report is not None:
         camera0_R_camera1, camera0_t_camera1, evidence = (
             load_fixed_stereo_calibration(
@@ -699,6 +937,15 @@ def estimate_stereo_extrinsics(
                 input_projection_model,
             )
         )
+    elif declared_calibration is not None:
+        camera0_R_camera1, camera0_t_camera1, evidence = declared_calibration
+    else:
+        camera0_R_camera1, camera0_t_camera1, evidence = recover_stereo_pose(
+            normalized_left, normalized_right, baseline
+        )
+        evidence["sampled_pairs"] = len(sample_indices)
+
+    if calibration_report is not None or declared_calibration is not None:
         residuals = normalized_sampson_residuals(
             camera0_R_camera1,
             camera0_t_camera1,
@@ -709,6 +956,11 @@ def estimate_stereo_extrinsics(
         inlier_ratio = float(np.mean(residuals < epipolar_threshold))
         median_residual = float(np.median(residuals))
         p95_residual = float(np.percentile(residuals, 95.0))
+        strict_passed = (
+            inlier_ratio >= 0.70
+            and median_residual <= 0.0025
+            and p95_residual <= 0.04
+        )
         evidence["current_capture_epipolar_validation"] = {
             "sampled_pairs": len(sample_indices),
             "feature_matches": len(normalized_left),
@@ -719,12 +971,24 @@ def estimate_stereo_extrinsics(
             "required_inlier_ratio": 0.70,
             "maximum_median_residual": 0.0025,
             "maximum_p95_residual": 0.04,
+            "strict_empirical_thresholds_passed": strict_passed,
         }
-        if (
-            inlier_ratio < 0.70
-            or median_residual > 0.0025
-            or p95_residual > 0.04
-        ):
+        if declared_calibration is not None and not strict_passed:
+            declared_evidence = evidence
+            camera0_R_camera1, camera0_t_camera1, evidence = (
+                recover_stereo_pose(
+                    normalized_left,
+                    normalized_right,
+                    baseline,
+                )
+            )
+            evidence["mode"] = (
+                "estimated_from_current_capture_after_declared_validation_failure"
+            )
+            evidence["sampled_pairs"] = len(sample_indices)
+            evidence["rejected_declared_calibration"] = declared_evidence
+            declared_calibration = None
+        elif not strict_passed:
             raise RuntimeError(
                 "Fixed stereo calibration fails current-capture epipolar validation: "
                 f"inlier_ratio={inlier_ratio:.3f}, median={median_residual:.6f}, "
@@ -735,16 +999,26 @@ def estimate_stereo_extrinsics(
                 estimate_rectified_right_vertical_warp(
                     pixels_left,
                     pixels_right,
-                    K,
-                    camera0_R_camera1,
+                    *(
+                        (K, camera0_R_camera1)
+                        if declared_calibration is None
+                        else ()
+                    ),
                 )
             )
+            if declared_calibration is not None:
+                evidence["right_vertical_rectification"].update(
+                    {
+                        "source": (
+                            "declared_identity_rotation_plus_current_capture_"
+                            "vertical_residual"
+                        ),
+                        "horizontal_pixel_mapping": "identity",
+                        "right_image_preserved": False,
+                    }
+                )
         return camera0_R_camera1, camera0_t_camera1, evidence
 
-    camera0_R_camera1, camera0_t_camera1, evidence = recover_stereo_pose(
-        normalized_left, normalized_right, baseline
-    )
-    evidence["sampled_pairs"] = len(sample_indices)
     if input_projection_model == "pinhole_rectified":
         evidence["right_vertical_rectification"] = (
             estimate_rectified_right_vertical_warp(
@@ -757,14 +1031,18 @@ def estimate_stereo_extrinsics(
     return camera0_R_camera1, camera0_t_camera1, evidence
 
 
-def camera_quaternion_level_error(aux_records, order: str) -> float:
+def camera_quaternion_matrices(aux_records, order: str) -> np.ndarray:
     matrices = []
     for record in aux_records:
         values = record["poses"]["head_camera"]["orientation_xyzw"]
         if order == "wxyz":
             values = [values[1], values[2], values[3], values[0]]
         matrices.append(Rotation.from_quat(values).as_matrix())
-    base_R_camera = np.asarray(matrices)
+    return np.asarray(matrices)
+
+
+def camera_quaternion_level_error(aux_records, order: str) -> float:
+    base_R_camera = camera_quaternion_matrices(aux_records, order)
     # For an optical frame on a level robot, camera +Y (image down) should be
     # close to base -Z. Yaw motion does not affect this score.
     down_axes = base_R_camera[:, :, 1]
@@ -772,18 +1050,118 @@ def camera_quaternion_level_error(aux_records, order: str) -> float:
     return float(np.median(np.linalg.norm(down_axes - base_down, axis=1)))
 
 
-def resolve_camera_quaternion_order(aux_records, requested_order: str):
-    errors = {
+def load_recorded_camera_rotation_matrices(
+    source_dataset: Path,
+    sequence: str,
+    expected_count: int,
+) -> np.ndarray | None:
+    path = (
+        source_dataset
+        / "poses"
+        / "dense_global"
+        / sequence
+        / "poses.txt"
+    )
+    if not path.is_file():
+        return None
+    matrices = np.loadtxt(path, dtype=np.float64)
+    if matrices.ndim == 1:
+        matrices = matrices[None, :]
+    if matrices.shape != (expected_count, 16):
+        raise ValueError(
+            "Recorded head-camera pose matrix count/shape disagrees with "
+            f"aux_poses.jsonl: {matrices.shape} vs ({expected_count}, 16)"
+        )
+    matrices = matrices.reshape(-1, 4, 4)
+    if not np.isfinite(matrices).all():
+        raise ValueError("Recorded head-camera pose matrices contain non-finite values")
+    if not np.allclose(
+        matrices[:, 3, :],
+        np.asarray([0.0, 0.0, 0.0, 1.0]),
+        atol=1.0e-9,
+    ):
+        raise ValueError("Recorded head-camera poses are not homogeneous matrices")
+    rotations = matrices[:, :3, :3]
+    orthogonality = np.matmul(
+        rotations.transpose(0, 2, 1),
+        rotations,
+    )
+    if not np.allclose(orthogonality, np.eye(3), atol=1.0e-8):
+        raise ValueError("Recorded head-camera rotations are not orthonormal")
+    if not np.allclose(np.linalg.det(rotations), 1.0, atol=1.0e-8):
+        raise ValueError("Recorded head-camera rotations are not proper")
+    return rotations
+
+
+def camera_quaternion_reference_errors_deg(
+    aux_records,
+    order: str,
+    recorded_rotations: np.ndarray,
+) -> np.ndarray:
+    candidate_rotations = camera_quaternion_matrices(aux_records, order)
+    if candidate_rotations.shape != recorded_rotations.shape:
+        raise ValueError("Quaternion and recorded rotation counts differ")
+    residual_rotations = np.matmul(
+        recorded_rotations.transpose(0, 2, 1),
+        candidate_rotations,
+    )
+    return np.rad2deg(
+        Rotation.from_matrix(residual_rotations).magnitude()
+    )
+
+
+def resolve_camera_quaternion_order(
+    aux_records,
+    requested_order: str,
+    recorded_rotations: np.ndarray | None = None,
+):
+    level_errors = {
         order: camera_quaternion_level_error(aux_records, order)
         for order in ("xyzw", "wxyz")
     }
-    order = min(errors, key=errors.get) if requested_order == "auto" else requested_order
-    if errors[order] > 0.35:
-        raise ValueError(
-            "Neither camera quaternion interpretation produces a plausible "
-            f"optical frame: selected={order}, level_errors={errors}"
+    reference_errors = None
+    if recorded_rotations is not None:
+        reference_errors = {}
+        for order in ("xyzw", "wxyz"):
+            values = camera_quaternion_reference_errors_deg(
+                aux_records,
+                order,
+                recorded_rotations,
+            )
+            reference_errors[order] = {
+                "count": int(values.size),
+                "minimum": float(np.min(values)),
+                "median": float(np.median(values)),
+                "p90": float(np.percentile(values, 90)),
+                "p99": float(np.percentile(values, 99)),
+                "maximum": float(np.max(values)),
+            }
+
+    if requested_order == "auto":
+        if reference_errors is None:
+            raise ValueError(
+                "Automatic camera quaternion-order selection requires the "
+                "recorded head-camera poses.txt rotation matrices. Pass an "
+                "explicit order only when the capture contract independently "
+                "proves it."
+            )
+        order = min(
+            reference_errors,
+            key=lambda candidate: reference_errors[candidate]["median"],
         )
-    return order, errors
+    else:
+        order = requested_order
+
+    if (
+        reference_errors is not None
+        and reference_errors[order]["maximum"] > 1.0e-5
+    ):
+        raise ValueError(
+            "Selected camera quaternion order disagrees with the capture's "
+            "recorded pose matrices: "
+            f"selected={order}, reference_errors_deg={reference_errors}"
+        )
+    return order, level_errors, reference_errors
 
 
 def build_virtual_camera(
@@ -799,25 +1177,23 @@ def build_virtual_camera(
     input_projection_model: str = "kannala_brandt",
     right_vertical_rectification: dict | None = None,
 ):
-    if not 30.0 <= horizontal_fov_deg < 170.0:
-        raise ValueError("--horizontal-fov-deg must be in [30, 170)")
-    if not 5.0 <= down_fov_deg < 80.0:
-        raise ValueError("--down-fov-deg must be in [5, 80)")
-
-    focal = width / (2.0 * np.tan(np.deg2rad(horizontal_fov_deg / 2.0)))
-    cx = width / 2.0
-    cy = (height - 1) - focal * np.tan(np.deg2rad(down_fov_deg))
-    if not 0.0 < cy < height:
-        raise ValueError(
-            "Requested FOV places the virtual principal point outside the image: "
-            f"cy={cy:.3f}"
-        )
-    virtual_K = np.array(
-        [[focal, 0.0, cx], [0.0, focal, cy], [0.0, 0.0, 1.0]],
-        dtype=np.float64,
-    )
-
     if input_projection_model == "kannala_brandt":
+        if not 30.0 <= horizontal_fov_deg < 170.0:
+            raise ValueError("--horizontal-fov-deg must be in [30, 170)")
+        if not 5.0 <= down_fov_deg < 80.0:
+            raise ValueError("--down-fov-deg must be in [5, 80)")
+        focal = width / (2.0 * np.tan(np.deg2rad(horizontal_fov_deg / 2.0)))
+        cx = width / 2.0
+        cy = (height - 1) - focal * np.tan(np.deg2rad(down_fov_deg))
+        if not 0.0 < cy < height:
+            raise ValueError(
+                "Requested FOV places the virtual principal point outside the image: "
+                f"cy={cy:.3f}"
+            )
+        virtual_K = np.array(
+            [[focal, 0.0, cx], [0.0, focal, cy], [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
         stereo_R_left, stereo_R_right, _, _, _ = cv2.fisheye.stereoRectify(
             K,
             distortion,
@@ -831,29 +1207,64 @@ def build_virtual_camera(
             balance=0.0,
             fov_scale=1.0,
         )
+    elif input_projection_model == "pinhole_unrectified":
+        if abs(optical_x_rotation_deg) >= 1.0e-12:
+            raise ValueError(
+                "pinhole_unrectified currently requires zero "
+                "--rectification-roll-deg"
+            )
+        zero_distortion = np.zeros(5, dtype=np.float64)
+        (
+            stereo_R_left,
+            stereo_R_right,
+            projection_left,
+            _,
+            _,
+            _,
+            _,
+        ) = cv2.stereoRectify(
+            K,
+            zero_distortion,
+            K,
+            zero_distortion,
+            (width, height),
+            camera0_R_camera1,
+            camera0_t_camera1,
+            flags=cv2.CALIB_ZERO_DISPARITY,
+            alpha=0.0,
+            newImageSize=(width, height),
+        )
+        virtual_K = projection_left[:3, :3].copy()
     elif input_projection_model == "pinhole_rectified":
+        if abs(optical_x_rotation_deg) >= 1.0e-12:
+            raise ValueError(
+                "pinhole_rectified input preserves the original left image; "
+                "--rectification-roll-deg must be zero"
+            )
         if right_vertical_rectification is None:
             raise ValueError(
-                "pinhole_rectified input requires right-only vertical "
+                "pinhole_rectified input requires right-only "
                 "rectification evidence"
             )
-        # The stored left pixels already define the rectified image camera.
-        # Preserve that camera exactly; only the right image receives the
-        # residual vertical correction estimated from current-capture matches.
+        # The stored left pixels already define the image camera used by TF and
+        # downstream semantics. Preserve both the pixel grid and its calibrated
+        # intrinsics exactly. FOV arguments only apply when converting raw
+        # Kannala-Brandt pixels into a virtual pinhole camera.
+        virtual_K = np.asarray(K, dtype=np.float64).copy()
         stereo_R_left = np.eye(3, dtype=np.float64)
         stereo_R_right = np.eye(3, dtype=np.float64)
     else:
         raise ValueError(
             f"Unsupported input projection model: {input_projection_model}"
         )
-    # Apply a common rotation about the rectified optical X axis. It keeps the
-    # virtual baseline horizontal while selecting the useful forward/floor view.
-    level_rotation = Rotation.from_euler(
-        "x", optical_x_rotation_deg, degrees=True
-    ).as_matrix()
-    original_R_virtual_left = level_rotation @ stereo_R_left
-    original_R_virtual_right = level_rotation @ stereo_R_right
     if input_projection_model == "kannala_brandt":
+        # Apply a common rotation about the rectified optical X axis. It keeps
+        # the virtual baseline horizontal while selecting the useful view.
+        level_rotation = Rotation.from_euler(
+            "x", optical_x_rotation_deg, degrees=True
+        ).as_matrix()
+        original_R_virtual_left = level_rotation @ stereo_R_left
+        original_R_virtual_right = level_rotation @ stereo_R_right
         maps = [
             cv2.fisheye.initUndistortRectifyMap(
                 K,
@@ -865,24 +1276,39 @@ def build_virtual_camera(
             )
             for rotation in (original_R_virtual_left, original_R_virtual_right)
         ]
-    else:
+    elif input_projection_model == "pinhole_unrectified":
+        original_R_virtual_left = stereo_R_left
+        original_R_virtual_right = stereo_R_right
+        zero_distortion = np.zeros(5, dtype=np.float64)
         maps = [
             cv2.initUndistortRectifyMap(
                 K,
-                np.zeros(5, dtype=np.float64),
+                zero_distortion,
                 rotation,
                 virtual_K,
                 (width, height),
                 cv2.CV_32FC1,
             )
-            for rotation in (original_R_virtual_left, original_R_virtual_right)
+            for rotation in (
+                original_R_virtual_left,
+                original_R_virtual_right,
+            )
         ]
-        aligned_x, aligned_y = maps[1]
-        maps[1] = invert_rectified_right_remap(
-            aligned_x,
-            aligned_y,
-            right_vertical_rectification,
+    else:
+        original_R_virtual_left = np.eye(3, dtype=np.float64)
+        original_R_virtual_right = np.eye(3, dtype=np.float64)
+        aligned_x, aligned_y = np.meshgrid(
+            np.arange(width, dtype=np.float32),
+            np.arange(height, dtype=np.float32),
         )
+        maps = [
+            (aligned_x, aligned_y),
+            invert_rectified_right_remap(
+                aligned_x,
+                aligned_y,
+                right_vertical_rectification,
+            ),
+        ]
     valid_ratios = []
     for map_x, map_y in maps:
         valid = (
@@ -892,11 +1318,29 @@ def build_virtual_camera(
             & (map_y <= height - 1)
         )
         valid_ratios.append(float(valid.mean()))
-    if min(valid_ratios) < 0.995:
+    if input_projection_model == "kannala_brandt" and min(valid_ratios) < 0.995:
         raise ValueError(
             "Virtual view extends outside the fisheye images: "
             f"valid_ratios={valid_ratios}. Reduce the requested FOV."
         )
+    if (
+        input_projection_model == "pinhole_unrectified"
+        and min(valid_ratios) < 0.95
+    ):
+        raise ValueError(
+            "Pinhole stereo rectification leaves too little valid image area: "
+            f"valid_ratios={valid_ratios}"
+        )
+    if input_projection_model == "pinhole_rectified":
+        if valid_ratios[0] < 1.0:
+            raise ValueError(
+                "Original-left preservation produced an invalid left pixel map"
+            )
+        if valid_ratios[1] < 0.95:
+            raise ValueError(
+                "Right-only rectification leaves too little valid image area: "
+                f"valid_ratio={valid_ratios[1]:.6f}"
+            )
     return (
         virtual_K,
         original_R_virtual_left,
@@ -955,6 +1399,33 @@ def main():
     )
     if not matches:
         raise ValueError("No synchronized stereo pairs found")
+    requested_source_indices = None
+    requested_unmatched_source_indices: list[int] = []
+    if args.source_indices is not None:
+        requested_source_indices = set(args.source_indices)
+        if (
+            not requested_source_indices
+            or len(requested_source_indices) != len(args.source_indices)
+            or min(requested_source_indices) < 0
+        ):
+            raise ValueError("source-indices must be unique non-negative values")
+        available_source_indices = {int(record["tick"]) for record in records}
+        missing_source_indices = requested_source_indices - available_source_indices
+        if missing_source_indices:
+            raise ValueError(
+                f"Requested source frames are absent: {sorted(missing_source_indices)}"
+            )
+        matches = [
+            match
+            for match in matches
+            if int(records[match[0]]["tick"]) in requested_source_indices
+        ]
+        matched_source_indices = {
+            int(records[match[0]]["tick"]) for match in matches
+        }
+        requested_unmatched_source_indices = sorted(
+            requested_source_indices - matched_source_indices
+        )
 
     K, distortion, width, height, baseline, source_calibration = load_calibration(
         calibration_source, args.sequence
@@ -967,6 +1438,13 @@ def main():
             distortion,
         )
     )
+    declared_calibration = None
+    if input_projection_model == "pinhole_rectified":
+        declared_calibration = load_declared_rectified_stereo_calibration(
+            calibration_source,
+            args.sequence,
+            baseline,
+        )
     camera0_R_camera1, camera0_t_camera1, stereo_calibration = (
         estimate_stereo_extrinsics(
             src,
@@ -977,14 +1455,47 @@ def main():
             baseline,
             input_projection_model,
             args.stereo_calibration_report,
+            declared_calibration,
         )
     )
+    if args.right_rectification_report is not None:
+        if input_projection_model != "pinhole_rectified":
+            raise ValueError(
+                "--right-rectification-report requires pinhole_rectified input"
+            )
+        stereo_calibration["visual_epipolar_rectification_replaced"] = (
+            stereo_calibration.get("right_vertical_rectification")
+        )
+        stereo_calibration["right_vertical_rectification"] = (
+            load_lidar_guided_right_rectification(
+                args.right_rectification_report,
+                src,
+                K,
+                width,
+                height,
+                baseline,
+            )
+        )
+        stereo_calibration["right_rectification_selection"] = (
+            "explicit_lidar_validated_report"
+        )
     aux_records = load_jsonl(
         src / "poses" / "dense_global" / args.sequence / "aux_poses.jsonl"
     )
-    camera_quaternion_order, quaternion_level_errors = (
+    recorded_camera_rotations = load_recorded_camera_rotation_matrices(
+        src,
+        args.sequence,
+        len(aux_records),
+    )
+    (
+        camera_quaternion_order,
+        quaternion_level_errors,
+        quaternion_reference_errors_deg,
+    ) = (
         resolve_camera_quaternion_order(
-            aux_records, args.camera_quaternion_order
+            aux_records,
+            args.camera_quaternion_order,
+            recorded_camera_rotations,
         )
     )
     optical_x_rotation_deg = args.rectification_roll_deg
@@ -1065,27 +1576,53 @@ def main():
                 f"{left.shape[:2]} / {right.shape[:2]}"
             )
 
-        virtual_left = cv2.remap(
-            left,
-            left_maps[0],
-            left_maps[1],
-            cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-        )
-        virtual_right = cv2.remap(
-            right,
-            right_maps[0],
-            right_maps[1],
-            cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-        )
         left_output = output / "rgb" / f"{output_idx:08d}.png"
         right_output = output / "stereo_right" / f"{output_idx:08d}.png"
         write_options = [cv2.IMWRITE_PNG_COMPRESSION, 1]
-        if not cv2.imwrite(str(left_output), virtual_left, write_options):
-            raise RuntimeError(f"Failed to write {left_output}")
-        if not cv2.imwrite(str(right_output), virtual_right, write_options):
-            raise RuntimeError(f"Failed to write {right_output}")
+        if input_projection_model == "pinhole_rectified":
+            # Copy the encoded source PNG instead of decoding and re-encoding
+            # it. This makes preservation byte-for-byte auditable.
+            if left_path.suffix.lower() != ".png":
+                raise ValueError(
+                    "pinhole_rectified left-image preservation requires PNG input: "
+                    f"{left_path}"
+                )
+            with left_path.open("rb") as stream:
+                if stream.read(len(PNG_SIGNATURE)) != PNG_SIGNATURE:
+                    raise ValueError(f"Source image is not an encoded PNG: {left_path}")
+            shutil.copyfile(left_path, left_output)
+        else:
+            virtual_left = cv2.remap(
+                left,
+                left_maps[0],
+                left_maps[1],
+                cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
+            if not cv2.imwrite(str(left_output), virtual_left, write_options):
+                raise RuntimeError(f"Failed to write {left_output}")
+        if stereo_calibration.get("right_image_pixels_preserved", False):
+            if right_path.suffix.lower() != ".png":
+                raise ValueError(
+                    "Declared rectified right-image preservation requires PNG "
+                    f"input: {right_path}"
+                )
+            with right_path.open("rb") as stream:
+                if stream.read(len(PNG_SIGNATURE)) != PNG_SIGNATURE:
+                    raise ValueError(
+                        f"Source image is not an encoded PNG: {right_path}"
+                    )
+            shutil.copyfile(right_path, right_output)
+        else:
+            virtual_right = cv2.remap(
+                right,
+                right_maps[0],
+                right_maps[1],
+                cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
+            if not cv2.imwrite(str(right_output), virtual_right, write_options):
+                raise RuntimeError(f"Failed to write {right_output}")
 
         output_frames.append(
             {
@@ -1178,7 +1715,29 @@ def main():
     translations = np.asarray([pose[:3, 3] for pose in global_poses])
     virtual_forward_z = np.asarray([pose[2, 2] for pose in global_poses])
     virtual_down_z = np.asarray([pose[2, 1] for pose in global_poses])
+    effective_horizontal_fov_deg = float(
+        np.degrees(
+            np.arctan2(virtual_K[0, 2], virtual_K[0, 0])
+            + np.arctan2(
+                (width - 1) - virtual_K[0, 2],
+                virtual_K[0, 0],
+            )
+        )
+    )
+    effective_down_fov_deg = float(
+        np.degrees(
+            np.arctan2(
+                (height - 1) - virtual_K[1, 2],
+                virtual_K[1, 1],
+            )
+        )
+    )
+    left_pixels_preserved = input_projection_model == "pinhole_rectified"
+    right_pixels_preserved = bool(
+        stereo_calibration.get("right_image_pixels_preserved", False)
+    )
     report = {
+        "preparation_contract_version": PREPARATION_CONTRACT_VERSION,
         "source_dataset": str(src),
         "calibration_source_dataset": str(calibration_source),
         "base_pose_source": args.base_pose_source,
@@ -1191,13 +1750,36 @@ def main():
         ],
         "effective_input_projection_model": input_projection_model,
         "stereo_rectification_policy": (
-            "preserve_left_right_relative_rotation_and_y_alignment"
+            "preserve_declared_rectified_left_and_right_identity"
+            if right_pixels_preserved
+            else "preserve_left_identity_right_only_epipolar_remap"
             if input_projection_model == "pinhole_rectified"
+            else "opencv_pinhole_stereo_rectify_from_empirical_extrinsics"
+            if input_projection_model == "pinhole_unrectified"
             else "opencv_fisheye_stereo_rectify"
+        ),
+        "output_intrinsics_source": (
+            "source_rectified_K"
+            if input_projection_model == "pinhole_rectified"
+            else "opencv_pinhole_stereo_rectify_projection"
+            if input_projection_model == "pinhole_unrectified"
+            else "virtual_pinhole_from_requested_fov"
         ),
         "left_image_orientation_preserved": (
             input_projection_model == "pinhole_rectified"
             and abs(optical_x_rotation_deg) < 1.0e-12
+        ),
+        "left_image_pixels_preserved": left_pixels_preserved,
+        "right_image_pixels_preserved": right_pixels_preserved,
+        "left_image_storage_policy": (
+            "byte_for_byte_source_png_copy"
+            if left_pixels_preserved
+            else "opencv_remap_and_png_encode"
+        ),
+        "right_image_storage_policy": (
+            "byte_for_byte_source_png_copy"
+            if right_pixels_preserved
+            else "opencv_remap_and_png_encode"
         ),
         "input_projection_model_evidence": input_projection_evidence,
         "source_intrinsics": K.tolist(),
@@ -1210,11 +1792,22 @@ def main():
         "opencv_right_original_to_virtual_R": original_R_virtual_right.tolist(),
         "camera_quaternion_order": camera_quaternion_order,
         "camera_quaternion_level_errors": quaternion_level_errors,
+        "camera_quaternion_reference_errors_deg": (
+            quaternion_reference_errors_deg
+        ),
         "applied_optical_x_rotation_deg": optical_x_rotation_deg,
-        "horizontal_fov_deg": args.horizontal_fov_deg,
-        "down_fov_deg": args.down_fov_deg,
+        "horizontal_fov_deg": effective_horizontal_fov_deg,
+        "down_fov_deg": effective_down_fov_deg,
+        "requested_horizontal_fov_deg": args.horizontal_fov_deg,
+        "requested_down_fov_deg": args.down_fov_deg,
         "remap_valid_ratios": valid_ratios,
         "source_pairs": len(records),
+        "requested_source_indices": (
+            sorted(requested_source_indices)
+            if requested_source_indices is not None
+            else None
+        ),
+        "requested_unmatched_source_indices": requested_unmatched_source_indices,
         "matched_pairs": len(matches),
         "skipped_cam0": len(skipped_left),
         "skipped_cam1": len(skipped_right),

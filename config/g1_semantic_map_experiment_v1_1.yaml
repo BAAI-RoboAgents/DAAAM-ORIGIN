@@ -1,0 +1,43 @@
+schema: daaam.g1_semantic_map_experiment.v1
+repository_root: /home/user/Code/DAAAM_Origin
+python_executable: /home/user/Code/DAAAM_Origin/.repro/venv/bin/python
+environment_setup: /home/user/Code/DAAAM_Origin/.repro/ros2_ws/install/setup.bash
+workspace: experiments/g1_20260724_473_573_v1_1
+raw_dataset: /home/user/datasets/g1_20260724
+
+source_frames:
+  start: 473
+  end: 573
+
+repeats: 3
+seeds: [0, 1, 2]
+
+splits:
+  calibration: [473, 487]
+  development: [488, 527]
+  stress: [528, 557]
+  held_out: [558, 573]
+
+inputs:
+  fast_foundation_repo: /home/user/Code/Fast-FoundationStereo
+  fast_foundation_checkpoint: /home/user/Code/Fast-FoundationStereo/weights/20-30-48/model_best_bp2_serialize.pth
+  foundation_stereo_checkpoint: /home/user/Code/FoundationStereo/pretrained_models/11-33-40/model_best_bp2.pth
+  # Deliberately absent until P1 produces a calibration-only scale report.
+  floor_calibration_report: experiments/g1_20260724_473_573_v1_1/shared_artifacts/scale_473_487.json
+  right_rectification_report: output/g1_20260724_v1_v2_optimal_combination_653_953_final/best_combination.json
+  fastsam_engine: checkpoints/fastsam/FastSAM-x-640x480.engine
+  reid_engine: checkpoints/reid_weights/clip_general.engine
+  dam_model: nvidia/DAM-3B
+
+artifacts:
+  prepared_dataset: experiments/g1_20260724_473_573_v1_1/shared_artifacts/prepared_stereo_473_573_v1_v2
+  # These paths remain intentionally absent until reviewed GT and D0 qualify
+  # formal execution. Existing full-run artifacts are diagnostic only.
+  selected_dataset: experiments/g1_20260724_473_573_v1_1/shared_artifacts/formal_selected
+  geometry_dataset: experiments/g1_20260724_473_573_v1_1/shared_artifacts/formal_geometry
+  temporal_report: experiments/g1_20260724_473_573_v1_1/shared_artifacts/formal_temporal/temporal_depth_consistency_report.json
+  odometry_dataset: experiments/g1_20260724_473_573_v1_1/shared_artifacts/formal_odometry
+  loop_report: experiments/g1_20260724_473_573_v1_1/shared_artifacts/formal_loops/loop_closure_report.json
+  optimized_dataset: experiments/g1_20260724_473_573_v1_1/shared_artifacts/formal_optimized
+  filtered_dataset: experiments/g1_20260724_473_573_v1_1/shared_artifacts/formal_filtered
+  query_dsg: experiments/g1_20260724_473_573_v1_1/shared_artifacts/formal_query/dsg_updated.json

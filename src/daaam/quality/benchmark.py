@@ -462,6 +462,11 @@ def validate_realtime_run(
         },
     )
     if require_dam:
+        dam_model = semantic_models.get("dam", {})
+        dam_model_resolved = bool(dam_model.get("cached_revision")) or (
+            bool(dam_model.get("local_path"))
+            and bool(dam_model.get("model_index_sha256"))
+        )
         check("semantic.mode_dam", report.get("semantic_mode") == "dam")
         check(
             "semantic.real_corrections",
@@ -520,7 +525,7 @@ def validate_realtime_run(
             "semantic.resolved_models",
             bool(semantic_models.get("fastsam", {}).get("sha256"))
             and bool(semantic_models.get("botsort_reid", {}).get("sha256"))
-            and bool(semantic_models.get("dam", {}).get("cached_revision"))
+            and dam_model_resolved
             and bool(semantic_models.get("semantic_labelspace", {}).get("sha256"))
             and bool(semantic_models.get("labelspace_colors", {}).get("sha256")),
             semantic_models,

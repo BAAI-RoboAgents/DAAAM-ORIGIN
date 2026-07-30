@@ -1,0 +1,331 @@
+{
+  "depth": {
+    "left_right_consistency": {
+      "count": 76,
+      "maximum": 0.9400149258711573,
+      "mean": 0.8799294288297639,
+      "minimum": 0.7643601406654508,
+      "p05": 0.7893890568540918,
+      "p50": 0.894250229393732,
+      "p95": 0.9332585826533926
+    },
+    "mean_confidence": {
+      "count": 76,
+      "maximum": 0.958452045917511,
+      "mean": 0.9433054955382096,
+      "minimum": 0.9213172793388367,
+      "p05": 0.9324409365653992,
+      "p50": 0.9428617656230927,
+      "p95": 0.9544672220945358
+    },
+    "median_depth_m": {
+      "count": 76,
+      "maximum": 2.379020929336548,
+      "mean": 1.802377214557246,
+      "minimum": 1.3600361347198486,
+      "p05": 1.3964508771896362,
+      "p50": 1.6882762908935547,
+      "p95": 2.309355616569519
+    },
+    "valid_ratio": {
+      "count": 76,
+      "maximum": 0.93996826171875,
+      "mean": 0.8798342306572096,
+      "minimum": 0.7643172200520834,
+      "p05": 0.7892295328776041,
+      "p50": 0.894248046875,
+      "p95": 0.9332403564453124
+    }
+  },
+  "filter": {
+    "input_valid_ratio": {
+      "count": 76,
+      "maximum": 0.93996826171875,
+      "mean": 0.8798342306572096,
+      "minimum": 0.7643172200520834,
+      "p05": 0.7892295328776041,
+      "p50": 0.894248046875,
+      "p95": 0.9332403564453124
+    },
+    "output_valid_ratio": {
+      "count": 76,
+      "maximum": 0.9216951497395833,
+      "mean": 0.8568691855982731,
+      "minimum": 0.7434375,
+      "p05": 0.7815128580729167,
+      "p50": 0.870257568359375,
+      "p95": 0.9043227132161458
+    },
+    "rejected_valid_ratio": {
+      "count": 76,
+      "maximum": 0.07811893282244105,
+      "mean": 0.02581995461452383,
+      "minimum": 0.005543268656807021,
+      "p05": 0.008896026886515897,
+      "p50": 0.021169188384909922,
+      "p95": 0.062000451315094865
+    }
+  },
+  "limitations": [
+    "The 101 frames form one continuous, highly overlapping indoor maneuver.",
+    "Existing stage artifacts were produced by the 844-frame full run, not isolated 473-573 runs.",
+    "No complete reviewed human instance/track/DSG ground truth exists for this window.",
+    "Mutual-SIFT epipolar residual is a diagnostic proxy and must not replace audited correspondences.",
+    "Loop closure, global consistency, room topology, and cross-scene generalization cannot be established from this window alone."
+  ],
+  "raw": {
+    "brightness": {
+      "count": 101,
+      "maximum": 132.70360514322917,
+      "mean": 121.01018209828796,
+      "minimum": 113.86881103515626,
+      "p05": 114.58525472005208,
+      "p50": 119.57011800130208,
+      "p95": 131.08754557291667
+    },
+    "sharpness": {
+      "count": 101,
+      "maximum": 724.0411594413215,
+      "mean": 452.2465787998468,
+      "minimum": 210.13174714580575,
+      "p05": 222.81409547627706,
+      "p50": 411.56447264671357,
+      "p95": 714.0387109359741
+    },
+    "stereo_delta_ms": {
+      "count": 101,
+      "maximum": 15.656891,
+      "mean": 3.3201074455445543,
+      "minimum": 0.044043,
+      "p05": 0.187477,
+      "p50": 2.294575,
+      "p95": 10.034622
+    },
+    "stereo_sync_pass_10ms": 94,
+    "stereo_sync_pass_10ms_ratio": 0.9306930693069307,
+    "stereo_sync_pass_2ms": 46,
+    "stereo_sync_pass_5ms": 80,
+    "trajectory_displacement_m": 1.9575652839731232,
+    "trajectory_path_length_m": 2.1421827612698614,
+    "yaw_change_deg": -49.54436569635114
+  },
+  "rectification": {
+    "diagnostic_only": true,
+    "missing_source_frames": [
+      473,
+      525,
+      536,
+      537,
+      539,
+      543,
+      553
+    ],
+    "prepared_coverage_ratio": 0.9306930693069307,
+    "prepared_frames": 94,
+    "raw_mutual_sift_vertical_median_px": {
+      "count": 101,
+      "maximum": 3.677734375,
+      "mean": 2.8735604545857645,
+      "minimum": 2.2712631225585938,
+      "p05": 2.334136962890625,
+      "p50": 2.93829345703125,
+      "p95": 3.26800537109375
+    },
+    "rectified_mutual_sift_vertical_median_px": {
+      "count": 94,
+      "maximum": 0.43023681640625,
+      "mean": 0.3276770977263755,
+      "minimum": 0.24338912963867188,
+      "p05": 0.25852203369140625,
+      "p50": 0.3150749206542969,
+      "p95": 0.4057929992675781
+    }
+  },
+  "representative_frame": {
+    "selected_frame": 364,
+    "semantic_label_count": 19,
+    "source_frame": 569
+  },
+  "schema": "daaam.g1_473_573_visual_audit.v1",
+  "selection": {
+    "reasons": {
+      "image_event_at_static_pose": 59,
+      "pose_motion": 17
+    },
+    "selected_frames": 76,
+    "selected_ratio": 0.7524752475247525,
+    "selected_source_frames": [
+      474,
+      475,
+      476,
+      477,
+      478,
+      479,
+      480,
+      481,
+      482,
+      483,
+      484,
+      485,
+      486,
+      487,
+      488,
+      489,
+      490,
+      491,
+      492,
+      493,
+      494,
+      495,
+      496,
+      497,
+      498,
+      499,
+      500,
+      501,
+      502,
+      503,
+      504,
+      505,
+      506,
+      507,
+      508,
+      509,
+      510,
+      511,
+      512,
+      513,
+      514,
+      515,
+      516,
+      517,
+      518,
+      519,
+      520,
+      521,
+      522,
+      523,
+      524,
+      526,
+      527,
+      528,
+      529,
+      530,
+      531,
+      532,
+      533,
+      534,
+      535,
+      538,
+      540,
+      541,
+      544,
+      545,
+      547,
+      549,
+      552,
+      555,
+      561,
+      569,
+      570,
+      571,
+      572,
+      573
+    ]
+  },
+  "semantics": {
+    "dynamic_ratio": {
+      "count": 76,
+      "maximum": 0.10463541666666666,
+      "mean": 0.0442749451754386,
+      "minimum": 0.0,
+      "p05": 0.0,
+      "p50": 0.049218750000000006,
+      "p95": 0.09354166666666666
+    },
+    "label_frame_coverage": 1.0,
+    "labels_per_frame": {
+      "count": 76,
+      "maximum": 19.0,
+      "mean": 9.631578947368421,
+      "minimum": 4.0,
+      "p05": 5.0,
+      "p50": 9.0,
+      "p95": 18.0
+    },
+    "manual_ground_truth_available": false,
+    "map_memory_window": {
+      "entities": 50,
+      "observations": 914,
+      "semantic_operations": 27
+    },
+    "semantic_nonzero_ratio": {
+      "count": 76,
+      "maximum": 0.7598209635416666,
+      "mean": 0.5285462710731907,
+      "minimum": 0.26256673177083334,
+      "p05": 0.27051228841145836,
+      "p50": 0.571646728515625,
+      "p95": 0.7462727864583333
+    },
+    "unknown_ratio": {
+      "count": 76,
+      "maximum": 0.29171875,
+      "mean": 0.19081825657894735,
+      "minimum": 0.11609375,
+      "p05": 0.13037760416666666,
+      "p50": 0.18674479166666666,
+      "p95": 0.2631119791666666
+    }
+  },
+  "source": {
+    "dataset": "/media/user/data4t/g1_20260724",
+    "existing_artifacts_are_full_run_diagnostics": true,
+    "frame_count": 101,
+    "frames": [
+      473,
+      573
+    ]
+  },
+  "splits_under_review": {
+    "calibration": {
+      "count": 15,
+      "frames": [
+        473,
+        487
+      ]
+    },
+    "development": {
+      "count": 40,
+      "frames": [
+        488,
+        527
+      ]
+    },
+    "held-out": {
+      "count": 16,
+      "frames": [
+        558,
+        573
+      ]
+    },
+    "stress": {
+      "count": 30,
+      "frames": [
+        528,
+        557
+      ]
+    }
+  },
+  "temporal": {
+    "agreement_rate": {
+      "count": 75,
+      "maximum": 0.9603753585235066,
+      "mean": 0.9091947686214191,
+      "minimum": 0.8279226214936913,
+      "p05": 0.8450779854451477,
+      "p50": 0.9201706276660573,
+      "p95": 0.948294663197337
+    }
+  }
+}

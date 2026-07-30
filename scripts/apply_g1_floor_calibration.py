@@ -29,6 +29,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-report", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--max-depth-m", type=float, default=None)
+    parser.add_argument(
+        "--rotation-policy",
+        choices=("report", "identity"),
+        default="report",
+        help=(
+            "Apply the report rotation, or keep every source camera rotation "
+            "unchanged while applying only the calibrated depth scale."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -97,13 +106,18 @@ def main() -> None:
         effective_baseline / source_baseline, depth_scale, rel_tol=1.0e-9
     ):
         raise ValueError("Calibration baseline and depth scale disagree")
-    correction = np.asarray(
+    report_correction = np.asarray(
         calibration["tf_camera_R_image_camera"], dtype=np.float64
     )
-    if correction.shape != (3, 3) or not np.allclose(
-        correction.T @ correction, np.eye(3), atol=1.0e-6
+    if report_correction.shape != (3, 3) or not np.allclose(
+        report_correction.T @ report_correction, np.eye(3), atol=1.0e-6
     ):
         raise ValueError("Calibration image-frame rotation is invalid")
+    correction = (
+        report_correction
+        if args.rotation_policy == "report"
+        else np.eye(3, dtype=np.float64)
+    )
     max_depth_m = args.max_depth_m or float(
         tick_index.get("recommended_max_depth_m", 5.0)
     )
@@ -147,15 +161,22 @@ def main() -> None:
     output_tick = copy.deepcopy(tick_index)
     output_tick["source_baseline"] = source_baseline
     output_tick["baseline"] = effective_baseline
-    composition_suffix = " @ tf_camera_T_image_camera"
-    if not output_tick.get("pose_composition", "").endswith(composition_suffix):
-        output_tick["pose_composition"] = (
-            output_tick.get("pose_composition", "") + composition_suffix
-        )
+    if args.rotation_policy == "report":
+        composition_suffix = " @ tf_camera_T_image_camera"
+        if not output_tick.get("pose_composition", "").endswith(
+            composition_suffix
+        ):
+            output_tick["pose_composition"] = (
+                output_tick.get("pose_composition", "") + composition_suffix
+            )
     output_tick["floor_geometry_calibration"] = {
         "method": "apply_validated_fixed_calibration",
         "source_report": str(calibration_path),
         "application_report": "floor_calibration_application.json",
+        "rotation_policy": args.rotation_policy,
+        "source_camera_rotations_preserved": (
+            args.rotation_policy == "identity"
+        ),
     }
     for frame in output_tick["frames"]:
         index = int(frame["idx"])
@@ -174,6 +195,10 @@ def main() -> None:
         "source_baseline_m": source_baseline,
         "effective_baseline_m": effective_baseline,
         "depth_scale": depth_scale,
+        "rotation_policy": args.rotation_policy,
+        "source_camera_rotations_preserved": (
+            args.rotation_policy == "identity"
+        ),
         "max_depth_m": max_depth_m,
         "clipped_pixels": clipped_pixels,
         "valid_ratio_before_percentiles": np.percentile(
@@ -182,7 +207,8 @@ def main() -> None:
         "valid_ratio_after_percentiles": np.percentile(
             after_ratios, [0, 5, 50, 95, 100]
         ).tolist(),
-        "tf_camera_R_image_camera": correction.tolist(),
+        "reported_tf_camera_R_image_camera": report_correction.tolist(),
+        "applied_tf_camera_R_image_camera": correction.tolist(),
     }
     (output / "floor_calibration_application.json").write_text(
         json.dumps(report, indent=2) + "\n"

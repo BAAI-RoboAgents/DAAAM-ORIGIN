@@ -38,6 +38,7 @@ DIAGNOSE_RGBD_FUSION = REPOSITORY_ROOT / "scripts" / "diagnose_rgbd_fusion.py"
 RUN_PIPELINE = REPOSITORY_ROOT / "scripts" / "run_pipeline.py"
 DEFAULT_FS_ROOT = REPOSITORY_ROOT / "third_party" / "FoundationStereo"
 DEFAULT_G1_HYDRA_CONFIG = REPOSITORY_ROOT / "config" / "hydra_g1_high_quality.yaml"
+G1_PREPARATION_CONTRACT_VERSION = 4
 STAGES = (
     "prepare",
     "select",
@@ -82,8 +83,24 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "kannala_brandt", "pinhole_rectified"),
         default="auto",
     )
-    g1.add_argument("--horizontal-fov-deg", type=float, default=100.0)
-    g1.add_argument("--down-fov-deg", type=float, default=28.0)
+    g1.add_argument(
+        "--horizontal-fov-deg",
+        type=float,
+        default=100.0,
+        help=(
+            "Virtual pinhole FOV for raw Kannala-Brandt input; ignored for "
+            "rectified pinhole pixels."
+        ),
+    )
+    g1.add_argument(
+        "--down-fov-deg",
+        type=float,
+        default=28.0,
+        help=(
+            "Virtual pinhole downward FOV for raw Kannala-Brandt input; "
+            "ignored for rectified pinhole pixels."
+        ),
+    )
     g1.add_argument("--rectification-roll-deg", type=float, default=0.0)
     g1.add_argument(
         "--camera-quaternion-order", choices=("auto", "xyzw", "wxyz"), default="auto"
@@ -105,6 +122,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Validated pinhole preparation report from the same unchanged G1 "
             "stereo rig; passed through to the preparation stage."
+        ),
+    )
+    g1.add_argument(
+        "--right-rectification-report",
+        type=Path,
+        help=(
+            "LiDAR-validated right-only projective rectification report; "
+            "passed through to G1 preparation without modifying the left image."
         ),
     )
     g1.add_argument("--recommended-max-depth-m", type=float, default=5.0)
@@ -153,6 +178,15 @@ def parse_args() -> argparse.Namespace:
             "g1-fisheye run that proceeds beyond nominal depth inference."
         ),
     )
+    geometry.add_argument(
+        "--floor-rotation-policy",
+        choices=("report", "identity"),
+        default="report",
+        help=(
+            "Use identity to apply only the floor-derived depth scale while "
+            "preserving the source camera rotations exactly."
+        ),
+    )
     geometry.add_argument("--geometry-max-depth-m", type=float, default=5.0)
     geometry.add_argument("--local-keyframe-distance-m", type=float, default=0.10)
     geometry.add_argument("--local-max-keyframe-gap", type=int, default=8)
@@ -160,6 +194,15 @@ def parse_args() -> argparse.Namespace:
     geometry.add_argument("--local-min-inliers", type=int, default=80)
     geometry.add_argument("--local-visual-max-nfev", type=int, default=150)
     geometry.add_argument("--loop-dense-candidate-count", type=int, default=80)
+    geometry.add_argument(
+        "--skip-loop-closure-validation",
+        action="store_true",
+        help=(
+            "Skip loop discovery when the capture design proves that the "
+            "trajectory contains no revisit. Requires "
+            "--preserve-source-trajectory."
+        ),
+    )
     geometry.add_argument("--max-loop-gravity-residual-deg", type=float, default=8.0)
     geometry.add_argument("--global-iterations", type=int, default=250)
     geometry.add_argument(
@@ -169,6 +212,16 @@ def parse_args() -> argparse.Namespace:
             "Keep the prepared source trajectory unchanged after RGB-D/loop "
             "diagnostics. Use this when poses are already expressed in an "
             "authoritative external map frame."
+        ),
+    )
+    geometry.add_argument(
+        "--allow-missing-verified-loops",
+        action="store_true",
+        help=(
+            "Allow global pose-graph optimization to continue when loop "
+            "discovery finds zero geometrically verified closures. Use only "
+            "for short non-revisiting segments where loops are impossible; "
+            "record the missing-loop condition in the run manifest."
         ),
     )
 
@@ -267,6 +320,7 @@ def validate_time_contract(dataset: Path) -> dict[str, Any]:
         metadata = json.loads(tick_path.read_text())
         frames = metadata["frames"]
         time_origin_ns = int(metadata["time_origin_ns"])
+        input_modality = str(metadata.get("input_modality", "stereo"))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise RuntimeError(
             f"Prepared dataset does not provide a valid absolute time contract: {dataset}"
@@ -297,9 +351,14 @@ def validate_time_contract(dataset: Path) -> dict[str, Any]:
             frame_index = int(frame["idx"])
             sensor_time_ns = int(frame["sensor_time_ns"])
             cam0_time_ns = int(frame["cam0_sensor_time_ns"])
-            cam1_time_ns = int(frame["cam1_sensor_time_ns"])
             pose_time_ns = int(frame["pose_sensor_time_ns"])
             pose_row = int(frame["pose_row"])
+            if input_modality == "aligned_rgbd":
+                depth_time_ns = int(frame["depth_sensor_time_ns"])
+                cam1_time_ns = None
+            else:
+                cam1_time_ns = int(frame["cam1_sensor_time_ns"])
+                depth_time_ns = None
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeError(
                 f"Frame {index} is missing required absolute-time metadata"
@@ -311,7 +370,16 @@ def validate_time_contract(dataset: Path) -> dict[str, Any]:
         if pose_row < 0 or pose_row >= len(pose_timestamps) or pose_row in checked_pose_rows:
             raise RuntimeError(f"Frame {index} has invalid or duplicate pose_row {pose_row}")
         checked_pose_rows.add(pose_row)
-        if sensor_time_ns != cam0_time_ns or pose_time_ns != cam0_time_ns:
+        if input_modality == "aligned_rgbd":
+            if (
+                sensor_time_ns != cam0_time_ns
+                or pose_time_ns != cam0_time_ns
+                or depth_time_ns != cam0_time_ns
+            ):
+                raise RuntimeError(
+                    f"Frame {index} RGB, depth, and pose absolute times disagree"
+                )
+        elif sensor_time_ns != cam0_time_ns or pose_time_ns != cam0_time_ns:
             raise RuntimeError(f"Frame {index} camera and pose absolute times disagree")
         if pose_timestamps[pose_row] != pose_time_ns:
             raise RuntimeError(f"Frame {index} pose timestamp does not match pose_row")
@@ -325,24 +393,36 @@ def validate_time_contract(dataset: Path) -> dict[str, Any]:
             raise RuntimeError(
                 f"Frame {index} relative timestamp is not derived from sensor_time_ns"
             )
-        expected_stereo_delta_ms = abs(cam0_time_ns - cam1_time_ns) / 1.0e6
-        if "stereo_delta_ms" in frame and not math.isclose(
-            float(frame["stereo_delta_ms"]), expected_stereo_delta_ms, abs_tol=1.0e-6
-        ):
-            raise RuntimeError(f"Frame {index} stereo_delta_ms disagrees with capture times")
+        if cam1_time_ns is not None:
+            expected_stereo_delta_ms = abs(cam0_time_ns - cam1_time_ns) / 1.0e6
+            if "stereo_delta_ms" in frame and not math.isclose(
+                float(frame["stereo_delta_ms"]),
+                expected_stereo_delta_ms,
+                abs_tol=1.0e-6,
+            ):
+                raise RuntimeError(
+                    f"Frame {index} stereo_delta_ms disagrees with capture times"
+                )
 
+    checked = [
+        "cam0_sensor_time_ns == sensor_time_ns == pose_sensor_time_ns",
+        "pose_sensor_time_ns == pose_timestamps_ns[pose_row]",
+        "strictly_increasing_sensor_time_ns",
+        "relative_timestamp_derived_from_time_origin_ns",
+    ]
+    if input_modality == "aligned_rgbd":
+        checked.append("depth_sensor_time_ns == cam0_sensor_time_ns")
+    else:
+        checked.append(
+            "stereo_delta_ms_derived_from_cam0_cam1_absolute_times"
+        )
     return {
         "valid": True,
         "frame_count": len(frames),
         "time_origin_ns": time_origin_ns,
+        "input_modality": input_modality,
         "pose_timestamp_file": str(pose_time_path),
-        "checked": [
-            "cam0_sensor_time_ns == sensor_time_ns == pose_sensor_time_ns",
-            "pose_sensor_time_ns == pose_timestamps_ns[pose_row]",
-            "strictly_increasing_sensor_time_ns",
-            "relative_timestamp_derived_from_time_origin_ns",
-            "stereo_delta_ms_derived_from_cam0_cam1_absolute_times",
-        ],
+        "checked": checked,
     }
 
 
@@ -412,6 +492,20 @@ def prepared_ready(dataset: Path) -> bool:
         (dataset / "tick_index.json").is_file()
         and (dataset / "pose" / "poses.txt").is_file()
         and (dataset / "pose" / "pose_timestamps_ns.txt").is_file()
+    )
+
+
+def g1_prepared_ready(dataset: Path) -> bool:
+    if not prepared_ready(dataset):
+        return False
+    report_path = dataset / "pinhole_preparation_report.json"
+    try:
+        report = json.loads(report_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        int(report.get("preparation_contract_version", -1))
+        == G1_PREPARATION_CONTRACT_VERSION
     )
 
 
@@ -529,19 +623,30 @@ def run_or_resume(
     return "planned" if args.dry_run else "executed"
 
 
-def require_verified_loop(report_path: Path) -> dict[str, Any]:
+def require_verified_loop(
+    report_path: Path, *, allow_missing: bool = False
+) -> dict[str, Any]:
     report = json.loads(report_path.read_text())
     verified_count = int(report.get("verified_count", 0))
-    if verified_count < 1:
-        raise RuntimeError(
-            "No geometrically verified loop closure was found; global optimization "
-            "and Hydra mapping are intentionally blocked."
-        )
-    return {
+    payload = {
         "report": str(report_path),
         "verified_count": verified_count,
         "dense_tested_count": int(report.get("dense_tested_count", 0)),
     }
+    if verified_count < 1:
+        if not allow_missing:
+            raise RuntimeError(
+                "No geometrically verified loop closure was found; global optimization "
+                "and Hydra mapping are intentionally blocked."
+            )
+        payload["status"] = "missing_verified_loops_allowed"
+        payload["warning"] = (
+            "No geometrically verified loop closure was found; continuing with "
+            "local constraints only because --allow-missing-verified-loops was set."
+        )
+        return payload
+    payload["status"] = "verified_loops_present"
+    return payload
 
 
 def load_gate_summary(report_path: Path) -> dict[str, Any]:
@@ -711,19 +816,31 @@ def main() -> None:
                     str(args.stereo_calibration_report.resolve()),
                 ]
             )
+        if args.right_rectification_report is not None:
+            command.extend(
+                [
+                    "--right-rectification-report",
+                    str(args.right_rectification_report.resolve()),
+                ]
+            )
         if args.calibration_source is not None:
             command.extend(
                 ["--calibration-source", str(args.calibration_source.resolve())]
             )
         result = run_or_resume(
-            "prepare", command, prepared_ready(prepared), args
+            "prepare", command, g1_prepared_ready(prepared), args
         )
         manifest["prepared_dataset"] = str(prepared)
         record("prepare", result)
 
-    if not args.dry_run and not prepared_ready(prepared):
+    preparation_ready = (
+        prepared_ready(prepared)
+        if args.adapter == "prepared-stereo"
+        else g1_prepared_ready(prepared)
+    )
+    if not args.dry_run and not preparation_ready:
         raise RuntimeError(f"Prepared dataset does not satisfy the time contract: {prepared}")
-    if prepared_ready(prepared):
+    if preparation_ready:
         manifest["prepared_time_contract"] = validate_time_contract(prepared)
     if finish("prepare"):
         return
@@ -863,6 +980,8 @@ def main() -> None:
             str(calibration_report),
             "--output",
             str(geometry),
+            "--rotation-policy",
+            args.floor_rotation_policy,
             "--max-depth-m",
             str(args.geometry_max_depth_m),
         ]
@@ -878,6 +997,7 @@ def main() -> None:
     manifest["floor_calibration_report"] = (
         str(calibration_report) if calibration_report is not None else None
     )
+    manifest["floor_rotation_policy"] = args.floor_rotation_policy
     record("calibrate", result)
     if not args.dry_run:
         validate_time_contract(geometry)
@@ -949,23 +1069,46 @@ def main() -> None:
         return
 
     loop_report = loop_output / "loop_closure_report.json"
-    command = [
-        sys.executable,
-        str(DISCOVER_RGBD_LOOPS),
-        "--dataset",
-        str(geometry),
-        "--output-dir",
-        str(loop_output),
-        "--keyframe-distance-m",
-        str(args.local_keyframe_distance_m),
-        "--max-keyframe-gap",
-        "10",
-        "--dense-candidate-count",
-        str(args.loop_dense_candidate_count),
-        "--max-depth-m",
-        str(args.geometry_max_depth_m),
-    ]
-    result = run_or_resume("loops", command, report_ready(loop_report), args)
+    if args.skip_loop_closure_validation:
+        if not args.preserve_source_trajectory:
+            raise ValueError(
+                "--skip-loop-closure-validation requires "
+                "--preserve-source-trajectory"
+            )
+        result = "planned" if args.dry_run else "skipped"
+        if not args.dry_run:
+            loop_output.mkdir(parents=True, exist_ok=True)
+            loop_report.write_text(
+                json.dumps(
+                    {
+                        "status": "skipped",
+                        "skip_reason": "no_revisit_by_capture_design",
+                        "verified_count": 0,
+                        "dense_tested_count": 0,
+                        "role": "not_applicable_authoritative_source_trajectory",
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+    else:
+        command = [
+            sys.executable,
+            str(DISCOVER_RGBD_LOOPS),
+            "--dataset",
+            str(geometry),
+            "--output-dir",
+            str(loop_output),
+            "--keyframe-distance-m",
+            str(args.local_keyframe_distance_m),
+            "--max-keyframe-gap",
+            "10",
+            "--dense-candidate-count",
+            str(args.loop_dense_candidate_count),
+            "--max-depth-m",
+            str(args.geometry_max_depth_m),
+        ]
+        result = run_or_resume("loops", command, report_ready(loop_report), args)
     if args.dry_run:
         manifest["loop_closures"] = {"report": str(loop_report), "status": "planned"}
     elif args.preserve_source_trajectory:
@@ -974,10 +1117,17 @@ def main() -> None:
             "report": str(loop_report),
             "verified_count": int(loop_details.get("verified_count", 0)),
             "dense_tested_count": int(loop_details.get("dense_tested_count", 0)),
-            "role": "diagnostic_only_authoritative_source_trajectory",
+            "role": loop_details.get(
+                "role", "diagnostic_only_authoritative_source_trajectory"
+            ),
+            "status": loop_details.get("status", "executed"),
+            "skip_reason": loop_details.get("skip_reason"),
         }
     else:
-        manifest["loop_closures"] = require_verified_loop(loop_report)
+        manifest["loop_closures"] = require_verified_loop(
+            loop_report,
+            allow_missing=bool(args.allow_missing_verified_loops),
+        )
     record("loops", result)
     if finish("loops"):
         return
@@ -1014,6 +1164,8 @@ def main() -> None:
         "--iterations",
         str(args.global_iterations),
     ]
+    if args.allow_missing_verified_loops:
+        command.append("--allow-missing-verified-loops")
     if args.overwrite:
         command.append("--overwrite")
     result = run_or_resume(
@@ -1028,7 +1180,10 @@ def main() -> None:
         validate_time_contract(optimized)
         manifest["global_pose_graph"] = load_global_optimization_summary(
             optimized / "global_pose_graph_report.json",
-            require_verified_loop=not args.preserve_source_trajectory,
+            require_verified_loop=(
+                not args.preserve_source_trajectory
+                and not args.allow_missing_verified_loops
+            ),
         )
     if finish("optimize"):
         return

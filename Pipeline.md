@@ -1,5 +1,15 @@
 # 地图构建核心流程：从双目图像到语义地图
 
+> 当前 G1 实验阶段（2026-07-28）：暂时跳过人工数据标注，使用现有数据对构建链路逐环节
+> 做证据优先的细粒度诊断。阶段目标、`exact/proxy/unavailable/not_applicable` 结论等级
+> 和全量中间产物保留要求见
+> [docs/g1_semantic_map_diagnostic_no_gt_stage.md](docs/g1_semantic_map_diagnostic_no_gt_stage.md)，
+> 执行配置见
+> [config/g1_semantic_map_diagnostic_no_gt.yaml](config/g1_semantic_map_diagnostic_no_gt.yaml)。
+> 本轮现有产物诊断已完成，证据总账见
+> [EVIDENCE_LEDGER.md](experiments/g1_20260724_473_573_v1_1/diagnostic_no_gt/EVIDENCE_LEDGER.md)。
+> 这不会把自动输出提升为 GT，也不会取消正式 V1.1 的双人标注、裁决和 held-out 条件。
+
 本文依据当前仓库代码和配置，说明从实时或离线双目图像到 Hydra Dynamic
 Scene Graph（DSG）语义地图的实际处理链路、每一步必须提供或可以调整的参数、
 当前默认值、质量门和输出产物。
@@ -15,8 +25,18 @@ Scene Graph（DSG）语义地图的实际处理链路、每一步必须提供或
 > 4. “完成语义地图”和“完成可查询语义地图”不是同一个终点。后者还要生成查询
 >    embedding 和 manifest；FastSAM 证据资产是再下一步的可选增强。
 > 5. 当前核心流程提供两个可选深度后端：默认使用 **Fast-FoundationStereo**（全分辨率、
->    8 iterations、FP16、左右一致性检查、有效深度硬截断 **5.0 m**）；FoundationStereo
->    保留为兼容、复现和 A/B 对比方案。准实时 `foundation-worker` 仍只实现后者。
+>    8 iterations、FP16、左右一致性检查）；FoundationStereo 保留为兼容、复现和 A/B
+>    对比方案。新建图任务不再使用 5.0 m 业务截断，`uint16` 毫米深度的格式上限
+>    **65.535 m** 仅用于防止存储溢出。准实时 `foundation-worker` 仍只实现后者。
+> 6. `2d_rect` 路径、`D=0` 和 `roi.do_rectify=true` **只能证明当前像素已经完成单目
+>    去畸变，不能单独证明左右目已经完成联合立体校正**。2026-07-28 对
+>    `g1_20260724` 的 653–953 帧实验确认：输入 PNG 仍有系统性垂直极线误差，必须先应用
+>    经过留出帧验证的双目校正，才可送入 FoundationStereo。禁止再次应用 fisheye
+>    去畸变；是否需要立体校正必须由匹配点实验判定，不能由目录名猜测。
+> 7. 后续语义地图构建**不再安排 1 Hz、3 Hz、5 Hz 等回放频率 A/B 或时效测试**。
+>    `--rate-hz` 只作为单次正式构建的调度和资源保护参数，沿用任务已确认的稳定值，
+>    不得为了比较频率重复运行地图构建。只有用户明确要求性能基准时才允许做频率测试；
+>    此类测试必须使用独立 `run-dir`，且不能替代或阻塞正式全量语义地图交付。
 
 ## 1. 两条当前可用链路
 
@@ -27,10 +47,12 @@ Scene Graph（DSG）语义地图的实际处理链路、每一步必须提供或
 默认深度入口：[scripts/run_fast_foundation_stereo_depth.py](scripts/run_fast_foundation_stereo_depth.py)
 
 ```text
-原始 G1 鱼眼双目，或已准备好的针孔双目
-  -> 双目同步、鱼眼转针孔、位姿对齐
+已单目去畸变的 G1 双目，或已准备好的针孔双目
+  -> 判定是否已经水平立体校正
+  -> 必要时应用留出验证通过的双目校正（不重复 fisheye 去畸变）
+  -> 双目同步、位姿对齐和可追溯的数据整理
   -> 内容安全关键帧选择
-  -> Fast-FoundationStereo 深度和左右一致性（最大 5.0 m）
+  -> Fast-FoundationStereo 深度和左右一致性（取消 5.0 m 业务截断）
   -> 固定地面/图像坐标校准
   -> 输入深度时序诊断
   -> 局部 RGB-D 里程计
@@ -98,6 +120,11 @@ FoundationStereo worker；它不是当前仓库内的原始 ROS 相机 topic 接
 `sensor_time_ns`，墙钟派发则同时受 source delta 和 `--rate-hz` 控制，默认每帧至少间隔
 `1/rate_hz`，不等于按采集墙钟 1:1 重放。
 
+这里的 `--rate-hz` 是执行参数，不是语义地图质量参数。正常建图只选择一个已确认值完成
+一次全量运行，不再先后试跑 1 Hz、3 Hz 等频率来判断是否能够建图，也不以这类时效试验
+作为语义完成门。排障应依据逐 stage 延迟、队列、内存、drop/error、postpass 和质量报告，
+不能通过反复降低或切换回放频率替代根因分析。
+
 ### 1.3 参数来源和优先级
 
 当前参数分散在三层，运行报告应保存三层的最终组合：
@@ -121,8 +148,8 @@ MapMemory 的跨 track 合并距离和最终 DSG object mesh 绑定距离也由�
 
 | 起点和终点 | 当前结论 |
 | --- | --- |
-| 原始离线 G1 双目 -> 几何验收预览 | 默认 Fast 方案由 `run_stereo_mapping.py` 与 `run_fast_foundation_stereo_depth.py` 三段式编排；原版单段式可选。两者都需要对应标定报告、模型权重和许可证确认 |
-| 原始离线 G1 双目 -> 旧式 DAAAM/Hydra map | 两种深度后端都有后续完整命令图，但有标定、闭环和人工预览硬门；默认 map 路由会确定性地使 wrapper 完成判定失败，且其检查不是严格语义完成门 |
+| 原始离线 G1 双目 -> 几何验收预览 | 对真正已立体校正的输入，默认 Fast 方案仍由两个脚本三段式编排。对 `g1_20260724`，先用 `materialize_g1_v1_v2_rectified_dataset.py` 把已验收组合物化为完整 `prepared-stereo`，再进入 Fast 深度和几何链 |
+| 原始离线 G1 双目 -> 旧式 DAAAM/Hydra map | `g1_20260724` 已完成组合校正物化、LiDAR 尺度、几何链、人工预览和一次全量 Hydra + DAM 构建；旧 wrapper 的默认 map 输出路由及弱完成检查仍未改变，严格结论应读取准实时运行的 postpass、durable commit、质量报告和独立验证 |
 | 已准备针孔双目、预计算深度、pose/time -> 动态隔离后的静态语义 Hydra DSG | 默认 Fast-FoundationStereo，原版可选；代码路径可由 `run_realtime_mapping.py --depth-backend precomputed --semantic-mode dam --stop-after global` 一次闭合；是否验收通过还要看第 8 节的 postpass、commit 和质量报告 |
 | 实时 ROS 双目/IMU topic -> 在线 VIO -> 语义地图 | 当前仓库内尚未由一个脚本闭合，传感器和 VIO 接入仍在部署/DAAAM-ROS 层 |
 | 最终语义 DSG -> 中英文可查询 | 视绑定状态执行 rebind，然后生成 embedding + manifest |
@@ -135,16 +162,19 @@ worktree：
 
 | 证据 | 已验证 | 未覆盖/限制 |
 | --- | --- | --- |
+| `g1_20260724` 653–953 帧 V1/V2 组合校正实验 | 240 帧训练、61 帧独立留出；留出汇总 `abs(dy)` P50/P95 为 `0.195/0.859 px`，正视差 `99.00%`，严格通过 `56/61`，共同有效图像面积 `94.84%`；组合验收 PASS | 证明极线对齐和正视差方向，不等于稠密深度绝对精度证明；物化脚本可以消费 `best_combination.json`，但 V2 的 `60.193 mm` 标称基线仍必须经 LiDAR/已知距离验证 |
 | clean 版本 `ab047db` 的 789 帧权威运行 | 789/789 completed，0 drop/error/resume，7/7 hard gates、32/32 validator，真实 FastSAM/BotSort/DAM，`authoritative=true` | 使用旧的预计算深度；早于当前 exact-frame semantic postpass/query 与 Fast-FoundationStereo 默认方案，不作为新默认深度链验收证据 |
-| `output/g1_20260717_1hz_dam_meshbound_opt` 功能性全量运行 | 1098/1098、0 drop，预计算的 refine 深度（32 iterations、scale 1.0、FP16），exact-frame label postpass 完成，7 个 hard gate PASS，83 个 DSG correction operations applied | 仍有 178 个 `rejected_no_mesh`；operation 数不等于 mesh-bound 实体数；运行时 worktree dirty，validator 为 `authoritative=false`，且文件哈希不等于当前工作区 |
+| 历史 `output/g1_20260717_1hz_dam_meshbound_opt` 功能性全量运行（仅归档） | 1098/1098、0 drop，预计算的 refine 深度（32 iterations、scale 1.0、FP16），exact-frame label postpass 完成，7 个 hard gate PASS，83 个 DSG correction operations applied | 仍有 178 个 `rejected_no_mesh`；operation 数不等于 mesh-bound 实体数；运行时 worktree dirty，validator 为 `authoritative=false`，且文件哈希不等于当前工作区；不得据此恢复 1 Hz/3 Hz 频率对比流程 |
 | 5 cm/3 cm 几何 A/B 和查询资产 | 两组均完成 1098 帧重放；5 cm 结果生成 49 个 mesh-bound、167 个 spatial-only 查询实体，216/216 有图像证据，其中 214 个有 RGB-D 点云 | 3 cm 未增加 mesh-bound 数，网格更大且连通性更差，所以 5 cm 仍是当前基线，3 cm 只是实验配置 |
 | `g1_260720_1424_indoor_fast_hq` 的 Fast 深度运行 | 1575/1575、0 failed；全分辨率、8 iterations、FP16、双向左右检查、5.0 m 截断；平均有效率 68.14%，完整运行端到端 964.7 s | 运行前 GPU 已被其他进程占用，计时不是无争用基准；原始采集没有稠密深度 GT，模型间差异不能当作绝对精度 |
 | `g1_260720_1424_indoor_fast_semantic_10cm` 的最终语义运行 | 1575/1575、quality/benchmark PASS、durable commit 有效；74 个 described mesh-bound objects，Fast 候选运行约 972.9 s | 当前 worktree/benchmark 非权威；与旧基线还同时存在 Hydra 几何配置差异，不能把全部变化只归因于深度模型 |
+| `g1_20260724_v1_v2_semantic_map` 的 V1/V2 + LiDAR 尺度全量运行 | 844/844 完成、0 drop/error；exact-label postpass 844/844、DAM drain PASS；153 个 Hydra objects、50 个 mesh-bound 描述实体、59 个 durable operations；最终 mesh 为 48,891 顶点/65,182 面，DSG commit 哈希验证通过 | 外部 SIGTERM 后从 600 帧检查点恢复，因此独立权威验证的 zero-resume/full-dispatch 门不通过；语义对象重建使 `global` service P95 达到 `305.46 ms`，超过标准 `250 ms` 门，故 `quality_passed=false`。这是可审计的功能性地图，不得误报为权威质量 PASS |
 
 截至当前，尚未完成原始 ROS 双目/IMU 直接接入、真机在线 VIO、Fast-FoundationStereo
-在线 request/response worker 接入，以及连续 30 分钟部署稳定性验收。默认方案的已验证
-方式是先按 5.0 m 上限生成 Fast 预计算深度，再由准实时链回放；需要在线逐帧深度时可选择
-原版 FoundationStereo worker，但它不是默认方案。
+在线 request/response worker 接入，以及连续 30 分钟部署稳定性验收。历史验证运行使用
+5.0 m 上限；新运行必须保存独立 provenance，并显式使用 65.535 m 存储上限取消该业务
+截断，再由准实时链回放。需要在线逐帧深度时可选择原版 FoundationStereo worker，但它
+不是默认方案。
 
 ## 2. 输入数据和时间契约
 
@@ -152,15 +182,15 @@ worktree：
 
 | `--adapter` | 输入 | 后续行为 |
 | --- | --- | --- |
-| `g1-fisheye` | G1 原始 Kannala-Brandt 鱼眼双目、标定、时间戳和机器人/头部位姿 | 执行同步、双目外参验证、虚拟针孔重投影和位姿组合 |
+| `g1-fisheye` | G1 双目、标定、时间戳和机器人/头部位姿；`g1_20260724/2d_rect` 实际为已单目去畸变但未完成水平立体校正的针孔像素 | 不得依赖 `auto` 或目录名；原始 PNG 诊断时显式使用 `pinhole_unrectified`。正式深度应先物化经过留出验证的组合校正结果，再以 `prepared-stereo` 进入后续流程 |
 | `prepared-stereo` | 已经满足下述时间契约的针孔双目数据集 | 跳过 G1 鱼眼准备，但仍执行选择、深度、几何优化和建图 |
 
 进入关键帧选择和 Fast-FoundationStereo 之前，核心结构为：
 
 ```text
 dataset/
-  rgb/                         # 左目针孔图像，也是 Hydra/DAAAM 使用的 RGB
-  stereo_right/                # 右目针孔图像
+  rgb/                         # 已校正左目原图，也是 Hydra/DAAAM 使用的 RGB
+  stereo_right/                # 已校正右目原图
   pose/poses.txt               # 每行一个 4x4 world_T_camera，16 个数
   pose/pose_timestamps_ns.txt  # 每个 pose 行的绝对纳秒时间
   camera_info.json             # 针孔内参
@@ -169,9 +199,11 @@ dataset/
 
 Fast-FoundationStereo 步骤随后新增 `depth/`（uint16 毫米）、`depth_confidence/`、
 `depth_consistency/`、`depth_occlusion/` 和 `depth_metadata/`。这些目录不是
-`prepared-stereo` 入口的先验必需输入。准备数据若未写 `recommended_max_depth_m`，
-Fast 深度脚本会回退到 `5.0 m`；核心流程仍必须显式传 `--max-depth-m 5.0`，并保证
-`recommended_max_depth_m` 和所有下游几何上限一致为 `5.0 m`。
+`prepared-stereo` 入口的先验必需输入。现有脚本若未写 `recommended_max_depth_m` 或未传
+`--max-depth-m`，仍会回退到旧默认 `5.0 m`，所以新运行必须显式传
+`--recommended-max-depth-m 65.535 --max-depth-m 65.535`，并把所有下游几何上限同步
+设为 `65.535 m`。这表示取消 5 m 业务截断；65.535 m 只是 `uint16` 毫米格式可表达的
+最大值，不代表模型在该距离仍有可靠精度。
 
 `tick_index.json` 每帧的 `cam0` 和 `cam1` 字段分别指向 `rgb/` 与
 `stereo_right/` 中的实际文件；后续 stage 应以这些记录为准，而不是猜测目录或文件名。
@@ -194,7 +226,7 @@ G1 `prepare` 一定生成
 `10 ms` 配对门。`prepared-stereo` 输入允许省略 `stereo_delta_ms`，存在时才校验该公式；
 该 adapter 也不会重新执行 `--max-delta-ms` 门，因此输入提供方仍要负责证明左右同步质量。
 
-### 2.3 G1 鱼眼准备参数
+### 2.3 G1 输入整理参数
 
 实现：[scripts/prepare_g1_pinhole_stereo_dataset.py](scripts/prepare_g1_pinhole_stereo_dataset.py)
 
@@ -202,17 +234,150 @@ G1 `prepare` 一定生成
 | --- | ---: | --- |
 | `--sequence` | `000000` | G1 标定和 pose 序列号 |
 | `--max-delta-ms` | `10.0 ms` | 左右目最大配对时间差；超过则不配对 |
-| `--horizontal-fov-deg` | `100°` | 虚拟针孔水平视场 |
-| `--down-fov-deg` | `28°` | 输出中保留的光轴下方视场 |
-| `--rectification-roll-deg` | `0°` | 虚拟相机绕光学 X 轴的公共旋转 |
-| `--camera-quaternion-order` | `auto` | 原始头部相机四元数顺序；可固定为 `xyzw` 或 `wxyz` |
-| `--stereo-calibration-report` | 无 | 同一未改变双目 rig 的已验证固定双目标定报告；正式运行建议提供 |
-| `--recommended-max-depth-m` | `5.0 m` | 写入数据集，作为后续深度和融合的推荐最大距离 |
+| `--input-projection-model` | `auto` | `g1_20260724` 原始 PNG 不得使用 `auto`：它会被路径/ROI 误判为 `pinhole_rectified`；诊断或重新物化时显式使用 `pinhole_unrectified`。已经应用验收校正的产物改走 `prepared-stereo` |
+| `--horizontal-fov-deg` | `100°` | 只适用于真正的原始 Kannala-Brandt 输入；已单目去畸变的 PNG 忽略 |
+| `--down-fov-deg` | `28°` | 只适用于真正的原始 Kannala-Brandt 输入；已单目去畸变的 PNG 忽略 |
+| `--rectification-roll-deg` | `0°` | 当前实验保持 `0°`；共同立体校正旋转必须来自固定报告，不得再叠加经验 roll |
+| `--camera-quaternion-order` | `auto` | 不得在建图任务中直接依赖 `auto`；必须把候选四元数解释与采集保存的旋转矩阵比较，并显式固定误差较小的 `xyzw` 或 `wxyz`。当前 `orientation_xyzw`/`poses.txt` 格式必须传 `xyzw` |
+| `--stereo-calibration-report` | 无 | 同一未改变 rig 才能复用。当前参数解析器尚不能直接读取本次 `best_combination.json`，不得把格式不兼容的文件强行传入 |
+| `--right-rectification-report` | 无 | LiDAR 右目单应报告不是本次 V1/V2 联合校正的替代品；最终组合包含左右基础单应和右目 x 不变的 y 残差模型 |
+| `--recommended-max-depth-m` | `65.535 m`（新运行显式传入） | 取消 5 m 业务截断；该值是 `uint16` 毫米格式上限 |
+
+用于构建地图的 G1 运行必须把相机 pose 表达到 `map` 坐标系，不能沿用入口默认的
+`odom` 坐标系。准备阶段必须显式传 `--base-pose-source map`，并按绝对时间分别插值
+`map_T_base_link` 和 `base_link_T_head_camera`，最终组合为：
+
+```text
+map_T_camera = map_T_base_link @ base_link_T_head_camera
+```
+
+不得把 `odom_T_base_link` 当作 `map_T_base_link`，也不得通过经验性旋转相机来补偿坐标系
+使用错误。旋转策略必须由数据支撑：当采集已提供可信的 map pose 时，固定地面标定默认只
+应用有证据的深度尺度，并使用 `--floor-rotation-policy identity` 保留源相机旋转；只有同一
+未改变 rig 的标定报告能够证明所需旋转、且应用后的重力/重投影/时序几何指标共同改善时，
+才允许选择 `report`。选择依据和对比指标必须写入本次运行报告。
+
+四元数存储顺序也属于旋转证据，不能由“相机看起来大致朝前”猜测。准备前应分别按
+`xyzw` 和 `wxyz` 解释 `aux_poses.jsonl` 的头部相机四元数，并与采集保存的
+`poses.txt` 旋转矩阵计算角误差；只有误差接近数值精度的解释可以使用。例如
+`g1_20260724` 按 `xyzw` 的角误差约为 `2.9e-11°`，强制重排成 `wxyz` 的误差约为
+`20.95°`，因此该格式必须显式传 `--camera-quaternion-order xyzw`。错误顺序会在转头段
+造成大范围时序重投影失败，不能用更强深度过滤掩盖。
+
+当前准备脚本从 `state/<sequence>/map_pose.jsonl` 读取标准
+`map_T_base_link` 流。若采集器把同样的数据写在 `manifest.jsonl` 的
+`poses.values.map` 中、但没有生成独立文件，先使用仓库脚本创建只含符号链接和规范化 pose
+流的 staging 数据集，不修改原始采集：
+
+```bash
+python scripts/stage_g1_map_pose_dataset.py \
+  --src /path/to/g1_capture \
+  --output data/g1_map_pose_stage
+```
+
+staging 脚本会硬性核验每条记录的方向为 `target_frame=map`、
+`source_frame=base_link`，并要求 pose 时间严格递增。后续 `--src` 必须指向该 staging
+目录，同时仍显式传 `--base-pose-source map`。
 
 质量要求：原始 manifest 的 layout 必须为 `capture4daaam_like`，其
-`quality_report.alignment.ok` 必须为真；输入必须是 Kannala-Brandt 模型、两相机分辨率
-一致、baseline 为正，且标定报告中的内参、畸变、baseline、旋转和当前采集的极线几何
-必须通过验证。
+`quality_report.alignment.ok` 必须为真；存储图像分辨率必须与输入虚拟内参一致、畸变为
+零、左右分辨率一致、baseline 为正，并通过时间配对、相机顺序和极线误差检查。
+“原样整理”模式的输出 PNG 才要求与输入逐字节一致；当输入经实验证明尚未立体校正时，
+输出哈希必然变化，必须改为保存输入哈希、组合标定报告哈希、左右变换、有效区域和输出
+哈希，不能把有依据的像素变换误报为重复校正。
+
+### 2.4 `g1_20260724` V1/V2 组合标定经验
+
+复现实验：
+[scripts/optimize_g1_v1_v2_stereo_combination.py](scripts/optimize_g1_v1_v2_stereo_combination.py)
+
+验收报告：
+[output/g1_20260724_v1_v2_optimal_combination_653_953_final/best_combination.json](output/g1_20260724_v1_v2_optimal_combination_653_953_final/best_combination.json)
+
+本实验固定 `cam0=左目`，使用 653–953 共 301 帧。按帧位置每第 5 帧留出，240 帧只用于
+拟合，61 帧只用于最终验证。结论不是把 V1/V2 的矩阵逐元素平均，而是按职责组合：
+
+原始 PNG 不做任何联合校正时，301 帧的帧中位 `abs(dy)` P50 为 `2.222 px`、帧内 P95
+的 P50 为 `7.020 px`、正视差比例 P50 只有 `31.2%`，严格通过为 `0/301`。因此“文件名为
+`2d_rect`”与“可直接做水平视差”在本数据上明确不等价。
+
+| 信息来源 | 最终职责 |
+| --- | --- |
+| 当前 PNG 的 CameraInfo | 输入像素的虚拟针孔 K；左右 `D=0`，不得再次 fisheye 去畸变 |
+| V1 | 有效 `cam1_from_cam0` 位姿优化初值；最终旋转与 V1 仅相差约 `0.196°` |
+| V2 | `60.1930859728 mm` 公制基线、目标 K、P1/P2/Q 和深度尺度 |
+| 当前训练帧匹配 | 在 V1 初值附近优化有效相对旋转和平移方向，并拟合右目 x 不变的 y 残差 |
+| 留出帧 | 只验收，不参与位姿、内参候选或 y 残差拟合 |
+
+候选选择必须先满足总体正视差和有效区域硬门，再比较严格通过率和垂直误差。只按
+`abs(dy)` 排序会选中错误解：例如 0.75 权重的 V2 原始内参候选虽然垂直残差更小，但训练
+总体正视差只有 `85.1%`、严格通过率只有 `52.1%`。最终选择不混入 V1/V2 原始内参，而使用
+当前 CameraInfo K；训练总体正视差 `98.81%`、严格通过率 `90.42%`。
+
+最终留出结果为：汇总 `abs(dy)` P50/P95=`0.195/0.859 px`，正视差 `99.00%`，
+严格通过 `56/61`，共同有效图像面积 `94.84%`。完整 301 帧严格通过 `273/301`。
+5 个留出失败帧均因逐帧正视差比例低于 `95%`，其垂直 P95 仍为 `0.70–1.75 px`；因此
+深度阶段仍必须屏蔽 `d<=0`、遮挡、左右一致性失败和低置信度像素。
+
+组合候选的最低验收门固定为：
+
+| 门 | 阈值 |
+| --- | ---: |
+| 留出集“逐帧 `abs(dy)` 中位数”的 P50 | `<=1 px` |
+| 留出集“逐帧 `abs(dy)` P95”的 P50 | `<=3 px` |
+| 留出匹配总体正视差比例 | `>=95%` |
+| 留出严格通过帧比例 | `>=90%` |
+| 左右共同有效图像面积 | `>=75%` |
+
+单帧严格通过同时要求 `abs(dy)` 中位数 `<=1 px`、P95 `<=3 px`、正视差 `>=95%`、
+有效匹配 `>=90%`。选型必须先过硬门，不能用更低的垂直残差补偿错误视差方向或过度裁剪。
+
+V2 的 R1/R2 经 OpenCV 重生成和合成三维点实验确认是标准的“相机到校正相机”正向旋转，
+并非按逆映射方向保存。对当前 PNG 直接或转置套用 R1/R2 都不是最终方案：文件方向正确，
+但它描述的源像素/虚拟 K 与当前已单目去畸变 PNG 不一致。不得为适配当前 PNG 而篡改
+R1/R2 语义。
+
+最终像素处理顺序必须固定为：
+
+```text
+当前左右 PNG（已单目去畸变，D=0）
+  -> 左目 source_to_rectified_left_H
+  -> 右目 source_to_rectified_right_base_H
+  -> 右目 right_y_projective_x_preserving（x 保持不变）
+  -> 正视差 d = x_left - x_right
+  -> Z_m = 25.11911653856251 / d_px
+```
+
+其中 `fx=417.3090004041 px`、`baseline=0.06019308597284 m`、
+`fx*baseline=25.11911653856 px·m`。右目残差模型不改变 x，因此仍可使用报告中的 P1/P2/Q
+计算公制深度。该实验只验证极线对齐、视差符号和图像覆盖；绝对深度精度仍必须用 LiDAR
+或已知距离独立验证。
+
+本数据集完整物化后的 Fast-FoundationStereo + LiDAR 实验进一步确认，V2 标称 baseline
+不能直接作为最终公制尺度。以偶数输出帧折的 61 个跨时段样本拟合、奇数输出帧折的 61 个
+互不重叠样本留出，得到固定 `depth_scale=0.8426534188`。在留出折 0.25–5 m、已通过左右
+一致性的 LiDAR 投影像素上，中位绝对相对误差由 `21.68%` 降到 `7.59%`，中位绝对误差由
+`0.526 m` 降到 `0.164 m`，中位有符号误差为 `0.024 m`。因此本数据最终采用
+`effective_baseline=0.05072190968 m`，不追加图像坐标旋转：
+
+```text
+Z_raw_m = 25.11911653856 / d_px
+Z_final_m = 0.8426534188 * Z_raw_m = 21.16670942782 / d_px
+```
+
+拟合和留出证据分别保存在
+`output/g1_20260724_v1_v2_lidar_scale_train_fold0_61/` 与
+`output/g1_20260724_v1_v2_lidar_scale_holdout_fold1_61/`，固定应用报告为
+`output/g1_20260724_v1_v2_lidar_depth_scale_calibration.json`。该结果只绑定当前未改变
+rig、组合校正和报告哈希；不得外推到换相机或重新安装后的设备。
+
+组合报告由
+[scripts/materialize_g1_v1_v2_rectified_dataset.py](scripts/materialize_g1_v1_v2_rectified_dataset.py)
+物化为完整 `prepared-stereo`。该脚本只做一次图像插值，保存源图/报告/输出哈希、有效
+区域、P1/P2/Q、绝对时间绑定和校正后的 `map_T_camera`；它不会再次做 fisheye 去畸变。
+`run_stereo_mapping.py` 仍不直接消费组合 JSON，必须先显式运行物化脚本，再用
+`--adapter prepared-stereo`。不得把原始 `g1_20260724/2d_rect` 直接送入深度后端，也
+不得继续用 `--input-projection-model pinhole_rectified` 绕过这一门。
 
 ## 3. 高质量离线链路的逐步流程
 
@@ -258,17 +423,23 @@ Dashboard 的进度来自阶段报告、已提交帧数和受管子进程状态�
 显示“成功”，但它只表示计划生成成功；应同时检查命令中是否仍有 `--dry-run`、运行目录
 是否存在，以及目标 stage 是否产生了对应报告。
 
-### 步骤 1：双目同步、针孔化和位姿绑定（`prepare`）
+### 步骤 1：双目同步、立体校正物化和位姿绑定（`prepare`）
 
-**作用。** 把原始 G1 鱼眼双目、相机标定、机器人/头部位姿和绝对时间整理成所有后续
-模块都能使用的针孔双目数据集。它解决的是“同一帧到底是哪两张图、对应哪一个 pose、
-发生在什么时间、应使用什么内参”的基础问题。这里绑定错误会系统性污染所有深度和地图，
-后续优化无法可靠补救。
+**作用。** 把 G1 双目、相机标定、机器人/头部位姿和绝对时间整理成所有后续模块都能
+使用的、已经通过水平极线验收的针孔双目数据集。它解决的是“同一帧到底是哪两张图、
+对应哪一个 pose、发生在什么时间、应使用什么内参，以及是否真的能够做水平视差”的基础
+问题。这里绑定或校正错误会系统性污染所有深度和地图，后续优化无法可靠补救。
 
-**核心原理。** 对左右相机时间戳做最近邻配对并应用同步门；根据 Kannala-Brandt
-鱼眼模型和已验证双目外参，把两幅图重投影到公共虚拟针孔相机；将机身、头部和相机外参
-组合成 `world_T_camera`；最后把图像、pose 行和绝对纳秒时间写入 `tick_index.json`。
-输入为 `prepared-stereo` 时不再重投影，而是把该输入视为已经完成上述契约的结果。
+**核心原理。** 对左右相机时间戳做最近邻配对并应用同步门。必须先区分两种输入：
+
+- 已经由独立报告证明水平立体校正的 `prepared-stereo`：不再重投影，保留像素和 K；
+- 只完成单目去畸变的针孔 PNG：`D=0`，不再调用 fisheye undistort，但必须按固定报告对
+  左右图做共同立体校正并更新 K/P/Q。
+
+`g1_20260724/2d_rect` 属于第二种，不能再按 `pinhole_rectified` 逐字节复制。随后将机身、
+头部和左目校正相机外参组合成 `world_T_camera`，并把图像、pose 行、绝对纳秒时间和标定
+provenance 写入 `tick_index.json`。真正未做单目去畸变的 Kannala-Brandt 原始像素才允许
+走 fisheye 到虚拟针孔分支。
 
 **输入与输出。** G1 模式读取原始双目、标定、pose/time 和采集质量报告，输出
 `01_pinhole/rgb/`、`stereo_right/`、`pose/`、`camera_info.json`、`tick_index.json` 与
@@ -278,14 +449,19 @@ Dashboard 的进度来自阶段报告、已提交帧数和受管子进程状态�
 **参数影响。** 关键参数见第 2.3 节。调参时还应理解：
 
 - `max_delta_ms` 越小，同步更严格但可能丢掉更多配对；越大则运动场景中的左右错时风险更高；
-- `horizontal_fov_deg` 越大，覆盖范围更广，但边缘拉伸、无效重投影区域和远处细节压缩更明显；
-- `down_fov_deg` 决定保留多少地面视野，过小可能缺少地面，过大可能牺牲前向区域；
+- `input_projection_model` 对 `g1_20260724` 原始 PNG 必须显式识别为
+  `pinhole_unrectified`；`auto` 基于路径和 ROI 会产生错误结论；
+- `horizontal_fov_deg` 和 `down_fov_deg` 只作用于真正的原始 Kannala-Brandt 输入，
+  当前已单目去畸变图像不得使用；
 - `camera_quaternion_order=auto` 依赖数据证据判断顺序，已知采集格式时固定顺序更容易审计；
+- 不得用单个 LiDAR 右目单应代替本次左右共同校正；LiDAR 应作为深度输出的独立验证；
 - `recommended_max_depth_m` 只写入下游建议值，不会在本阶段生成或裁剪深度。
 
 **状态与质量判断。** 重点检查 `matched_pairs`、`max_matched_delta_ms`、左右跳过数量、
-`remap_valid_ratios`、虚拟内参以及 pose 插值是否被 clamp。通过条件是数据结构完整，所有
-保留帧的图像、pose 和绝对时间一一对应；仅仅生成 `01_pinhole/` 目录还不够。
+输入/输出左右图 SHA-256、组合标定报告哈希、校正后 K/P/Q、有效区域以及 pose 插值是否
+被 clamp。通过条件是数据结构完整、当前投影模型有显式证据、留出极线验收通过，且所有
+保留帧的图像、pose 和绝对时间一一对应。仅仅生成 `01_pinhole/` 目录、看到 `2d_rect`
+路径或检测到 `D=0` 都不够。
 
 ### 步骤 2：内容安全关键帧选择（`select`）
 
@@ -367,9 +543,24 @@ wrapper 恢复时会优先读取 `fast_foundation_stereo_run.json`。第 7.1 节
 depth_m = fx * baseline_m / disparity_px
 ```
 
-输出是 `uint16` 毫米深度；无效、非有限、负视差和超过最大深度的像素置零。默认 Fast
-方案把 `maximum_depth_m` 固定为 **5.0 m**：必须显式传 `--max-depth-m 5.0`，超过 5.0 m
-的输出写为零。这里是深度有效范围上限，不是 Hydra TSDF 的 `truncation_distance`。
+对 `g1_20260724` 的验收组合，必须使用报告中的校正后参数：
+
+```text
+fx = 417.3090004040853 px
+baseline = 0.060193085972838754 m
+disparity = x_left - x_right
+depth_m = 25.11911653856251 / disparity_px
+```
+
+这些参数只适用于已经依次应用左右基础单应和右目 x 不变 y 残差校正的输出，不能用于原始
+`2d_rect` PNG。深度后端启动前应抽查匹配点，至少确认垂直误差、正视差比例、共同有效
+区域和 P2/Q 的 baseline 编码与固定报告一致。
+
+输出是 `uint16` 毫米深度；无效、非有限和负视差像素置零。新运行必须显式传
+`--max-depth-m 65.535`，从而取消原有 5.0 m 业务截断。这里的 65.535 m 是 `uint16`
+毫米存储格式上限，不是质量承诺，也不是 Hydra TSDF 的 `truncation_distance`。原始
+float 深度超过该格式上限时仍无法写入 PNG；若未来确需更远距离，应改为 float32 深度格式，
+而不是继续增大本参数。
 
 默认 `left-right` 置信度模式还会交换左右图再推理一次，把左图像素投到右图并比较正反
 视差；差异超过 `max(0.75 px, disparity * 0.03)` 的像素视为不一致。这个检查能去掉遮挡
@@ -400,7 +591,7 @@ depth_m = fx * baseline_m / disparity_px
 | `--volume-builder` | `triton` | 可选 `triton` 或 `pytorch1`；默认 Triton |
 | `--confidence-mode` | `left-right` | 每帧双向推理并生成一致性证据；`validity` 仅适合显式速度实验 |
 | 左右绝对/相对容差 | `0.75 px / 0.03` | 左右一致性阈值 |
-| `--max-depth-m` | **`5.0 m`** | 默认 Fast 方案的硬上限；超过 5.0 m 的像素清零 |
+| `--max-depth-m` | **`65.535 m`（新运行显式传入）** | 取消 5 m 业务截断；只保留 `uint16` 毫米格式边界 |
 | `--warmup` | `1` | 正式计时前的暖机次数 |
 
 可选原版 FoundationStereo 保留以下 profile：
@@ -414,17 +605,18 @@ depth_m = fx * baseline_m / disparity_px
 选择原版时，`run_stereo_mapping.py` 总是把自身的 `--valid-iters` 默认值 `32` 传给深度
 脚本。因此仅写 `--depth-profile online` 仍会得到 32 iterations；要使用完整在线设置，应
 同时显式设置 `--valid-iters 8 --depth-scale 0.15 --depth-precision fp16`。原版的
-`--max-depth-m` 可以独立设置，不改变默认 Fast 方案固定为 5.0 m 的约定。
+`--max-depth-m` 可以独立设置；新运行同样必须显式设为 `65.535`，不能依赖旧的 5.0 m
+默认值。
 
 **参数影响。** Fast 默认不使用原版的 `depth_scale/profile/precision` 旋钮；主要速度与
 质量参数是 `iters`、`max_disp`、`volume_builder` 和 `confidence_mode`。增加 iterations
 通常更慢；`left-right` 相比 `validity` 约增加一次模型调用，却能提供可审计的遮挡和错误
-匹配证据，因此默认必须保留。5.0 m 是地图链统一的最大有效距离；调参实验若改变它，必须
-使用独立运行目录，不能仍标记为默认 Fast 配置。
+匹配证据，因此默认必须保留。取消 5 m 截断会暴露更多小视差远距离结果，但不保证其准确；
+应依赖左右一致性、时序一致性和雷达独立验证判定质量，不得再按距离先验直接清零。
 
 **状态与质量判断。** 进度以 `processed / frames_requested` 和已提交
 `depth_metadata/*.json` 数量为准。默认 Fast 完成后必须检查 `status=complete`、`failed=0`、
-`settings.maximum_depth_m=5.0`、`artifacts.verified=true`、
+`settings.maximum_depth_m=65.535`、`artifacts.verified=true`、
 `aggregate.mean_valid_ratio`、`mean_left_right_consistency`、每帧低有效率尾部、推理耗时和
 峰值显存。有效率低意味着覆盖不足，不必然意味着保留深度错误；还要结合步骤 5 和步骤 10
 的跨帧一致性判断。选择原版时读取 `foundation_stereo_run.json` 中的同类字段。
@@ -443,18 +635,20 @@ baseline，并把旋转右乘到每一帧 `world_T_camera`。RGB、帧顺序和�
 | 参数 | 默认/要求 | 作用 |
 | --- | --- | --- |
 | `--floor-calibration-report` | G1 继续建图时必填 | 同一固定 rig 的已验证地面/相机坐标校准 |
-| `--geometry-max-depth-m` | `5.0 m` | 校准和后续几何处理使用的最大深度 |
+| `--floor-rotation-policy` | `report` | `identity` 时只应用深度尺度并保持所有相机旋转不变 |
+| `--geometry-max-depth-m` | `65.535 m`（新运行显式传入） | 不在校准和后续几何处理中恢复 5 m 截断 |
 
 G1 不允许每次采集独立拟合一个“看起来平”的地面；必须使用已验证的固定报告。
-该步骤会同时执行三个动作：把所有有效深度乘固定 `depth_scale` 并按最大深度裁剪、
-把 `camera_info.json` 的 baseline 更新为 `effective_baseline_m`，以及对
-`world_T_camera` 右乘固定相机旋转校正。`prepared-stereo` 可以不提供报告，此时直接使用
-选择后的数据集，不执行这三项 G1 校正。
+该步骤会把所有有效深度乘固定 `depth_scale` 并按最大深度裁剪，同时把
+`camera_info.json` 的 baseline 更新为 `effective_baseline_m`。只有
+`floor_rotation_policy=report` 时才对 `world_T_camera` 右乘报告中的相机旋转；
+`identity` 明确保留源相机旋转，报告中的建议角度只作为审计信息。
+`prepared-stereo` 可以不提供报告，此时直接使用选择后的数据集，不执行 G1 校正。
 
 **参数影响。** `floor_calibration_report` 不是可随意调节的场景参数，必须来自同一未改变
 rig 的验证结果；错误报告会造成全局系统误差。`geometry_max_depth_m` 控制校准后以及步骤
-5–11共同使用的深度范围。默认 Fast 方案必须保持为 5.0 m；如果下游值更小，已经估计出的
-远处深度会在这里再次被清零。选择原版 FoundationStereo 时也应保证模型输出与下游上限一致。
+5–11共同使用的深度范围。新运行必须保持为 65.535 m；如果任一下游值仍为旧默认 5.0 m，
+已经估计出的远处深度会在这里或后续阶段再次被清零。
 
 **状态与质量判断。** 输出为 `03_geometry/` 和
 `floor_calibration_application.json`。检查 `depth_scale`、`effective_baseline_m`、
@@ -486,7 +680,7 @@ rig 的验证结果；错误报告会造成全局系统误差。`geometry_max_de
 | `pixel-step` | `4` |
 | `forward-only` | 开启 |
 | `require-time-contract` | 开启 |
-| 有效深度范围 | `0.25..geometry-max-depth-m`，默认 `0.25..5 m` |
+| 有效深度范围 | `0.25..geometry-max-depth-m`，新运行为 `0.25..65.535 m` |
 | 绝对/相对深度容差 | `0.04 m / 0.03` |
 
 该阶段输出 `04_temporal_input/temporal_depth_consistency_report.json`，不直接修改深度，
@@ -532,7 +726,7 @@ Lowe ratio test 建立图像对应；借助两帧深度把匹配点反投影为�
 | feature ratio test | `0.65` | 局部特征匹配过滤 |
 | 最大旋转误差 | `3°` | RGB-D/视觉约束接受门 |
 | odometry/position prior sigma | `0.25 / 0.75 m` | 相邻里程计和位置先验权重 |
-| 最大深度 | `5.0 m` | 参与约束的深度上限 |
+| 最大深度 | `65.535 m` | 新运行不恢复 5 m 截断；远距离点仍需通过几何质量门 |
 
 输出为 `05_rgbd_window_graph/` 和 `trajectory_refinement.json`。可靠局部约束数量还必须
 达到 `max(12, floor(keyframe_count / 4))`，否则阶段失败。
@@ -581,10 +775,17 @@ watchdog，过大可能出现长段缺少约束。`local_neighbor_span` 决定�
 | dense forward/reverse fitness | `0.30 / 0.20` | 双向稠密配准门 |
 | dense 最大 ICP RMSE | `0.045 m` | 稠密配准误差门 |
 | 最大候选平移/相对先验旋转 | `4.5 m / 45°` | 排除不合理闭环 |
-| 最大深度 | `5.0 m` | 几何验证范围 |
+| 最大深度 | `65.535 m` | 新运行的几何验证范围 |
 
 硬门：`loop_closure_report.json` 中 `verified_count` 必须至少为 1；否则全局优化和
 Hydra 都被阻断。
+
+如果采集设计已经明确证明整段轨迹没有任何空间回访，则闭环不属于该数据集的可验收
+指标，不应浪费计算运行候选检索，也不能把 `verified_count=0` 误写成几何失败。此时必须
+同时使用 `--skip-loop-closure-validation --preserve-source-trajectory`：前者生成
+`status=skipped`、`skip_reason=no_revisit_by_capture_design` 的审计报告，后者保证后续
+输出逐元素保留权威 map pose。禁止在可能存在回访、或需要用闭环修正漂移的数据上使用该
+开关。
 
 **参数影响。** `loop_dense_candidate_count` 越大，纹理弱场景找到闭环的机会越高，但
 FPFH/RANSAC/ICP 成本明显增加。最低 inlier、fitness 门越高越保守；RMSE、3D error、
@@ -664,7 +865,7 @@ edge。
 | `--temporal-filter-scale` | `0.5` | 过滤分析分辨率比例 |
 | `--temporal-filter-min-judged` | `3` | 一个像素至少要有 3 个可判断邻居 |
 | `--temporal-filter-min-support` | `0.5` | 至少一半邻居支持当前深度 |
-| 有效深度范围 | `0.25..5.0 m` | 过滤范围 |
+| 有效深度范围 | `0.25..65.535 m` | 新运行的过滤范围 |
 | 绝对/相对容差 | `0.05 m / 0.04` | 跨帧深度支持门 |
 
 该步骤使用全局优化 pose 重投影并过滤原始深度；被拒绝像素对应的 confidence 和
@@ -681,6 +882,39 @@ consistency 会同步清零，occlusion 基本复制，并在 metadata 中记录
 `rejected_valid_ratio`、左右证据覆盖率，以及 `poses_preserved`、
 `rgb_frames_preserved`、`absolute_time_contract_validated`。删除比例为零不一定最好，过高
 也不一定更可靠；应结合步骤 10 的一致率和步骤 11 的点云连续性判断。
+
+`65.535 m` 是原始 `uint16` 深度的存储上限，不等于所有距离都已经通过目标 rig 的融合
+可靠性验收。如果完整范围的步骤 11 预览出现远距放射状飞点，必须按多个距离上限生成诊断
+预览并保存点数、边界和图像证据。不得把数据集声明的
+`recommended_max_depth_m=65.535` 直接当作 Hydra 相机量程：Hydra 会沿有效深度射线分配
+TSDF，完整范围必须先用 1–3 帧做峰值 RSS/体素分配预检。2026-07-24 的 G1 数据在第 3 帧
+达到约 126.7 GB 匿名内存并被 Linux OOM killer 终止，证明当前 5 cm TSDF 不能无上限融合。
+
+准实时入口必须区分两个范围。`--maximum-depth-m` 描述运行时深度产品范围；本数据保持
+`65.535 m`，因此不会清零或覆盖 5 m 外的原始/过滤深度。`--hydra-maximum-range-m`
+则是 Hydra 相机模型的有限视锥/分配范围，必须由几何预览、资源预检和全量质量门共同确定。
+它会限制 Hydra 本次融合可使用的观测距离，但不能反向改写深度产品，也不能被表述为新的
+数据集深度上限。
+
+Hydra 预检按实际 C++ 分配逻辑计算：
+
+```text
+block_size = voxel_size * voxels_per_side
+max_steps = ceil(hydra_maximum_range / block_size) + 1
+cube_candidate_blocks = (2 * max_steps + 1)^3
+```
+
+5 cm、每块 16 voxel 时，把 `65.535 m` 误作 Hydra range 会产生
+`max_steps=83`、`4,657,463` 个立方候选块；历史 5 m 只有 `4,913` 个，候选规模约增大
+949 倍。这解释了第 3 帧约 126.7 GB RSS，而不是普通逐帧内存泄漏。代码现在默认在
+`100,000` 个候选块处硬失败，危险配置会在 Hydra 初始化前被拒绝。
+
+2026-07-24 G1 当前通过的资源配置是：深度产品 `65.535 m`、Hydra range `8 m`、
+背景 TSDF `12 cm`、每块 16 voxel；对应 `max_steps=6`、`2,197` 个候选块。819 帧几何
+预检完成 819/819、0 drop，global P95 `168.17 ms`、峰值 RSS `4,875,180 kB`，质量门
+通过。若要把 Hydra range 扩大到 8 m 以上，必须重新做短序列 RSS 预检和全量质量验证；
+不能使用“无限值”，也不能静默恢复历史 5 m。距离 A/B 必须写入独立运行目录和
+provenance。
 
 ### 步骤 10：最终深度质量门（`validate`）
 
@@ -733,7 +967,7 @@ consistency 会同步清零，occlusion 基本复制，并在 metadata 中记录
 | `--fusion-frame-step` | `10` | 每 10 帧做预览融合 |
 | `--fusion-pixel-step` | `8` | 点云采样步长 |
 | `--fusion-voxel-size-m` | `0.035 m` | 预览体素尺寸 |
-| 有效深度范围 | `0.25..5.0 m` | 预览采样范围 |
+| 有效深度范围 | `0.25..65.535 m` | 新运行的预览采样范围 |
 | render sample / seed | `180000 / 0` | 预览渲染采样数和确定性随机种子 |
 
 这里的“融合”是采样 RGB-D 点云后做 voxel 去重，不是 TSDF；即使不落在固定步长上，
@@ -785,7 +1019,7 @@ corrections、日志和运行报告；但本节开头所述旧式 wrapper 输出
 | `--hydra-config-path` | `config/hydra_g1_high_quality.yaml` | Hydra TSDF、对象、place、room 和 backend 参数 |
 | `--labelspace-path` | 建议 `config/labels_pseudo.yaml` | Hydra labelspace；必须与 pipeline YAML 的 `semantic_config_path` 一致 |
 | `--labelspace-colors` | 建议 `config/labels_pseudo.csv` | 语义可视化颜色 |
-| `--depth-lb/--depth-ub` | `0.25 / 5.0 m` | DAAAM 对象深度有效范围；一键入口覆盖 pipeline YAML 上限 |
+| `--depth-lb/--depth-ub` | `0.25 / 65.535 m`（新运行显式传入） | DAAAM 对象深度有效范围；不恢复 5 m 截断 |
 | `--fps` | `10` | 缺少真实时间时的后备帧率；有绝对时间时优先使用真实时间 |
 | `--query-interval-frames` | `90` | 离线 assignment 触发周期 |
 | `--target-fps` | 无 | 未设置时一键入口加 `--no-throttle`，尽快处理 |
@@ -865,8 +1099,8 @@ YAML 不能获得更高的推理分辨率。
 
 1. mask 内有效深度像素必须至少占 `25%`；
 2. 记录最近 `10` 次 mask 中位深度；
-3. 最近历史中位数应在 `depth_lb..depth_ub`，通用配置和 G1 一键入口均默认为
-   `0.25..5.0 m`；
+3. 最近历史中位数应在 `depth_lb..depth_ub`；现有代码默认上限仍为 `5.0 m`，新运行
+   必须显式覆盖为 `0.25..65.535 m`，否则语义对象阶段会重新引入 5 m 截断；
 4. 当前代码有一个背景物体例外：mask 面积达到
    `min_mask_region_area * 30 = 9000 px` 时，即使历史中位深度越界也会视为有效；
 5. 对有效 mask，使用 mask 中心像素和中位深度反投影为相机坐标，再用
@@ -935,7 +1169,7 @@ slack 和 position/size weight 来调度实体；有效资格门是 CLI
 
 | 参数 | 当前值 | 作用 |
 | --- | --- | --- |
-| `dam_model_path` | `nvidia/DAM-3B` | 区域开放词汇描述模型 |
+| `dam_model_path` | `checkpoints/dam/DAM-3B` | 已完整缓存并校验的本地 DAM-3B 快照；运行期禁止依赖网络下载 |
 | `dam_conv_mode` | `v1` | DAM 对话模板 |
 | `dam_prompt_mode` | `focal_prompt` | 聚焦 mask 区域 |
 | 固定区域问题 | `Describe what you see in this region.` | 每个 mask 的描述请求 |
@@ -1022,6 +1256,15 @@ FastSAM mask 首先得到临时语义 ID。DAM 返回自然语言描述后，以
 当前 G1 基线配置：
 [config/hydra_g1_high_quality.yaml](config/hydra_g1_high_quality.yaml)。桌面小物体配置：
 [config/hydra_g1_tabletop.yaml](config/hydra_g1_tabletop.yaml)。
+
+2026-07-24 数据的资源安全配置为
+[config/hydra_g1_8m_12cm.yaml](config/hydra_g1_8m_12cm.yaml)：Hydra 相机/对象范围
+`8 m`、map window `10 m`、背景 TSDF `12 cm`、truncation `36 cm`，对象重建仍独立使用
+`2 cm` 分辨率。该配置来自上述候选块预检、3 帧 A/B 和 819 帧纯几何回放，不是经验性猜测。
+需要注意，纯几何回放的 `global` service P95 为 `180.58 ms`，不代表 exact-label
+对象重建也必然满足同一 `250 ms` 门；`g1_20260724_v1_v2_semantic_map` 中 153 个对象使该
+指标升至 `305.46 ms`。后续若要做权威验收，应优化对象重建开销后从零完成单次全量运行，
+不能事后放宽阈值或减少语义对象来把已有报告改成 PASS。
 
 ### 5.1 TSDF 和活动窗口
 
@@ -1114,7 +1357,7 @@ DAM 观测次数、距离门后的实例标签像素数、Khronos tracker confid
 
 | 参数 | 默认值 | 作用 |
 | --- | ---: | --- |
-| `--rate-hz` | `1 Hz` | 最大墙钟派发率，不修改原始 `sensor_time_ns` |
+| `--rate-hz` | `1 Hz` | 最大墙钟派发率，不修改原始 `sensor_time_ns`；默认值不代表需要执行 1 Hz 时效测试 |
 | `--queue-capacity` | `8` | 每个主 stage 的有界队列容量 |
 | `--stage-deadline-ms` | 无 | 可选消息截止时间 |
 | `--drain-timeout-s` | `30 s` | 停机前等待主链排空 |
@@ -1125,6 +1368,10 @@ DAM 观测次数、距离门后的实例标签像素数、Khronos tracker confid
 主 stage 的服务能力上限固定为 pose `50 Hz`、depth `30 Hz`、dynamic/fusion/global
 各 `10 Hz`，再乘 `--stage-rate-multiplier`。这些是 worker 上限，不是地图发布频率；
 真正输入上限由 `--rate-hz` 控制。
+
+**执行约束：**正式语义地图任务不得创建 1 Hz、3 Hz 等多个运行目录做频率试跑或 A/B。
+选定一个调度值后直接完成全量建图，并以第 8 节的语义 postpass、durable commit 和质量门
+验收。仅当用户明确提出吞吐、延迟或部署容量评测时，才单独开展时效测试。
 
 这里名为 `global` 的 stage 只维护 submap/path bookkeeping，并在启用时调用 Hydra；
 它不发现闭环，也不执行第 3 节那种全局位姿图优化。实时链使用的是数据集已经提供的 pose。
@@ -1152,7 +1399,9 @@ VIO、视觉里程计或 pose estimation。
 | --- | ---: | --- |
 | `--depth-backend` | `precomputed` | 默认读取步骤 3 生成的 Fast 深度；`foundation-worker` 是可选原版后端 |
 | precomputed provenance | `fast_foundation_stereo_run.json` | 自动优先识别 Fast 报告；原版报告仍兼容 |
-| precomputed 最大深度 | `5.0 m` | 默认 Fast PNG 已清零 5.0 m 以外像素；数据集 `recommended_max_depth_m` 也必须为 5.0 |
+| precomputed 最大深度 | `65.535 m` | 新 Fast PNG 不再清零 5.0 m 以外像素；数据集 `recommended_max_depth_m` 必须为 65.535 |
+| `--maximum-depth-m` | 数据集值，本数据 `65.535 m` | 运行时深度产品范围；不等于 Hydra 分配范围 |
+| `--hydra-maximum-range-m` | `min(maximum-depth, map_window.max_radius_m)`；本数据显式 `8 m` | Hydra 相机视锥/融合范围；启动前执行候选块安全预检 |
 | precomputed 行为 | 直接读取磁盘 | 不执行模型；profile/iterations/scale CLI 不会改变已有深度，模型来源以 provenance 为准 |
 | 可选 worker `--depth-profile` | `online` | 原版 FoundationStereo worker 默认 8 iterations、0.15 scale、FP16 |
 | worker `--depth-confidence-mode` | `left-right` | 配置周期性左右验证 |
@@ -1273,7 +1522,7 @@ postpass 完成。语义旁路仍可能描述移动物体，但静态 Hydra 中�
 
 | 类别 | 当前硬门 |
 | --- | --- |
-| 时间 | 双目差 `<=10 ms`，必须针孔 |
+| 时间/双目输入 | 双目差 `<=10 ms`，必须针孔；若源图只完成单目去畸变，固定组合标定及其留出极线门必须先通过 |
 | 深度 | 有效率 `>=15%`，时序一致 `>=70%`，左右一致 `>=60%`，左右证据覆盖 `>=25%` |
 | pose | 相邻平移 `<=0.50 m`，旋转 `<=20°`，位置 std `<=0.50 m` |
 | dynamic | 静态图动态污染 `<=1%`，unknown `<=60%` |
@@ -1300,20 +1549,52 @@ semantic PASS 只证明投递链闭合且至少有 correction 成功写入真实
 
 ### 7.1 离线 G1：先运行到人工预览
 
-默认 Fast-FoundationStereo 需要三段执行。第一段只准备和选择关键帧：
+`g1_20260724` 在默认 Fast-FoundationStereo 三段执行前新增一个不可跳过的标定门。先复现
+或核验固定组合报告：
+
+```bash
+python scripts/optimize_g1_v1_v2_stereo_combination.py \
+  --dataset /path/to/g1_20260724 \
+  --v1 "/path/to/g1_20260724/calibrations/000000/New Calibration.yaml" \
+  --v2 "/path/to/g1_20260724/calibrations/000000/New Calibration_V2.yaml" \
+  --start-frame 653 \
+  --end-frame 953 \
+  --output output/g1_v1_v2_rectification_audit
+```
+
+必须检查 `best_combination.json` 中 `acceptance.passed=true`、留出严格通过率、总体正视差、
+共同有效面积和 P2/Q baseline。优化报告只生成参数和三帧预览，**不会自行物化完整校正
+数据集**。用下列受测应用阶段处理完整采集；若原始采集把 map pose 只写在 manifest，先按
+第 2.3 节生成 staging 数据集，并把它作为 `--source`：
+
+```bash
+python scripts/materialize_g1_v1_v2_rectified_dataset.py \
+  --source /path/to/g1_map_pose_stage \
+  --calibration-report output/g1_v1_v2_rectification_audit/best_combination.json \
+  --output output/g1_v1_v2_rectified_prepared \
+  --maximum-stereo-delta-ms 10 \
+  --recommended-maximum-depth-m 65.535
+```
+
+该阶段按报告固定顺序处理全部左右 PNG，保存输入/报告/输出哈希，并产出满足第 2 节时间与
+pose 契约的 `prepared-stereo`。物化后必须对完整输出执行时间、哈希和双目几何审计，不能
+只复用 653–953 帧的选型报告。第一段正式编排只选择该产物：
 
 ```bash
 python scripts/run_stereo_mapping.py \
-  --adapter g1-fisheye \
-  --src /path/to/g1_capture \
+  --adapter prepared-stereo \
+  --src /path/to/v1_v2_rectified_prepared_stereo \
   --run-dir output/g1_map \
-  --stereo-calibration-report /path/to/pinhole_preparation_report.json \
-  --recommended-max-depth-m 5.0 \
+  --recommended-max-depth-m 65.535 \
   --stop-after select
 ```
 
-第二段在 `02_selected/` 中生成默认 Fast 深度。`--max-depth-m 5.0` 是不可省略的核心
-配置；脚本还会校验 Fast 仓库 commit、checkpoint、`cfg.yaml` 和哈希：
+不得在原始 `2d_rect` 上继续使用 `--input-projection-model pinhole_rectified`；也不得把
+优化报告的预览目录伪装成完整 `prepared-stereo`。
+
+第二段在 `02_selected/` 中生成默认 Fast 深度。`--max-depth-m 65.535` 是不可省略的核心
+配置，用格式上限取消旧的 5 m 截断；脚本还会校验 Fast 仓库 commit、checkpoint、
+`cfg.yaml` 和哈希：
 
 ```bash
 python scripts/run_fast_foundation_stereo_depth.py \
@@ -1325,20 +1606,23 @@ python scripts/run_fast_foundation_stereo_depth.py \
   --max-disp 416 \
   --volume-builder triton \
   --confidence-mode left-right \
-  --max-depth-m 5.0
+  --max-depth-m 65.535 \
+  --save-raw-products
 ```
 
 第三段从已验证的 Fast 深度继续到直接融合预览：
 
 ```bash
 python scripts/run_stereo_mapping.py \
-  --adapter g1-fisheye \
-  --src /path/to/g1_capture \
+  --adapter prepared-stereo \
+  --src /path/to/v1_v2_rectified_prepared_stereo \
   --run-dir output/g1_map \
-  --stereo-calibration-report /path/to/pinhole_preparation_report.json \
+  --recommended-max-depth-m 65.535 \
   --floor-calibration-report /path/to/validated_floor_geometry_calibration.json \
-  --max-depth-m 5.0 \
-  --geometry-max-depth-m 5.0 \
+  --floor-rotation-policy identity \
+  --max-depth-m 65.535 \
+  --geometry-max-depth-m 65.535 \
+  --depth-ub 65.535 \
   --hydra-config-path config/hydra_g1_high_quality.yaml \
   --pipeline-config config/pipeline_config.yaml \
   --labelspace-path config/labels_pseudo.yaml \
@@ -1355,15 +1639,17 @@ python scripts/run_stereo_mapping.py \
 
 ```bash
 python scripts/run_stereo_mapping.py \
-  --adapter g1-fisheye \
-  --src /path/to/g1_capture \
+  --adapter prepared-stereo \
+  --src /path/to/v1_v2_rectified_prepared_stereo \
   --run-dir output/g1_map_foundation \
   --checkpoint "$FOUNDATION_STEREO_CHECKPOINT" \
-  --stereo-calibration-report /path/to/pinhole_preparation_report.json \
+  --recommended-max-depth-m 65.535 \
   --floor-calibration-report /path/to/validated_floor_geometry_calibration.json \
+  --floor-rotation-policy identity \
   --accept-foundation-stereo-noncommercial-license \
-  --max-depth-m 5.0 \
-  --geometry-max-depth-m 5.0 \
+  --max-depth-m 65.535 \
+  --geometry-max-depth-m 65.535 \
+  --depth-ub 65.535 \
   --stop-after fuse \
   --resume
 ```
@@ -1381,7 +1667,7 @@ python scripts/run_pipeline.py output/g1_map/08_temporal_depth_filtered \
   --config config/pipeline_config.yaml \
   --depth-scale 1000 \
   --depth-lb 0.25 \
-  --depth-ub 5.0 \
+  --depth-ub 65.535 \
   --fps 10 \
   --query-interval-frames 90 \
   --hydra-config-path config/hydra_g1_high_quality.yaml \
@@ -1401,10 +1687,17 @@ python scripts/run_pipeline.py output/g1_map/08_temporal_depth_filtered \
 
 以下命令使用默认 Fast-FoundationStereo 预计算深度。`--dataset` 应指向第 7.1 节产生的
 `08_temporal_depth_filtered/`，其中必须保留 `fast_foundation_stereo_run.json`，且报告中的
-`settings.maximum_depth_m` 必须为 `5.0`。将 `--depth-backend` 改为
-`foundation-worker` 会显式选择可选的原版 FoundationStereo。
+`settings.maximum_depth_m` 必须为 `65.535`。将 `--depth-backend` 改为
+`foundation-worker` 会显式选择可选的原版 FoundationStereo。启动 DAM 前还必须保证
+`checkpoints/dam/DAM-3B` 指向完整本地快照，且 OpenCLIP `ViT-L-14/openai` 权重已进入
+Hugging Face cache；用 `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1` 做启动预检，禁止把首次
+模型下载放进受 semantic startup timeout 约束的建图进程。
+
+下面命令中的 `--rate-hz 1` 只是一个单次构建的调度示例，不要求先做 1 Hz 试跑，也不得
+再追加 3 Hz 等对比运行。实际任务应使用已经确认的一个稳定值直接完成正式全量构建。
 
 ```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 python scripts/run_realtime_mapping.py \
   --dataset /path/to/prepared-pinhole-dataset \
   --run-dir output/realtime_semantic_map \
@@ -1412,13 +1705,16 @@ python scripts/run_realtime_mapping.py \
   --rate-hz 1 \
   --queue-capacity 8 \
   --depth-backend precomputed \
+  --maximum-depth-m 65.535 \
   --static-map-backend hydra \
-  --hydra-config-path config/hydra_g1_high_quality.yaml \
+  --hydra-maximum-range-m 8 \
+  --hydra-config-path config/hydra_g1_8m_12cm.yaml \
   --hydra-labelspace-path config/labels_pseudo.yaml \
   --hydra-labelspace-colors config/labels_pseudo.csv \
   --semantic-mode dam \
   --semantic-config config/pipeline_config_realtime.yaml \
   --segmentation-rate-hz 5 \
+  --semantic-queue-capacity 256 \
   --semantic-minimum-observations 5 \
   --semantic-startup-timeout-s 180 \
   --semantic-drain-timeout-s 600 \
@@ -1426,7 +1722,10 @@ python scripts/run_realtime_mapping.py \
 ```
 
 CLI 默认语义 startup/drain timeout 仍是 `120/60 s`；上面采用 `180/600 s` 是完整
-1098 帧成功运行使用的较稳妥设置。
+1098 帧成功运行使用的较稳妥设置。正式 exact-label 构建不能沿用语义队列默认容量 `2`：
+在一次 3.46 s 的前端服务尖峰中，容量 `2` 的 content-aware 队列驱逐了已经接收的单帧，
+导致后处理以 `837/838` 覆盖率硬失败。上面的容量 `256` 用于吸收这种短时尖峰；它不是
+吞吐率声明，最终仍必须检查语义队列零 drop、逐帧标签 `100%` 覆盖和 postpass 完整重放。
 
 可选原版 FoundationStereo 在线 worker 的附加参数：
 
@@ -1511,7 +1810,8 @@ python scripts/run_realtime_mapping.py \
 `--motion-analysis-width 320 --minimum-dynamic-pixels 20` 比通用 `160/40` 更敏感，目的是
 降低手、杯子等小运动区域漏入静态 TSDF 的概率，也更容易把光流噪声判为动态，必须单独
 检查 false positive。`--rate-hz 5` 只是最大派发目标，不证明整条链已经在目标 GPU 上
-达到 5 Hz；应以实际 drop ratio、service P95 和质量门决定可持续频率。
+达到 5 Hz；它同样不是频率测试指令。正式任务只执行一个已确认调度值，不再追加
+1 Hz/3 Hz/5 Hz 对比；应以实际 drop ratio、service P95 和质量门验收该次构建。
 
 如果桌面任务明确选择可选的原版 FoundationStereo 在线 worker，可把深度部分替换为：
 
@@ -1529,7 +1829,8 @@ python scripts/run_realtime_mapping.py \
 
 该组合比原版 worker 的 `online = 8 iterations / 0.15 scale` 保留更多杯口和小目标边界，
 也明显更重；需要在目标设备对延迟、显存、有效深度率和边界稳定性做 A/B。默认方案仍是
-预计算 Fast-FoundationStereo：8 iterations、全分辨率、FP16、左右一致性、最大 5.0 m。
+预计算 Fast-FoundationStereo：8 iterations、全分辨率、FP16、左右一致性、不使用 5.0 m
+业务截断（PNG 存储上限为 65.535 m）。
 上述原版 worker 参数对 `precomputed` 输入没有作用，已有深度必须依据其 provenance 判断。
 
 `pipeline_config_tabletop.yaml` 的 `depth_lb=0.20`、`depth_ub=2.0` 当前只由旧式离线
@@ -1599,6 +1900,11 @@ DAM/exact-label 路径启用时产生。建议把以下条件作为“语义地�
    hard gate 全部通过；
 6. 最终配置、模型、数据和语义标签具有可追溯 SHA-256。
 
+这些条件判定的是工程构建和持久化完整性，不等于人工 GT 语义验收。当前
+[无人工 GT 阶段](docs/g1_semantic_map_diagnostic_no_gt_stage.md) 即使全部满足，也只能写
+`diagnostic_no_gt_complete`；Mask AP、HOTA、entity/binding F1、query recall/FAR 和
+held-out 结论仍不可计算或宣称。
+
 普通 runtime 质量门允许 drop ratio `<=10%`；权威验收应额外要求所有请求帧完成、
 零 drop、零 runtime error、零 resume，并要求 clean worktree 和验证器
 `authoritative=true`。
@@ -1653,6 +1959,57 @@ python scripts/prepare_query_evidence.py \
 缺少真实证据都会失败，只有显式 `--allow-missing` 才允许部分输出。任意旧版
 “completed DAM run”并不一定满足当前 label journal/postpass 合约。
 
+### 9.4 语义位置异常必须修复上游几何契约
+
+当查询描述和机器人轨迹正确、但物体位置系统性偏离时，禁止在查询结果中平移坐标、把物体
+吸附到最近 LiDAR 点、只修改某个 entity，或根据期望位置反推一个旋转角。这些做法会隐藏
+pose、像素射线或深度源的根因。必须按以下顺序定位并重建：
+
+1. 用采集保存的 `poses.txt` 旋转矩阵核验 `orientation_xyzw`，先排除四元数顺序错误；
+2. 明确区分 TF 相机坐标系和存储图像的像素射线坐标系。即使
+   `map_T_base_link @ base_link_T_head_camera` 正确，驱动输出的 `2d_rect` 图像仍可能
+   缺失一个固定的 `tf_camera_T_image_camera`；
+3. 若元数据未给出该固定变换，只能用与目标物体无关的多帧几何证据标定，并设置留出帧。
+   当前实现以 map 坐标 LiDAR 的数据驱动地面高度、宽幅底部 FastSAM 地面 mask 和物理双目
+   X 轴为约束，在全角度范围搜索固定光学 X 轴旋转；不得读取待验证物体坐标：
+
+```bash
+python scripts/calibrate_g1_image_rotation_from_lidar.py \
+  --source-dataset /path/to/raw_capture \
+  --prepared-dataset output/<geometry-run>/08_temporal_depth_filtered_strict \
+  --label-dir output/<semantic-run>/semantic_sidecar/label_frames \
+  --lidar-map /path/to/global_cloud_cleaned.pcd \
+  --output output/<audit>/image_lidar_rotation_calibration.json
+```
+
+标定报告必须同时证明：原始四元数解释与矩阵一致、pose 为 `map` 坐标、目标物体没有参与
+标定、训练帧和留出帧的 LiDAR/地面 mask 指标均改善。地面不能观测任意 yaw；当前脚本用
+采集声明的双目 X 基线固定图像横轴，只估计绕光学 X 的缺失变换，不把错误的 `wxyz`
+解释伪装成“相机调平”。
+
+如果双目深度没有通过相机/LiDAR 独立验证，不得继续用该深度生成物体三维坐标。可保留
+RGB/FastSAM 作为语义来源，改由 map 坐标 LiDAR 提供几何，并从所有对象的多帧 mask
+统一重建，而不是修补单个查询结果：
+
+```bash
+python scripts/build_lidar_semantic_query_geometry.py \
+  --source-query-map output/<query-run-v002> \
+  --source-dataset /path/to/raw_capture \
+  --prepared-dataset output/<geometry-run>/08_temporal_depth_filtered_strict \
+  --label-dir output/<semantic-run>/semantic_sidecar/label_frames \
+  --lidar-map /path/to/global_cloud_cleaned.pcd \
+  --calibration-report output/<audit>/image_lidar_rotation_calibration.json \
+  --output-query-map /path/to/query-map-v003
+```
+
+该重建使用 `map_T_base_link @ base_link_T_head_camera_xyzw @
+tf_camera_T_image_camera` 投影全局 LiDAR，默认不设最大语义深度；每个物体由多帧 mask
+共同支持、逐像素 Z-buffer 和最近的显著连贯表面确定。成功几何必须声明
+`fastsam_masked_lidar_map_projection` 并绑定 LiDAR 与标定报告 SHA-256。没有足够 LiDAR
+证据的对象必须降为 `image_only`，不能沿用失败 RGB-D 产生的旧坐标。原版 query map
+保持不可变，重建结果写入新版本目录，最后用相同模型、相同查询和相同 LiDAR 底图生成
+前后截图验收。
+
 查询命令：
 
 ```bash
@@ -1676,8 +2033,9 @@ rebind、embedding/manifest 和 evidence 都不是 `run_stereo_mapping.py` 或
 
 当某类物体没有出现在最终语义地图中，建议按以下顺序检查，而不是直接修改“15 cm”：
 
-1. **输入**：左右目是否同步、针孔化正确、内参/baseline/pose/time 是否绑定；
-2. **深度**：mask 内是否至少 25% 有效，深度是否在 0.25–3/5 m，左右和时序是否一致；
+1. **输入**：左右目是否同步、单目去畸变与联合立体校正是否被正确区分、留出极线门是否
+   通过、K/P/Q/baseline/pose/time 是否绑定；不得仅凭 `2d_rect`、`D=0` 或水平线预览判定；
+2. **深度**：mask 内是否至少 25% 有效，是否误用了旧的 5 m 截断，左右和时序是否一致；
 3. **FastSAM**：通用配置是否达到 confidence `0.3`、mask `300 px`；桌面配置是否达到
    `0.25`、`150 px`，并检查提高到 `IoU=0.60` 后是否出现重复 mask；
 4. **BotSort**：ID 是否稳定，30 帧 buffer 和 ReID 是否成功跨过遮挡；
@@ -1695,3 +2053,61 @@ rebind、embedding/manifest 和 evidence 都不是 `run_stereo_mapping.py` 或
 
 任何物理尺寸阈值都应结合目标距离、相机内参、mask 像素、有效深度、TSDF 体素和
 对象完整重建程度共同分析，不能只用一个厘米数代表整条过滤链。
+
+## 11. D0 故障注入的证据与判定规则
+
+D0 不是“把某个数改坏后看图”，而是先验证质量采集器是否有资格参与后续选择。每类故障
+必须在查看结果前冻结：注入剂量、eligible 样本、首先应报警的模块、主效应方向、control
+误报警门和中/重剂量检出率。注入后不得换用更好看的次级指标覆盖主采集器失败。
+
+G1 473–573 的完整实例在
+`experiments/g1_20260724_473_573_v1_1/comparisons/diagnostic_gt_free_d0_all_families_20260728/`：
+13 类均已执行，主采集器严格通过 11 类；JPEG Q60 和 camera–LiDAR 时间偏移未通过。
+这说明“覆盖完整”和“D0 PASS”必须分开记录。
+
+### 11.1 故障必须路由到协议指定的首个采集器
+
+- 深度尺度优先看 E4 camera–LiDAR signed error，不能只看 E5 时序 agreement。实际负尺度
+  会改善 E5 的内部 agreement，若把 E5 当主指标会得到错误方向；E4 在冻结 LiDAR 样本上
+  能检出全部 ±5/10/20%。
+- 位姿平移/yaw 才优先看 E5 重投影误差和 agreement drop。
+- camera–LiDAR 时间偏移的严格主响应是投影有效率下降和边界误差上升。同源 LiDAR 点的
+  投影位移可以作为次级诊断，但不能用它的 100% 检出覆盖主联合告警最低 14.5% 的失败。
+- 模糊/JPEG 的 SIFT 内点保留率只代表 E3 特征可见性，不能冒充 Mask AP、ReID 或 HOTA。
+
+### 11.2 lineage 与样本分母必须冻结
+
+- 所有窗口选择使用 raw `source_idx`/`cam0_source_idx`；中间
+  `source_frame_idx` 只表示上游数组位置，禁止当 raw tick。任何混用都要使运行失效并保留
+  `POSTHOC_INVALIDATION.json`。
+- 比较深度尺度时，像素 validity 必须从 control 冻结；若在注入后重新应用深度阈值，
+  会改变样本集合并污染效应量。
+- eligible 必须描述“该注入在此样本上能发生”。例如 control dynamic mask 为 0 像素的
+  帧无法腐蚀或膨胀，不应作为漏检；G1 追加审计把每个 mask 剂量从错误的 67/76 修正为
+  67/67，同时保留原摘要和修正依据。
+- 对连续丢帧，应枚举所有可放置窗口并保存每个被删 raw tick，而不是只挑一个容易报警的
+  位置。
+
+### 11.3 注入产物与失败现场都属于正式证据
+
+每个 D0 cell 至少保存：
+
+- 注入前预注册与展开后的 CLI；
+- 修改后的图像、JPEG bitstream、mask、depth/pose、timestamp、track/entity/query
+  observation；
+- feature match、LiDAR correspondence 或重投影 pair 的原始 NPZ/JSONL；
+- 逐帧/逐对象表、control-paired delta、剂量汇总和可视化；
+- stdout/stderr、`/usr/bin/time -v`、终止异常和事后失效说明；
+- 对 cell/run 全部文件的 SHA-256 inventory 和根摘要。
+
+输出目录必须 append-only；聚合失败、路径假设错误、lineage 错误或样本集漂移时，不清理
+已经完成的 cell。修复后从新目录重跑，并在最终 failure ledger 同时链接失败运行和修复
+运行。报告中的 montage 只是入口，不能替代修改后的 PNG/JPEG/NPZ/JSONL。
+
+### 11.4 无人工 GT 时的结论上限
+
+没有 reviewed human GT 时，D0 可以验证同步、极线、时序、LiDAR、mask 面积、ID
+一致性、binding gate 和 top-1 margin 是否对已知注入响应；不能给出 Mask AP、
+HOTA/IDF1、ReID、错误 mesh 率或 query Recall/MRR/FAR。即使某个 proxy collector
+达到 100%，结论仍应写成 `diagnostic/proxy observability passed`，不能写成语义准确率
+通过或正式 winner。

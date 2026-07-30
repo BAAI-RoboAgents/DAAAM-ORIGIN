@@ -1,0 +1,69 @@
+schema: daaam.g1_semantic_map_diagnostic_gt_free.v1
+status: diagnostic_complete_existing_artifacts
+evaluation_mode: diagnostic_gt_free
+dataset: /home/user/datasets/g1_20260724
+formal_protocol: docs/g1_semantic_map_experiments_v1_1.md
+stage_protocol: docs/g1_semantic_map_diagnostic_no_gt_stage.md
+
+window:
+  start: 473
+  end: 573
+  diagnostic_exposed_tail: [558, 573]
+  original_held_out_core: [563, 573]
+  original_held_out_core_diagnostic_only: true
+  original_held_out_core_blind_test: false
+
+existing_artifacts:
+  prepared: output/g1_20260724_v1_v2_rectified_prepared
+  geometry: output/g1_20260724_v1_v2_geometry
+  semantic: output/g1_20260724_v1_v2_semantic_map
+  rectification: output/g1_20260724_v1_v2_optimal_combination_653_953_final/best_combination.json
+
+evaluation_basis:
+  allowed: [exact, proxy, unavailable, not_applicable]
+  default_without_independent_truth: proxy
+  require_no_gt_watermark: true
+  formal_ranking_allowed: false
+  semantic_accuracy_claims_allowed: false
+  held_out_final_claims_allowed: false
+  independent_held_out_sealing_skipped: true
+
+retention:
+  retain_all_intermediates: true
+  raw_numeric_products: all_frames
+  visualizations: all_frames_when_available
+  rejected_candidates: all
+  failed_samples: all
+  stdout_stderr: per_command
+  resource_telemetry: full_timeseries
+  frame_lineage: bidirectional
+  artifact_inventory: sha256_every_file
+  code_config_inventory: sha256_current_contents
+  derived_evidence_inventory: sha256_every_file
+  inventory_product_hashes: true
+  database_snapshot_policy: checkpoint_then_copy_with_wal
+  evidence_write_policy: append_new_run_never_overwrite
+  deletion_policy: forbidden_without_explicit_review
+  evidence_tiers:
+    source: immutable_hash_reference
+    stage_native: retain_full_resolution
+    derived: retain_tables_and_generation_inputs
+    presentation: never_substitute_for_native_evidence
+  overwrite_existing_artifacts: false
+  cleanup_on_success: false
+  cleanup_on_failure: false
+
+outputs:
+  root: experiments/g1_20260724_473_573_v1_1/diagnostic_no_gt
+  forensic_report_markdown: REPORT.md
+  forensic_report_html: REPORT.html
+  forensic_per_frame_table: tables/per_frame.csv
+  forensic_failure_index: failure_cases/failure_cases.jsonl
+  full_source_inventory: evidence_inventory_full/artifact_inventory.jsonl
+  full_source_inventory_provenance: evidence_inventory_full/inventory_provenance.json
+  evidence_ledger: EVIDENCE_LEDGER.md
+  native_database_and_stage_exports: native_export_bundle_20260728
+  deep_readonly_audit: ../diagnostic_no_gt_deep_audit_20260728
+  derived_bundle_inventory: ../../g1_20260724_diagnostic_evidence_seal_20260728/artifact_inventory.jsonl
+  derived_bundle_inventory_provenance: ../../g1_20260724_diagnostic_evidence_seal_20260728/inventory_provenance.json
+  independent_readonly_audit: output/g1_20260724_v1_v2_no_gt_audit

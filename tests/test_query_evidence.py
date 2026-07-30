@@ -19,6 +19,7 @@ from daaam.semantic_query import (
     SemanticQueryError,
 )
 from scripts.prepare_query_evidence import (
+    accumulated_segmentation_frame_indices,
     largest_component,
     render_evidence_image,
     render_masked_cutout,
@@ -114,6 +115,16 @@ def test_segmentation_schedule_matches_timestamp_rate_gate() -> None:
         origin + 400_000_000,
     ]
     assert infer_segmentation_frame_indices(times, 5.0) == [0, 2, 4]
+
+
+def test_segmentation_schedule_restarts_at_resume_boundary() -> None:
+    origin = 1_700_000_000_000_000_000
+    times = [origin + index * 100_000_000 for index in range(8)]
+    accumulated, reported = accumulated_segmentation_frame_indices(
+        times, 5.0, frames_resumed_from=5
+    )
+    assert accumulated == [0, 2, 4, 5, 7]
+    assert reported == [5, 7]
 
 
 def test_largest_component_and_render_preserve_exact_mask() -> None:

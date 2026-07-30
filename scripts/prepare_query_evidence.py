@@ -131,6 +131,39 @@ def _candidate_score(area: int, border_touch: bool) -> float:
     return float(area) * (0.40 if border_touch else 1.0)
 
 
+def accumulated_segmentation_frame_indices(
+    sensor_times_ns: list[int],
+    segmentation_rate_hz: float,
+    *,
+    frames_resumed_from: int,
+) -> tuple[list[int], list[int]]:
+    """Replay persisted FastSAM schedules across one interrupted/resumed run.
+
+    The timestamp scheduler restarts when a run resumes.  Labels before the
+    resume boundary remain valid, checksum-bound artifacts from the preceding
+    segment, while the final runtime report only counts calls made after that
+    boundary.
+    """
+
+    if frames_resumed_from < 0 or frames_resumed_from > len(sensor_times_ns):
+        raise ValueError("frames_resumed_from is outside the tick index")
+    if frames_resumed_from == 0:
+        indices = infer_segmentation_frame_indices(
+            sensor_times_ns, segmentation_rate_hz
+        )
+        return indices, indices
+    prior = infer_segmentation_frame_indices(
+        sensor_times_ns[:frames_resumed_from], segmentation_rate_hz
+    )
+    current = [
+        frames_resumed_from + index
+        for index in infer_segmentation_frame_indices(
+            sensor_times_ns[frames_resumed_from:], segmentation_rate_hz
+        )
+    ]
+    return prior + current, current
+
+
 def select_candidates(
     *,
     targets: dict[int, EvidenceTarget],
@@ -456,14 +489,30 @@ def main(
     ):
         raise click.ClickException("Tick index references an invalid camera pose row")
     sensor_times_ns = [int(frame["sensor_time_ns"]) for frame in frames]
-    segmentation_indices = infer_segmentation_frame_indices(
-        sensor_times_ns, segmentation_rate_hz
-    )
+    frames_resumed_from = int(report.get("frames_resumed_from") or 0)
+    try:
+        segmentation_indices, reported_segment_indices = (
+            accumulated_segmentation_frame_indices(
+                sensor_times_ns,
+                segmentation_rate_hz,
+                frames_resumed_from=frames_resumed_from,
+            )
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     expected_calls = int(semantic_stats.get("segmentation_calls", -1))
-    if len(segmentation_indices) != expected_calls:
+    if len(reported_segment_indices) != expected_calls:
         raise click.ClickException(
-            "Inferred FastSAM schedule does not match runtime evidence: "
-            f"{len(segmentation_indices)} != {expected_calls}"
+            "Inferred FastSAM schedule does not match runtime evidence for "
+            f"the reported segment: {len(reported_segment_indices)} != "
+            f"{expected_calls}"
+        )
+    if frames_resumed_from > 0 and not all(
+        semantic_label_path(label_directory, index).is_file()
+        for index in segmentation_indices[: -len(reported_segment_indices)]
+    ):
+        raise click.ClickException(
+            "Persisted FastSAM labels before the resume boundary are incomplete"
         )
     maximum_frame_interval_ns = max(
         (
@@ -643,6 +692,8 @@ def main(
             "mask_source": "fastsam_segmentation",
             "segmentation_rate_hz": segmentation_rate_hz,
             "segmentation_frames": len(segmentation_indices),
+            "runtime_report_segmentation_calls": expected_calls,
+            "frames_resumed_from": frames_resumed_from,
             "segmentation_failures": 0,
             "observation_interval_tolerance_ns": evidence_interval_tolerance_ns,
             "rgbd_geometry_objects": sum(

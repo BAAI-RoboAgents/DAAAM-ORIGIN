@@ -11,7 +11,7 @@ import sys
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
-from daaam.quality import QualityGateRunner  # noqa: E402
+from daaam.quality import QualityGateConfig, QualityGateRunner  # noqa: E402
 
 
 def valid_context():
@@ -149,6 +149,22 @@ def test_depth_gate_distinguishes_missing_lr_provenance_from_bad_consistency():
     )
     report = QualityGateRunner().evaluate(context)
     assert result_codes(report)["depth"] == "depth.missing_lr_evidence"
+
+
+def test_aligned_rgbd_depth_gate_does_not_require_stereo_evidence():
+    context = valid_context()
+    context["depth"].update(
+        {
+            "left_right_consistency": 0.0,
+            "left_right_coverage": 0.0,
+            "left_right_evidence_available": False,
+        }
+    )
+    config = QualityGateConfig(require_left_right_evidence=False)
+    report = QualityGateRunner(config).evaluate(context)
+    depth = next(result for result in report["results"] if result["stage"] == "depth")
+    assert depth["code"] == "depth.quality"
+    assert not depth["metrics"]["left_right_evidence_required"]
 
 
 def test_required_dam_gate_requires_real_worker_and_hydra_ack():

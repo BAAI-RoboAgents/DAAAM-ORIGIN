@@ -234,6 +234,28 @@ def test_clean_1_hz_run_is_authoritative(tmp_path):
     assert verdict["expected_rate_hz"] == 1.0
 
 
+def test_local_dam_artifact_provenance_is_accepted(tmp_path):
+    run = write_run(tmp_path / "local-dam", 1.0)
+    manifest_path = run / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["models"]["semantic_frontend"]["dam"] = {
+        "local_path": "/models/DAM-3B",
+        "model_index_sha256": "dam-index-sha",
+        "cached_revision": None,
+    }
+    manifest_path.write_text(json.dumps(manifest))
+
+    verdict = validate_realtime_run(run, expected_rate_hz=1.0)
+
+    assert verdict["passed"]
+    resolved = next(
+        item
+        for item in verdict["checks"]
+        if item["code"] == "semantic.resolved_models"
+    )
+    assert resolved["passed"]
+
+
 def test_fast_precomputed_depth_profile_does_not_require_scale(tmp_path):
     run = write_run(tmp_path / "fast-depth", 1.0)
     manifest_path = run / "run_manifest.json"

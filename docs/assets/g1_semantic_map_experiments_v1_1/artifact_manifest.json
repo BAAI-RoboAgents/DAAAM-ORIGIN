@@ -1,0 +1,61 @@
+{
+  "files": [
+    {
+      "bytes": 3958297,
+      "file": "01_window_scene_overview.png",
+      "sha256": "16e8d11be825f536f3e2b29bc9fc2469d83890680f010b0f7ef7d4d30ece2285"
+    },
+    {
+      "bytes": 440654,
+      "file": "02_input_sync_exposure_audit.png",
+      "sha256": "505dd49856e7b0ae3e717f06914fcf6aa249898d7a7552bdb0e24af411dba001"
+    },
+    {
+      "bytes": 186340,
+      "file": "03_pose_and_epipolar_audit.png",
+      "sha256": "1622c5475ec60907c7e6e0c1d75ebb37a5cd4329b5856c1d0232c903313741c8"
+    },
+    {
+      "bytes": 572385,
+      "file": "04_module_effect_timeseries.png",
+      "sha256": "4b520ec929ed5ae37aefe2440d96dac0f15201776a82fdffddc527b008b11804"
+    },
+    {
+      "bytes": 154157,
+      "file": "05_v1_1_pipeline_experiment_flow.png",
+      "sha256": "505850c4d9c486e891ae6b78acce1979209e8fe65f10810ba71a1354fcddeff9"
+    },
+    {
+      "bytes": 2307184,
+      "file": "06_representative_module_montage.png",
+      "sha256": "ed680d1943dc2f5dd51e071f1107e20358069769b622af7fb9516792e3473e41"
+    },
+    {
+      "bytes": 105970,
+      "file": "07_evidence_readiness_scorecard.png",
+      "sha256": "651321db821f14f9b411aa5f4df1c8ed52b2d40df2ed5d448068da15e1cc5945"
+    },
+    {
+      "bytes": 271162,
+      "file": "08_v1_1_diagnostic_protocol.png",
+      "sha256": "4b159953218af23e117eccc57201f614cede8287b8ac54656387261ef64689f0"
+    },
+    {
+      "bytes": 156400,
+      "file": "09_v1_1_failure_localization_tree.png",
+      "sha256": "02d3ad919e944e77d97b430e3631f14c00d7d3a617f91df1b697f92f1df47166"
+    },
+    {
+      "bytes": 48883,
+      "file": "g1_473_573_per_frame.csv",
+      "sha256": "1bbb88afa00e2908914437022a84ac37121be63e22463330270417ece0941950"
+    },
+    {
+      "bytes": 7412,
+      "file": "g1_473_573_visual_audit.json",
+      "sha256": "bd4a53c6bfd463e0a8734a1b95f816a0ad4a73e7d303eb6ba27ef3844a2c03a8"
+    }
+  ],
+  "schema": "daaam.g1_473_573_visual_artifacts.v1",
+  "source_metrics": "g1_473_573_visual_audit.json"
+}

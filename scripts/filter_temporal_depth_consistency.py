@@ -66,6 +66,15 @@ def parse_args() -> argparse.Namespace:
         default=0.25,
         help="Minimum agreeing/judged ratio; zero support is always rejected.",
     )
+    parser.add_argument(
+        "--require-temporal-support",
+        action="store_true",
+        help=(
+            "Also reject valid depth that cannot be judged by the configured "
+            "minimum number of neighbors. This is an evidence-coverage gate, "
+            "not a distance cutoff."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -185,6 +194,7 @@ def propagate_depth_evidence(
     output_depth_path: Path,
     output_valid_ratio: float,
     rejected_valid_ratio: float,
+    require_temporal_support: bool,
 ) -> dict[str, object]:
     """Copy verifiable stereo evidence while applying the temporal reject mask."""
     propagated: list[str] = []
@@ -251,6 +261,10 @@ def propagate_depth_evidence(
                 "left_right_verified": left_right_verified,
                 "temporal_filter": {
                     "method": "multi_neighbor_reprojection_consistency",
+                    "require_temporal_support": require_temporal_support,
+                    "insufficient_evidence_policy": (
+                        "reject" if require_temporal_support else "preserve"
+                    ),
                     "rejected_valid_ratio": rejected_valid_ratio,
                     "source_metadata_sha256": sha256_file(source_metadata_path),
                     "depth_evidence_dataset": str(evidence_source),
@@ -438,11 +452,22 @@ def main() -> None:
             tested_neighbors.append(neighbor)
 
         support_ratio = support_count / np.maximum(judged_count, 1)
-        reject_low = (
+        valid_low = (
             (source_low >= args.min_depth_m)
             & (source_low <= args.max_depth_m)
-            & (judged_count >= args.min_judged_neighbors)
+        )
+        sufficient_evidence = judged_count >= args.min_judged_neighbors
+        contradicted_low = (
+            valid_low
+            & sufficient_evidence
             & (support_ratio < args.min_support_ratio)
+        )
+        insufficient_low = (
+            valid_low
+            & ~sufficient_evidence
+        )
+        reject_low = contradicted_low | (
+            insufficient_low if args.require_temporal_support else False
         )
 
         depth_mm = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
@@ -475,6 +500,7 @@ def main() -> None:
             output_depth_path=output_depth_path,
             output_valid_ratio=output_valid_ratios[-1],
             rejected_valid_ratio=rejected_ratios[-1],
+            require_temporal_support=args.require_temporal_support,
         )
         propagated_evidence_directories.update(evidence["propagated"])
         left_right_verified_frames += int(evidence["left_right_verified"])
@@ -485,6 +511,14 @@ def main() -> None:
                 "tested_neighbors": tested_neighbors,
                 "low_resolution_judged_ratio": float((judged_count > 0).mean()),
                 "low_resolution_supported_ratio": float((support_count > 0).mean()),
+                "low_resolution_sufficient_evidence_valid_ratio": float(
+                    np.count_nonzero(valid_low & sufficient_evidence)
+                    / max(1, int(np.count_nonzero(valid_low)))
+                ),
+                "low_resolution_insufficient_evidence_valid_ratio": float(
+                    np.count_nonzero(insufficient_low)
+                    / max(1, int(np.count_nonzero(valid_low)))
+                ),
                 "input_valid_ratio": input_valid_ratios[-1],
                 "output_valid_ratio": output_valid_ratios[-1],
                 "rejected_valid_ratio": rejected_ratios[-1],
@@ -528,6 +562,10 @@ def main() -> None:
         "filter_scale": args.filter_scale,
         "min_judged_neighbors": args.min_judged_neighbors,
         "min_support_ratio": args.min_support_ratio,
+        "require_temporal_support": args.require_temporal_support,
+        "insufficient_evidence_policy": (
+            "reject" if args.require_temporal_support else "preserve"
+        ),
         "depth_bounds_m": [args.min_depth_m, args.max_depth_m],
         "absolute_tolerance_m": args.absolute_tolerance_m,
         "relative_tolerance": args.relative_tolerance,

@@ -25,6 +25,7 @@ from daaam.memory import (
     VersionedCorrectionProcessor,
 )
 from daaam.pipeline.models import PromptRecord
+from daaam.realtime.audit import JsonlAuditWriter
 from daaam.realtime.contracts import RealtimeEnvelope, SemanticCorrection
 from daaam.realtime.gpu import SharedGpuCoordinator
 from daaam.realtime.masked_geometry import backproject_masked_depth
@@ -59,6 +60,7 @@ class RealtimeSemanticConfig:
     label_run_configuration_sha256: str = (
         DEFAULT_LABEL_RUN_CONFIGURATION_SHA256
     )
+    write_visualizations: bool = False
 
     def __post_init__(self) -> None:
         if self.segmentation_rate_hz <= 0.0:
@@ -856,6 +858,7 @@ class RealtimeSemanticAdapter:
         tracking_service: Any = None,
         grounding_service: Any = None,
         dsg_sink: Optional[HydraDsgSemanticSink] = None,
+        audit_writers: Optional[Mapping[str, JsonlAuditWriter]] = None,
     ) -> None:
         self.pipeline_config = pipeline_config
         self.memory = memory
@@ -902,6 +905,7 @@ class RealtimeSemanticAdapter:
         self.tracking_service = tracking_service
         self.grounding_service = grounding_service
         self.dsg_sink = dsg_sink
+        self.audit_writers = dict(audit_writers or {})
         self.gpu_coordinator = SharedGpuCoordinator(
             lock_path=config.gpu_lock_path,
             activity_path=config.gpu_activity_path,
@@ -984,6 +988,21 @@ class RealtimeSemanticAdapter:
             "segmentation_service_ms": [],
             "tracking_service_ms": [],
         }
+
+    def _audit(
+        self,
+        stream: str,
+        event: str,
+        values: Mapping[str, Any],
+    ) -> None:
+        writer = self.audit_writers.get(stream)
+        if writer is None:
+            return
+        try:
+            writer.write(event, values)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            # Experiment logging is supplemental and must not alter map results.
+            return
 
     def _wait_for_grounding_ready(self) -> None:
         if self.grounding_service is None:
@@ -1345,6 +1364,37 @@ class RealtimeSemanticAdapter:
             with self._lock:
                 self._stats["label_persistence_failures"] += 1
             raise
+        if self.config.write_visualizations:
+            visual = np.zeros((*label_image.shape, 3), dtype=np.uint8)
+            for semantic_id in np.unique(label_image):
+                if semantic_id <= 0:
+                    continue
+                visual[label_image == semantic_id] = (
+                    int(semantic_id * 53) % 255,
+                    int(semantic_id * 97) % 255,
+                    int(semantic_id * 193) % 255,
+                )
+            cv2.putText(
+                visual,
+                "segmentation" if segmentation_due else "propagation",
+                (18, 34),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            visualization_path = (
+                self.output_dir
+                / "visualizations"
+                / "semantic_labels"
+                / f"{frame_index:08d}.png"
+            )
+            visualization_path.parent.mkdir(parents=True, exist_ok=True)
+            if not cv2.imwrite(str(visualization_path), visual):
+                raise RuntimeError(
+                    f"Failed to write semantic visualization: {visualization_path}"
+                )
         with self._lock:
             self._label_cache[sensor_time_ns] = label_image.copy()
             self._label_cache.move_to_end(sensor_time_ns)
@@ -1360,6 +1410,26 @@ class RealtimeSemanticAdapter:
             self._stats["label_frames_cached"] += 1
             self._stats["label_frames_persisted"] += 1
             self._stats["propagation_overlap_pixels"] += overlap_pixels
+        frame_record = {
+            "frame_index": frame_index,
+            "sensor_time_ns": sensor_time_ns,
+            "map_revision": map_revision,
+            "mode": audit["mode"],
+            "overlap_pixels": int(overlap_pixels),
+            "track_count": len(tracks),
+        }
+        self._audit("semantic_decisions", "frame_summary", frame_record)
+        for track in tracks:
+            decision = {
+                **frame_record,
+                **dict(track),
+                "accepted": bool(track.get("depth_valid")),
+                "rejection_reason": (
+                    None if track.get("depth_valid") else "insufficient_valid_depth"
+                ),
+            }
+            self._audit("semantic_decisions", "mask_decision", decision)
+            self._audit("track_events", "track_observation", decision)
 
     def handle(self, envelope: RealtimeEnvelope) -> None:
         source, rgb, depth = self._source_payload(envelope)
@@ -1442,6 +1512,7 @@ class RealtimeSemanticAdapter:
                 "method": propagation_method,
                 "mask_pixels": int(np.count_nonzero(mask)),
                 "mask_sha256": self._mask_digest(mask),
+                "bbox_xyxy": np.asarray(state.bbox, dtype=np.float64).tolist(),
                 "depth_valid": bool(depth_valid),
                 "entity_id": state.entity_id,
             }
@@ -1584,6 +1655,27 @@ class RealtimeSemanticAdapter:
                 self._stats["prompt_catchup_entities_submitted"] += len(
                     candidates
                 )
+        self._audit(
+            "dam_events",
+            "prompt_submitted",
+            {
+                "catchup": catchup,
+                "frame_id": candidates[0].frame_id if candidates else None,
+                "sensor_time_ns": (
+                    candidates[0].sensor_time_ns if candidates else None
+                ),
+                "map_revision": candidates[0].map_revision if candidates else None,
+                "entities": [
+                    {
+                        "entity_id": candidate.entity_id,
+                        "semantic_id": candidate.semantic_id,
+                        "track_id": candidate.track.id,
+                        "mask_pixels": int(candidate.track.region_area),
+                    }
+                    for candidate in candidates
+                ],
+            },
+        )
 
     def _submit_prompt_candidates(
         self,
@@ -1776,6 +1868,11 @@ class RealtimeSemanticAdapter:
         if not isinstance(annotation, ObjectAnnotation):
             with self._lock:
                 self._stats["corrections_skipped"] += 1
+            self._audit(
+                "dam_events",
+                "annotation_skipped",
+                {"reason": "unsupported_annotation", "type": type(annotation).__name__},
+            )
             return
         label = " ".join(annotation.semantic_label.split()).strip()
         entity_id = annotation.entity_id or self._entity_by_semantic_id.get(
@@ -1798,6 +1895,19 @@ class RealtimeSemanticAdapter:
         ):
             with self._lock:
                 self._stats["corrections_skipped"] += 1
+            self._audit(
+                "dam_events",
+                "annotation_skipped",
+                {
+                    "reason": "invalid_or_unknown",
+                    "entity_id": entity_id,
+                    "semantic_id": annotation.semantic_id,
+                    "sensor_time_ns": sensor_time_ns,
+                    "map_revision": map_revision,
+                    "raw_label": annotation.semantic_label,
+                    "request_id": annotation.request_id,
+                },
+            )
             return
         source = f"dam:{annotation.source_model or 'unknown'}"
         operation_material = "|".join(
@@ -1825,6 +1935,22 @@ class RealtimeSemanticAdapter:
         )
         with self._lock:
             self._stats["corrections_submitted"] += 1
+        self._audit(
+            "dam_events",
+            "correction_submitted",
+            {
+                "operation_id": operation_id,
+                "request_id": annotation.request_id,
+                "entity_id": entity_id,
+                "semantic_id": annotation.semantic_id,
+                "sensor_time_ns": sensor_time_ns,
+                "map_revision": map_revision,
+                "raw_label": annotation.semantic_label,
+                "normalized_label": label,
+                "source_model": annotation.source_model,
+                "confidence": confidence,
+            },
+        )
 
     def attach_hydra_dsg(self, path: Path | str) -> dict[str, int]:
         return self.dsg_sink.attach_saved_graph(path)
@@ -2020,4 +2146,12 @@ class RealtimeSemanticAdapter:
                     repr(error) for error in cleanup_errors
                 )
             raise cleanup_errors[0]
+        service = getattr(self.dsg_sink, "service", None)
+        binding_events = list(getattr(service, "object_binding_audit", []) or [])
+        for event in binding_events:
+            self._audit(
+                "binding_candidates",
+                "binding_evaluated",
+                dict(event),
+            )
         return self.stats()

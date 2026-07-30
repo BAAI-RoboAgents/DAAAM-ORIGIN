@@ -14,10 +14,18 @@ import yaml
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
-from daaam.mapping.backends import HydraStaticMapBackend, matrix_to_xyzw  # noqa: E402
+from daaam.mapping.backends import (  # noqa: E402
+    HydraStaticMapBackend,
+    estimate_hydra_frustum_allocation,
+    matrix_to_xyzw,
+)
 
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
-from run_realtime_mapping import ReplayFrame, rebuild_static_map_prefix  # noqa: E402
+from run_realtime_mapping import (  # noqa: E402
+    ReplayFrame,
+    load_hydra_map_window_radius,
+    rebuild_static_map_prefix,
+)
 
 
 ORIGIN_NS = 1_783_933_507_759_540_877
@@ -79,6 +87,47 @@ def test_matrix_to_xyzw_preserves_rotation_and_translation_convention():
         np.abs(quaternion),
         [0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)],
     )
+
+
+def test_hydra_frustum_preflight_rejects_depth_storage_bound():
+    estimate = estimate_hydra_frustum_allocation(
+        REPOSITORY_ROOT / "config" / "hydra_g1_high_quality.yaml",
+        65.535,
+    )
+
+    assert estimate["status"] == "rejected"
+    assert estimate["block_size_m"] == pytest.approx(0.8)
+    assert estimate["max_steps"] == 83
+    assert estimate["cube_candidate_blocks"] == 4_657_463
+
+    with pytest.raises(ValueError, match="uint16 depth storage bound"):
+        HydraStaticMapBackend(
+            REPOSITORY_ROOT / "config" / "hydra_g1_high_quality.yaml",
+            REPOSITORY_ROOT / "output" / "unused-preflight-map",
+            maximum_depth_m=65.535,
+            integration_factory=lambda **_kwargs: FakeHydraIntegration(),
+        )
+
+
+def test_hydra_frustum_preflight_accepts_finite_mapping_range(tmp_path):
+    backend = HydraStaticMapBackend(
+        REPOSITORY_ROOT / "config" / "hydra_g1_high_quality.yaml",
+        tmp_path / "map",
+        maximum_depth_m=8.0,
+        integration_factory=lambda **_kwargs: FakeHydraIntegration(),
+    )
+
+    assert backend.frustum_allocation_preflight["status"] == "passed"
+    assert backend.frustum_allocation_preflight["cube_candidate_blocks"] == 12_167
+    assert backend.stats()["maximum_depth_m"] == 8.0
+
+
+def test_hydra_range_defaults_to_configured_active_map_radius():
+    radius_m = load_hydra_map_window_radius(
+        REPOSITORY_ROOT / "config" / "hydra_g1_high_quality.yaml"
+    )
+
+    assert radius_m == pytest.approx(8.0)
 
 
 def test_hydra_backend_receives_static_depth_and_original_absolute_time(tmp_path):

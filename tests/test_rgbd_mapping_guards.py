@@ -292,6 +292,52 @@ class RgbdMappingGuardTests(unittest.TestCase):
             self.assertTrue(report["rgb_frames_preserved"])
             self.assertTrue(report["poses_preserved"])
 
+    def test_temporal_filter_can_require_supported_evidence_without_distance_cutoff(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dataset, _ = create_rgbd_dataset(root)
+            output = root / "supported-only"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPOSITORY_ROOT
+                        / "scripts/filter_temporal_depth_consistency.py"
+                    ),
+                    "--dataset",
+                    str(dataset),
+                    "--output",
+                    str(output),
+                    "--neighbor-offsets",
+                    "1,2",
+                    "--filter-scale",
+                    "1",
+                    "--min-judged-neighbors",
+                    "5",
+                    "--min-support-ratio",
+                    "0.5",
+                    "--require-temporal-support",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertTrue(
+                all(
+                    np.count_nonzero(
+                        cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+                    )
+                    == 0
+                    for path in sorted((output / "depth").glob("*.png"))
+                )
+            )
+            report = json.loads(
+                (output / "temporal_depth_filter_report.json").read_text()
+            )
+            self.assertTrue(report["require_temporal_support"])
+            self.assertEqual(report["insufficient_evidence_policy"], "reject")
+
     def test_temporal_filter_preserves_verifiable_left_right_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

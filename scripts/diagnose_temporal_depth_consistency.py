@@ -188,13 +188,23 @@ def rotation_angle_deg(rotation: np.ndarray) -> float:
 def frame_provenance(frame: dict | None, index: int) -> dict:
     if frame is None:
         return {"frame": index}
-    source_index = frame.get("source_frame_idx", frame.get("source_idx"))
+    # In a selected dataset, source_frame_idx may identify a row in an
+    # intermediate prepared dataset. source_idx/cam0_source_idx is the raw
+    # acquisition tick and must take precedence in externally reported lineage.
+    raw_source_index = frame.get("source_idx", frame.get("cam0_source_idx"))
     return {
         "frame": index,
         "sensor_time_ns": int(frame["sensor_time_ns"]),
-        "source_frame_idx": int(source_index) if source_index is not None else None,
+        "source_frame_idx": (
+            int(raw_source_index) if raw_source_index is not None else None
+        ),
         "source_image_idx": (
             int(frame["source_idx"]) if frame.get("source_idx") is not None else None
+        ),
+        "intermediate_source_frame_idx": (
+            int(frame["source_frame_idx"])
+            if frame.get("source_frame_idx") is not None
+            else None
         ),
         "selection_reason": frame.get("selection_reason"),
     }

@@ -42,7 +42,7 @@ workers:
     position_score_weight: 0.5
     size_score_weight: 0.5
   dam_grounding_config:
-    dam_model_path: "nvidia/DAM-3B"
+    dam_model_path: "checkpoints/dam/DAM-3B"
     dam_conv_mode: "v1"
     dam_prompt_mode: "focal_prompt"
     multi_image_min_n_masks: 16
@@ -62,7 +62,9 @@ workers:
 
 depth:
   depth_lb: 0.25
-  depth_ub: 5.0
+  # Storage/runtime ceiling for new stereo runs. Hydra still receives its
+  # independent finite view-frustum limit via --hydra-maximum-range-m.
+  depth_ub: 65.535
 
 scene_graph:
   defer_dsg_processing: false

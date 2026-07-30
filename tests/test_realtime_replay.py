@@ -25,6 +25,7 @@ from run_realtime_mapping import (  # noqa: E402
     evaluate_dam_runtime_gate,
     load_precomputed_depth_provenance,
     load_semantic_model_provenance,
+    resolve_cached_huggingface_snapshot,
     resolve_environment_python,
     scheduled_confidence_mode,
 )
@@ -464,9 +465,20 @@ def test_semantic_model_provenance_hashes_local_artifacts(tmp_path):
     repository = tmp_path / "repository"
     (repository / "checkpoints" / "fastsam").mkdir(parents=True)
     (repository / "checkpoints" / "reid").mkdir()
+    (repository / "checkpoints" / "dam" / "DAM-3B" / "llm").mkdir(
+        parents=True
+    )
     (repository / "config").mkdir()
     (repository / "checkpoints" / "fastsam" / "model.engine").write_bytes(b"sam")
     (repository / "checkpoints" / "reid" / "model.engine").write_bytes(b"reid")
+    (
+        repository
+        / "checkpoints"
+        / "dam"
+        / "DAM-3B"
+        / "llm"
+        / "model.safetensors.index.json"
+    ).write_text("{}")
     (repository / "config" / "labels.yaml").write_text("labels: []")
     (repository / "config" / "colors.csv").write_text("0,0,0")
     config = repository / "pipeline.yaml"
@@ -478,7 +490,7 @@ tracking:
   reid_weights: checkpoints/reid/model.engine
 workers:
   dam_grounding_config:
-    dam_model_path: nvidia/DAM-3B
+    dam_model_path: checkpoints/dam/DAM-3B
 semantic_config_path: config/labels.yaml
 labelspace_colors_path: config/colors.csv
 """.strip()
@@ -489,8 +501,48 @@ labelspace_colors_path: config/colors.csv
     )
     assert provenance["fastsam"]["sha256"]
     assert provenance["botsort_reid"]["sha256"]
+    assert provenance["dam"]["local_path"] == str(
+        (repository / "checkpoints" / "dam" / "DAM-3B").resolve()
+    )
+    assert provenance["dam"]["model_index_sha256"]
+    assert provenance["dam"]["cached_revision"] is None
     assert provenance["semantic_labelspace"]["sha256"]
     assert provenance["labelspace_colors"]["sha256"]
+
+
+def test_resolve_cached_huggingface_snapshot_requires_complete_tree(tmp_path):
+    cache_root = tmp_path / "hub"
+    repository = cache_root / "models--nvidia--DAM-3B"
+    revision = "abc123"
+    snapshot = repository / "snapshots" / revision
+    snapshot.mkdir(parents=True)
+    (repository / "refs").mkdir()
+    (repository / "refs" / "main").write_text(revision)
+    (repository / "trees").mkdir()
+    (repository / "trees" / f"{revision}.json").write_text(
+        json.dumps(
+            {
+                "files": {
+                    "config.json": {"size": 3},
+                    "llm/model.safetensors": {"size": 5},
+                }
+            }
+        )
+    )
+    (snapshot / "config.json").write_text("{}\n")
+
+    with pytest.raises(FileNotFoundError, match="incomplete or size-invalid"):
+        resolve_cached_huggingface_snapshot(
+            "nvidia/DAM-3B",
+            cache_root=cache_root,
+        )
+
+    (snapshot / "llm").mkdir()
+    (snapshot / "llm" / "model.safetensors").write_bytes(b"12345")
+    assert resolve_cached_huggingface_snapshot(
+        "nvidia/DAM-3B",
+        cache_root=cache_root,
+    ) == snapshot.resolve()
 
 
 def test_periodic_left_right_validation_never_skips_left_depth_inference():

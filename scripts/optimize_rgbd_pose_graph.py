@@ -58,6 +58,14 @@ def parse_args() -> argparse.Namespace:
         help="Reject a verified loop incompatible with planar gravity by more than this.",
     )
     parser.add_argument(
+        "--allow-missing-verified-loops",
+        action="store_true",
+        help=(
+            "Allow optimization to continue with local robot/RGB-D edges when no "
+            "gravity-compatible verified loop remains."
+        ),
+    )
+    parser.add_argument(
         "--loop-uncertain",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -196,6 +204,8 @@ def select_loop_candidates(
     cluster_radius: int,
     max_edges: int,
     max_gravity_residual_deg: float,
+    *,
+    allow_missing: bool = False,
 ) -> list[dict]:
     verified = [
         candidate
@@ -268,6 +278,8 @@ def select_loop_candidates(
         if len(selected) >= max_edges:
             break
     if not selected:
+        if allow_missing:
+            return []
         raise RuntimeError(
             "No independently verified, gravity-compatible loop remains after "
             "filtering and clustering"
@@ -776,6 +788,7 @@ def main() -> None:
             args.loop_cluster_radius_frames,
             args.max_loop_edges,
             args.max_loop_gravity_residual_deg,
+            allow_missing=bool(args.allow_missing_verified_loops),
         )
     )
 

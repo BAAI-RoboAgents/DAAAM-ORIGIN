@@ -1,0 +1,106 @@
+schema: daaam.semantic_query_set.v1
+dataset: /home/user/datasets/test_ros2_all_tf_map
+source_frames: [815, 915]
+frozen_before_held_out_evaluation: true
+
+queries:
+  - id: plant_zh
+    language: zh-CN
+    text: "室内的大型绿色植物"
+    expected_found: true
+    expected_terms: [plant, potted plant, monstera]
+  - id: plant_en
+    language: en
+    text: "the large green indoor plant"
+    expected_found: true
+    expected_terms: [plant, potted plant, monstera]
+  - id: table_zh
+    language: zh-CN
+    text: "房间中央的长桌"
+    expected_found: true
+    expected_terms: [table, desk, work table]
+  - id: table_en
+    language: en
+    text: "the long table in the middle of the room"
+    expected_found: true
+    expected_terms: [table, desk, work table]
+  - id: chair_zh
+    language: zh-CN
+    text: "桌子旁边的棕色椅子"
+    expected_found: true
+    expected_terms: [chair, stool, seat]
+  - id: chair_en
+    language: en
+    text: "a brown chair beside the table"
+    expected_found: true
+    expected_terms: [chair, stool, seat]
+  - id: vending_zh
+    language: zh-CN
+    text: "墙边的自动售货机"
+    expected_found: true
+    expected_terms: [vending machine, vending, machine]
+  - id: vending_en
+    language: en
+    text: "the vending machine against the wall"
+    expected_found: true
+    expected_terms: [vending machine, vending, machine]
+  - id: dispenser_zh
+    language: zh-CN
+    text: "售货机旁边的饮水机"
+    expected_found: true
+    expected_terms: [water dispenser, dispenser, drink machine]
+  - id: dispenser_en
+    language: en
+    text: "the water dispenser beside the vending machine"
+    expected_found: true
+    expected_terms: [water dispenser, dispenser, drink machine]
+  - id: bin_zh
+    language: zh-CN
+    text: "黑色垃圾桶"
+    expected_found: true
+    expected_terms: [trash bin, garbage bin, waste bin, bin]
+  - id: bin_en
+    language: en
+    text: "a black trash bin"
+    expected_found: true
+    expected_terms: [trash bin, garbage bin, waste bin, bin]
+  - id: shelf_zh
+    language: zh-CN
+    text: "靠墙的木质置物架"
+    expected_found: true
+    expected_terms: [shelf, shelving, rack]
+  - id: shelf_en
+    language: en
+    text: "the wooden shelf against the wall"
+    expected_found: true
+    expected_terms: [shelf, shelving, rack]
+  - id: ceiling_light_zh
+    language: zh-CN
+    text: "天花板上的圆形大灯"
+    expected_found: true
+    expected_terms: [ceiling light, lamp, light]
+  - id: ceiling_light_en
+    language: en
+    text: "the large round ceiling light"
+    expected_found: true
+    expected_terms: [ceiling light, lamp, light]
+  - id: absent_hydrant_zh
+    language: zh-CN
+    text: "房间里的红色消防栓"
+    expected_found: false
+    expected_terms: []
+  - id: absent_bicycle_en
+    language: en
+    text: "a bicycle inside the room"
+    expected_found: false
+    expected_terms: []
+  - id: absent_bed_zh
+    language: zh-CN
+    text: "房间里的床"
+    expected_found: false
+    expected_terms: []
+  - id: absent_toilet_en
+    language: en
+    text: "the toilet in the room"
+    expected_found: false
+    expected_terms: []

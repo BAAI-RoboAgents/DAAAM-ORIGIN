@@ -12,6 +12,7 @@ import hashlib
 import importlib
 import json
 import math
+import shutil
 import subprocess
 import sys
 import time
@@ -65,6 +66,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--save-raw-products",
+        action="store_true",
+        help=(
+            "Also save float32 NPY left disparity and untruncated metric depth. "
+            "Left/right mode additionally saves right disparity and the "
+            "unthresholded left/right consistency error."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -250,6 +260,29 @@ def atomic_write_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+def atomic_write_npy(path: Path, value: np.ndarray) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as stream:
+        np.save(stream, value, allow_pickle=False)
+    temporary.replace(path)
+
+
+def colorize_float_field(
+    values: np.ndarray,
+    *,
+    minimum: float,
+    maximum: float,
+    valid_mask: np.ndarray,
+) -> np.ndarray:
+    if not math.isfinite(minimum) or not math.isfinite(maximum) or maximum <= minimum:
+        raise ValueError("Visualization range must be finite and increasing")
+    normalized = np.clip((values - minimum) / (maximum - minimum), 0.0, 1.0)
+    encoded = np.rint(np.nan_to_num(normalized, nan=0.0) * 255.0).astype(np.uint8)
+    color = cv2.applyColorMap(encoded, cv2.COLORMAP_TURBO)
+    color[~valid_mask] = 0
+    return color
+
+
 def capture_gpu_snapshot() -> dict[str, Any]:
     """Capture lightweight contention evidence without making it a run blocker."""
     commands = {
@@ -306,6 +339,17 @@ def main() -> None:
         frames = frames[: args.max_frames]
     if not frames:
         raise ValueError("no frames selected")
+    selected_metadata = dict(metadata)
+    selected_metadata["frames"] = frames
+    selected_metadata["depth_selection"] = {
+        "source_dataset": str(dataset),
+        "start_frame": args.start_frame,
+        "maximum_frames": args.max_frames,
+        "selected_frame_count": len(frames),
+        "selected_source_indices": [
+            int(frame["source_idx"]) for frame in frames
+        ],
+    }
 
     gpu_preflight = capture_gpu_snapshot()
     artifacts = verify_artifacts(args.repo, args.checkpoint)
@@ -321,11 +365,45 @@ def main() -> None:
         "occlusion": output / "depth_occlusion",
         "metadata": output / "depth_metadata",
     }
+    if args.save_raw_products:
+        directories.update(
+            {
+                "raw_disparity": output / "raw_disparity",
+                "raw_depth": output / "raw_depth_meter",
+                "disparity_visualization": output / "raw_disparity_visualization",
+                "depth_visualization_5m": output / "raw_depth_visualization_5m",
+                "depth_visualization_30m": output / "raw_depth_visualization_30m",
+                "depth_overlay_5m": output / "raw_depth_overlay_5m",
+            }
+        )
+        if args.confidence_mode == "left-right":
+            directories.update(
+                {
+                    "right_disparity": output / "right_disparity",
+                    "consistency_error": output / "lr_consistency_error",
+                }
+            )
+    suffixes = {
+        name: (
+            ".json"
+            if name == "metadata"
+            else ".npy"
+            if name
+            in {
+                "raw_disparity",
+                "raw_depth",
+                "right_disparity",
+                "consistency_error",
+            }
+            else ".png"
+        )
+        for name in directories
+    }
     for directory in directories.values():
         directory.mkdir(parents=True, exist_ok=True)
     if args.overwrite:
-        for directory in directories.values():
-            suffix = ".json" if directory == directories["metadata"] else ".png"
+        for name, directory in directories.items():
+            suffix = suffixes[name]
             for path in directory.glob(f"*{suffix}"):
                 path.unlink()
 
@@ -374,7 +452,7 @@ def main() -> None:
         frame_idx = int(frame["idx"])
         paths = {
             name: directory
-            / f"{frame_idx:08d}{'.json' if name == 'metadata' else '.png'}"
+            / f"{frame_idx:08d}{suffixes[name]}"
             for name, directory in directories.items()
         }
         if all(path.exists() for path in paths.values()) and not args.overwrite:
@@ -434,6 +512,14 @@ def main() -> None:
         post_started = time.perf_counter()
         left_disp = padder.unpad(left_tensor.float()).cpu().numpy().squeeze()
         left_disp = np.clip(left_disp, 0.0, None).astype(np.float32, copy=False)
+        columns = np.arange(width, dtype=np.float32)[None, :]
+        raw_depth_valid = (
+            np.isfinite(left_disp)
+            & (left_disp > 0.0)
+            & ((columns - left_disp) >= 0.0)
+        )
+        raw_depth = np.full(left_disp.shape, np.nan, dtype=np.float32)
+        raw_depth[raw_depth_valid] = fx * baseline / left_disp[raw_depth_valid]
         if right_tensor is not None:
             right_disp = (
                 padder.unpad(torch.flip(right_tensor, dims=[3]).float())
@@ -452,7 +538,10 @@ def main() -> None:
             consistent = stereo.consistent_mask
             occluded = stereo.occlusion_mask
             confidence_metrics = stereo.metrics
+            consistency_error = stereo.consistency_error_px
         else:
+            right_disp = None
+            consistency_error = None
             consistent = np.isfinite(left_disp) & (left_disp > 0.0)
             occluded = np.zeros_like(consistent)
             confidence = consistent.astype(np.float32)
@@ -473,11 +562,73 @@ def main() -> None:
             "consistency": consistent.astype(np.uint8) * 255,
             "occlusion": occluded.astype(np.uint8) * 255,
         }
+        disparity_visualization_max = None
+        if args.save_raw_products:
+            positive_disparity = left_disp[
+                np.isfinite(left_disp) & (left_disp > 0.0)
+            ]
+            disparity_visualization_max = (
+                max(1.0, float(np.percentile(positive_disparity, 99)))
+                if positive_disparity.size
+                else 1.0
+            )
+            raw_depth_5m_valid = (
+                np.isfinite(raw_depth)
+                & (raw_depth >= 0.25)
+                & (raw_depth <= 5.0)
+            )
+            raw_depth_30m_valid = (
+                np.isfinite(raw_depth)
+                & (raw_depth >= 0.25)
+                & (raw_depth <= 30.0)
+            )
+            disparity_visualization = colorize_float_field(
+                left_disp,
+                minimum=0.0,
+                maximum=disparity_visualization_max,
+                valid_mask=np.isfinite(left_disp) & (left_disp > 0.0),
+            )
+            depth_visualization_5m = colorize_float_field(
+                raw_depth,
+                minimum=0.25,
+                maximum=5.0,
+                valid_mask=raw_depth_5m_valid,
+            )
+            depth_visualization_30m = colorize_float_field(
+                raw_depth,
+                minimum=0.25,
+                maximum=30.0,
+                valid_mask=raw_depth_30m_valid,
+            )
+            depth_overlay_5m = left_bgr.copy()
+            depth_overlay_5m[raw_depth_5m_valid] = cv2.addWeighted(
+                left_bgr[raw_depth_5m_valid],
+                0.45,
+                depth_visualization_5m[raw_depth_5m_valid],
+                0.55,
+                0.0,
+            )
+            products.update(
+                {
+                    "disparity_visualization": disparity_visualization,
+                    "depth_visualization_5m": depth_visualization_5m,
+                    "depth_visualization_30m": depth_visualization_30m,
+                    "depth_overlay_5m": depth_overlay_5m,
+                }
+            )
         if not all(cv2.imwrite(str(paths[name]), product) for name, product in products.items()):
             print(f"[{frame_idx}] failed to write depth products", flush=True)
             failed += 1
             continue
+        if args.save_raw_products:
+            atomic_write_npy(paths["raw_disparity"], left_disp)
+            atomic_write_npy(paths["raw_depth"], raw_depth)
+            if right_disp is not None and consistency_error is not None:
+                atomic_write_npy(paths["right_disparity"], right_disp)
+                atomic_write_npy(paths["consistency_error"], consistency_error)
         valid = depth > 0.0
+        raw_positive = np.isfinite(left_disp) & (left_disp > 0.0)
+        raw_finite_depth = np.isfinite(raw_depth) & (raw_depth > 0.0)
         report = {
             "frame_idx": frame_idx,
             "sensor_time_ns": int(frame["sensor_time_ns"]),
@@ -488,6 +639,24 @@ def main() -> None:
             "left_right_verified": args.confidence_mode == "left-right",
             "occlusion_ratio": float(occluded.mean()),
             "mean_confidence": float(np.mean(confidence[valid])) if np.any(valid) else 0.0,
+            "raw_positive_disparity_ratio": float(raw_positive.mean()),
+            "raw_visible_depth_ratio": float(raw_finite_depth.mean()),
+            "raw_depth_coverage_ratio": {
+                "within_5m": float((raw_finite_depth & (raw_depth <= 5.0)).mean()),
+                "within_10m": float((raw_finite_depth & (raw_depth <= 10.0)).mean()),
+                "within_30m": float((raw_finite_depth & (raw_depth <= 30.0)).mean()),
+            },
+            "raw_products_saved": args.save_raw_products,
+            "visualizations": (
+                {
+                    "raw_disparity_color_max_px_p99": disparity_visualization_max,
+                    "raw_depth_5m_color_range_m": [0.25, 5.0],
+                    "raw_depth_30m_color_range_m": [0.25, 30.0],
+                    "raw_depth_overlay_5m_alpha": 0.55,
+                }
+                if args.save_raw_products
+                else None
+            ),
             "timing_seconds": {
                 "preprocess_wall": timing["preprocess_wall"][-1],
                 "left_model_wall": left_timing["wall_seconds"],
@@ -540,6 +709,13 @@ def main() -> None:
             "left_right_inferences_per_frame": 2 if args.confidence_mode == "left-right" else 1,
             "lr_absolute_tolerance_px": args.lr_absolute_tolerance_px,
             "lr_relative_tolerance": args.lr_relative_tolerance,
+            "save_raw_products": args.save_raw_products,
+            "raw_depth_definition": (
+                "fx * baseline / positive left disparity with x-disparity >= 0; "
+                "no maximum-depth or left/right-consistency truncation"
+                if args.save_raw_products
+                else None
+            ),
         },
         "frames_requested": len(frames),
         "start_frame": args.start_frame,
@@ -563,7 +739,25 @@ def main() -> None:
         "frame_stats": valid_frame_stats,
     }
     atomic_write_json(output / "fast_foundation_stereo_run.json", result)
-    atomic_write_json(output / "tick_index.json", metadata)
+    atomic_write_json(output / "tick_index.json", selected_metadata)
+    for metadata_name in ("camera_info.json", "input_integrity.json"):
+        source_metadata = dataset / metadata_name
+        target_metadata = output / metadata_name
+        if (
+            source_metadata.is_file()
+            and source_metadata.resolve() != target_metadata.resolve()
+        ):
+            shutil.copy2(source_metadata, target_metadata)
+    source_pose_directory = dataset / "pose"
+    target_pose_directory = output / "pose"
+    if source_pose_directory.is_dir():
+        target_pose_directory.mkdir(parents=True, exist_ok=True)
+        for source_pose_path in source_pose_directory.iterdir():
+            if source_pose_path.is_file():
+                shutil.copy2(
+                    source_pose_path,
+                    target_pose_directory / source_pose_path.name,
+                )
     print(json.dumps({key: value for key, value in result.items() if key != "frame_stats"}, indent=2), flush=True)
     if failed:
         raise SystemExit(1)

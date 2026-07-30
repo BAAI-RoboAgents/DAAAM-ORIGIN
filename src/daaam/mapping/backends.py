@@ -2,10 +2,62 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import numpy as np
+import yaml
+
+
+DEFAULT_MAXIMUM_FRUSTUM_CANDIDATE_BLOCKS = 100_000
+
+
+def estimate_hydra_frustum_allocation(
+    hydra_config_path: Path | str,
+    maximum_range_m: float,
+    *,
+    maximum_candidate_blocks: int = DEFAULT_MAXIMUM_FRUSTUM_CANDIDATE_BLOCKS,
+) -> dict[str, Any]:
+    """Estimate Hydra's pre-integration cube scan from its camera range.
+
+    Hydra's projective integrator enumerates a cube whose half-width is derived
+    from the sensor maximum range before testing which blocks intersect the
+    camera frustum. This guard prevents a depth-storage bound from accidentally
+    becoming a multi-million-block allocation request.
+    """
+
+    config_path = Path(hydra_config_path).resolve()
+    configuration = yaml.safe_load(config_path.read_text()) or {}
+    volumetric_map = (
+        configuration.get("active_window", {}).get("volumetric_map", {})
+    )
+    voxel_size_m = volumetric_map.get("voxel_size")
+    voxels_per_side = volumetric_map.get("voxels_per_side", 16)
+    if voxel_size_m is None:
+        return {
+            "status": "not_evaluated",
+            "reason": "active_window.volumetric_map.voxel_size_missing",
+            "maximum_range_m": float(maximum_range_m),
+            "maximum_candidate_blocks": int(maximum_candidate_blocks),
+        }
+
+    block_size_m = float(voxel_size_m) * int(voxels_per_side)
+    if block_size_m <= 0.0:
+        raise ValueError("Hydra volumetric block size must be positive")
+    max_steps = int(math.ceil(float(maximum_range_m) / block_size_m)) + 1
+    cube_candidate_blocks = int((2 * max_steps + 1) ** 3)
+    passed = cube_candidate_blocks <= int(maximum_candidate_blocks)
+    return {
+        "status": "passed" if passed else "rejected",
+        "maximum_range_m": float(maximum_range_m),
+        "voxel_size_m": float(voxel_size_m),
+        "voxels_per_side": int(voxels_per_side),
+        "block_size_m": block_size_m,
+        "max_steps": max_steps,
+        "cube_candidate_blocks": cube_candidate_blocks,
+        "maximum_candidate_blocks": int(maximum_candidate_blocks),
+    }
 
 
 def matrix_to_xyzw(transform: np.ndarray) -> np.ndarray:
@@ -59,6 +111,9 @@ class HydraStaticMapBackend:
         labelspace_path: Optional[Path | str] = None,
         labelspace_colors: Optional[Path | str] = None,
         maximum_depth_m: float = 10.0,
+        maximum_frustum_candidate_blocks: int = (
+            DEFAULT_MAXIMUM_FRUSTUM_CANDIDATE_BLOCKS
+        ),
         integration_factory: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.hydra_config_path = Path(hydra_config_path).resolve()
@@ -76,7 +131,23 @@ class HydraStaticMapBackend:
                 raise FileNotFoundError(optional_path)
         if maximum_depth_m <= 0.0:
             raise ValueError("maximum depth must be positive")
+        if maximum_frustum_candidate_blocks <= 0:
+            raise ValueError("maximum frustum candidate blocks must be positive")
         self.maximum_depth_m = maximum_depth_m
+        self.maximum_frustum_candidate_blocks = maximum_frustum_candidate_blocks
+        self.frustum_allocation_preflight = estimate_hydra_frustum_allocation(
+            self.hydra_config_path,
+            self.maximum_depth_m,
+            maximum_candidate_blocks=self.maximum_frustum_candidate_blocks,
+        )
+        if self.frustum_allocation_preflight["status"] == "rejected":
+            estimate = self.frustum_allocation_preflight
+            raise ValueError(
+                "Hydra camera range would enumerate "
+                f"{estimate['cube_candidate_blocks']} candidate blocks, exceeding "
+                f"the safety limit {estimate['maximum_candidate_blocks']}. "
+                "Do not use a uint16 depth storage bound as the Hydra sensor range."
+            )
         self._factory = integration_factory
         self._integration = None
         self._origin_time_ns: Optional[int] = None
@@ -215,6 +286,8 @@ class HydraStaticMapBackend:
         values.update(
             {
                 "backend": "hydra",
+                "maximum_depth_m": self.maximum_depth_m,
+                "frustum_allocation_preflight": self.frustum_allocation_preflight,
                 "frames_rejected": self._frames_rejected,
                 "finalized": self._finalized,
                 "output_dir": str(self.output_dir),

@@ -7,6 +7,7 @@ import threading
 import time
 from typing import Callable, Iterable, Optional
 
+from .audit import JsonlAuditWriter
 from .contracts import RealtimeEnvelope
 from .metrics import MetricsCollector
 from .queueing import QueueClosed, ValueAwareQueue
@@ -37,8 +38,14 @@ class StageSpec:
 class MultiRateScheduler:
     """Small realtime scheduler whose stages cannot block one another."""
 
-    def __init__(self, *, active_revision: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        active_revision: int = 0,
+        audit_writer: Optional[JsonlAuditWriter] = None,
+    ) -> None:
         self.metrics = MetricsCollector()
+        self.audit_writer = audit_writer
         self._active_revision = active_revision
         self._specs: dict[str, StageSpec] = {}
         self._queues: dict[str, ValueAwareQueue] = {}
@@ -49,6 +56,36 @@ class MultiRateScheduler:
         self._errors: list[tuple[str, str]] = []
         self._inflight: dict[str, int] = {}
         self._state_lock = threading.Lock()
+
+    def _audit(
+        self,
+        event: str,
+        *,
+        stage: Optional[str] = None,
+        envelope: Optional[RealtimeEnvelope] = None,
+        **values,
+    ) -> None:
+        if self.audit_writer is None:
+            return
+        record = dict(values)
+        if stage is not None:
+            record["stage"] = stage
+        if envelope is not None:
+            record.update(
+                {
+                    "sensor_time_ns": envelope.key.sensor_time_ns,
+                    "map_revision": envelope.key.map_revision,
+                    "calibration_revision": envelope.key.calibration_revision,
+                    "trace_id": envelope.trace_id,
+                    "source": envelope.source,
+                    "value": int(envelope.value),
+                }
+            )
+        try:
+            self.audit_writer.write(event, record)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            # Telemetry must never change scheduling behavior.
+            return
 
     @property
     def active_revision(self) -> int:
@@ -66,6 +103,13 @@ class MultiRateScheduler:
         )
         self._routes[spec.name] = []
         self._inflight[spec.name] = 0
+        self._audit(
+            "stage_registered",
+            stage=spec.name,
+            rate_hz=spec.rate_hz,
+            queue_capacity=spec.queue_capacity,
+            deadline_ms=spec.deadline_ms,
+        )
 
     def connect(self, source: str, destination: str) -> None:
         if source not in self._specs or destination not in self._specs:
@@ -102,11 +146,22 @@ class MultiRateScheduler:
                 ),
             )
         decision = self._queues[stage].put(envelope)
-        self.metrics.observe_queue(stage, self._queues[stage].qsize())
+        queue_size = self._queues[stage].qsize()
+        self.metrics.observe_queue(stage, queue_size)
         if not decision.accepted:
             self.metrics.record_drop(stage, decision.reason)
         elif decision.reason.startswith("evicted_"):
             self.metrics.record_drop(stage, decision.reason)
+        self._audit(
+            "queue_submit",
+            stage=stage,
+            envelope=envelope,
+            accepted=decision.accepted,
+            reason=decision.reason,
+            queue_size=queue_size,
+            queue_capacity=self._queues[stage].capacity,
+            dropped_identity=decision.dropped_identity,
+        )
         return decision.accepted
 
     def advance_revision(self, revision: int) -> dict[str, int]:
@@ -120,6 +175,13 @@ class MultiRateScheduler:
             removed[name] = count
             for _ in range(count):
                 self.metrics.record_drop(name, "stale_revision")
+            self._audit(
+                "revision_advanced",
+                stage=name,
+                active_revision=revision,
+                removed=count,
+                queue_size=stage_queue.qsize(),
+            )
         return removed
 
     def _run_stage(self, name: str) -> None:
@@ -134,8 +196,21 @@ class MultiRateScheduler:
 
             with self._state_lock:
                 self._inflight[name] += 1
+            self._audit(
+                "service_start",
+                stage=name,
+                envelope=envelope,
+                queue_wait_ms=queue_wait_ms,
+                queue_size=self._queues[name].qsize(),
+            )
             if envelope.key.map_revision < self.active_revision:
                 self.metrics.record_drop(name, "stale_revision")
+                self._audit(
+                    "service_drop",
+                    stage=name,
+                    envelope=envelope,
+                    reason="stale_revision",
+                )
                 with self._state_lock:
                     self._inflight[name] -= 1
                 continue
@@ -167,13 +242,32 @@ class MultiRateScheduler:
                 with self._state_lock:
                     self._errors.append((name, repr(error)))
                 self.metrics.record_error(name)
+                self._audit(
+                    "service_error",
+                    stage=name,
+                    envelope=envelope,
+                    error=repr(error),
+                )
             finally:
                 completed_ns = time.monotonic_ns()
+                service_ms = (completed_ns - service_started_ns) / 1e6
+                end_to_end_ms = (
+                    completed_ns - envelope.created_monotonic_ns
+                ) / 1e6
                 self.metrics.record_processed(
                     name,
                     queue_wait_ms=queue_wait_ms,
-                    service_ms=(completed_ns - service_started_ns) / 1e6,
-                    end_to_end_ms=(completed_ns - envelope.created_monotonic_ns) / 1e6,
+                    service_ms=service_ms,
+                    end_to_end_ms=end_to_end_ms,
+                    queue_size=self._queues[name].qsize(),
+                )
+                self._audit(
+                    "service_complete",
+                    stage=name,
+                    envelope=envelope,
+                    queue_wait_ms=queue_wait_ms,
+                    service_ms=service_ms,
+                    end_to_end_ms=end_to_end_ms,
                     queue_size=self._queues[name].qsize(),
                 )
                 with self._state_lock:
